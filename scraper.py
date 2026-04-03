@@ -28,8 +28,6 @@ from social_selenium import create_selenium_driver, close_selenium_driver, fetch
 app = FastAPI()
 
 # ==========================================
-# Cáº¤U HÃŒNH THÃ”NG Sá»
-# ==========================================
 SERVICE_ACCOUNT_FILE = 'credential.json'
 AUTH_SETTINGS_FILE = "auth_settings.json"
 SESSION_COOKIE_NAME = "social_monitor_session"
