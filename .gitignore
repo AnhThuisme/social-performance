@@ -7,6 +7,7 @@ credential.json
 auth_settings.json
 .env
 .env.*
+!.env.example
 
 # Build artifacts
 build/

@@ -1,3 +1,4 @@
+import os
 import json
 import re
 import time
@@ -8,7 +9,9 @@ import requests
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.service import Service as EdgeService
 
 DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 25
 DEFAULT_SETTLE_SECONDS = 2.2
@@ -26,6 +29,14 @@ def _emit(logger: Optional[Callable[[str], None]], message: str):
         logger(message)
     except Exception:
         pass
+
+
+def _first_env(*names: str) -> str:
+    for name in names:
+        value = str(os.getenv(name, "") or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _add_common_browser_args(options, headless: bool = True):
@@ -64,7 +75,12 @@ def _build_chrome_driver(headless: bool = True):
     _add_common_browser_args(options, headless=headless)
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    driver = webdriver.Chrome(options=options)
+    chrome_binary = _first_env("CHROME_BIN", "GOOGLE_CHROME_BIN", "CHROMIUM_BIN")
+    chromedriver_path = _first_env("CHROMEDRIVER_PATH")
+    if chrome_binary:
+        options.binary_location = chrome_binary
+    service = ChromeService(executable_path=chromedriver_path) if chromedriver_path else None
+    driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
     driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
     return driver
@@ -73,7 +89,12 @@ def _build_chrome_driver(headless: bool = True):
 def _build_edge_driver(headless: bool = True):
     options = EdgeOptions()
     _add_common_browser_args(options, headless=headless)
-    driver = webdriver.Edge(options=options)
+    edge_binary = _first_env("EDGE_BIN")
+    edgedriver_path = _first_env("MSEDGEDRIVER_PATH", "EDGEDRIVER_PATH")
+    if edge_binary:
+        options.binary_location = edge_binary
+    service = EdgeService(executable_path=edgedriver_path) if edgedriver_path else None
+    driver = webdriver.Edge(service=service, options=options) if service else webdriver.Edge(options=options)
     driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
     return driver

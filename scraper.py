@@ -28,7 +28,7 @@ from social_selenium import create_selenium_driver, close_selenium_driver, fetch
 app = FastAPI()
 
 # ==========================================
-SERVICE_ACCOUNT_FILE = 'credential.json'
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "credential.json").strip() or "credential.json"
 AUTH_SETTINGS_FILE = "auth_settings.json"
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
@@ -39,12 +39,10 @@ DEFAULT_SHEET_NAME = os.getenv("DEFAULT_SHEET_NAME", "").strip()
 ACTIVE_SHEET_NAME = DEFAULT_SHEET_NAME
 ACTIVE_SHEET_GID = "0"
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("AUTH_BOOTSTRAP_ADMIN_EMAIL", "").strip()
-# Gmail SMTP - điền trực tiếp vào đây nếu muốn cấu hình OTP ngay trong code.
-# Nếu để trống, app mới fallback sang biến môi trường cùng tên.
-GMAIL_SMTP_EMAIL = "fanscom.ecom@gmail.com"
-GMAIL_SMTP_APP_PASSWORD = "btqtzotpeyhnzzac"
-GMAIL_SMTP_FROM_EMAIL = "fanscom.ecom@gmail.com"
-YOUTUBE_API_KEY = "AIzaSyAbMDEzmIVpsVTASYhTaXI6oC7BudQWzlU"
+GMAIL_SMTP_EMAIL = os.getenv("GMAIL_SMTP_EMAIL", "").strip()
+GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "").strip()
+GMAIL_SMTP_FROM_EMAIL = os.getenv("GMAIL_SMTP_FROM_EMAIL", "").strip()
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.12"))
 try:
     START_ROW = max(2, int(os.getenv("START_ROW", "2")))
@@ -130,6 +128,30 @@ def parse_bool_env(value: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def build_google_credentials():
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    raw_json = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "") or "").strip()
+    raw_json_b64 = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "") or "").strip()
+
+    if raw_json:
+        return Credentials.from_service_account_info(json.loads(raw_json), scopes=scopes)
+
+    if raw_json_b64:
+        decoded = base64.b64decode(raw_json_b64).decode("utf-8")
+        return Credentials.from_service_account_info(json.loads(decoded), scopes=scopes)
+
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        raise RuntimeError(
+            "Missing Google service account credentials. "
+            "Set SERVICE_ACCOUNT_FILE, GOOGLE_SERVICE_ACCOUNT_JSON, or GOOGLE_SERVICE_ACCOUNT_JSON_BASE64."
+        )
+
+    return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
 
 def build_default_auth_settings():
     return {
@@ -1667,10 +1689,7 @@ def ensure_scheduler_thread():
     scheduler_thread.start()
 
 def get_gspread_client():
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    )
+    creds = build_google_credentials()
     return gspread.authorize(creds)
 
 def extract_sheet_id(sheet_input: str) -> Optional[str]:
@@ -2630,6 +2649,8 @@ def normalize_cell_value(field, value):
 # --- Xá»­ lÃ½ YouTube ---
 def get_youtube_stats(url):
     try:
+        if not YOUTUBE_API_KEY:
+            return None
         video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
         if not video_id_match: return None
         youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
@@ -6764,4 +6785,10 @@ def home(request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run("scraper:app", host="127.0.0.1", port=8000, reload=True)
+    host = str(os.getenv("UVICORN_HOST", "0.0.0.0") or "0.0.0.0").strip() or "0.0.0.0"
+    try:
+        port = int(str(os.getenv("PORT", os.getenv("UVICORN_PORT", "8000")) or "8000").strip() or "8000")
+    except Exception:
+        port = 8000
+    reload_enabled = parse_bool_env(os.getenv("UVICORN_RELOAD", "false"), False)
+    uvicorn.run("scraper:app", host=host, port=port, reload=reload_enabled)
