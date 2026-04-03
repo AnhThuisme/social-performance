@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local secrets and runtime config
+credential.json
+auth_settings.json
+.env
+.env.*
+
+# Build artifacts
+build/
+dist/
+
+# Local exports and generated files
+Social_Export.xlsx
+_dashboard_rendered.html
