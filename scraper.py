@@ -2838,6 +2838,10 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
 def on_startup():
     ensure_scheduler_thread()
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "service": "social-performance"}
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     current_user = get_current_user(request)

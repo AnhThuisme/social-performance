@@ -29,6 +29,25 @@ docker run --env-file .env -p 8000:8000 social-performance
 
 Container da cai `chromium` va `chromedriver` de Selenium chay headless.
 
+## Deploy len Render
+
+Khuyen dung tao `Web Service` voi `Environment = Docker` de Render build tu `Dockerfile`.
+
+Neu ban dang dung Python service va thay log:
+
+`Running 'gunicorn your_application.wsgi'`
+
+thi service dang bi tao sai template. App nay khong dung Django WSGI.
+
+Lua chon dung:
+
+1. Tao lai service tren Render voi `Docker`.
+2. Hoac dung Blueprint/`render.yaml` trong repo nay.
+
+Health check path:
+
+`/healthz`
+
 ## Luu y voi Netlify
 
 Netlify dang goi `hugo` vi Build command cua site dang set sai. Tuy nhien repo nay khong phai Hugo/static site; day la FastAPI app can Python runtime, Selenium browser, background task va API routes dong.
