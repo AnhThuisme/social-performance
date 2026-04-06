@@ -28,8 +28,12 @@ from social_selenium import create_selenium_driver, close_selenium_driver, fetch
 app = FastAPI()
 
 # ==========================================
+IS_VERCEL = bool(str(os.getenv("VERCEL", "") or "").strip())
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "credential.json").strip() or "credential.json"
-AUTH_SETTINGS_FILE = "auth_settings.json"
+AUTH_SETTINGS_FILE = (
+    str(os.getenv("AUTH_SETTINGS_FILE", "") or "").strip()
+    or ("/tmp/auth_settings.json" if IS_VERCEL else "auth_settings.json")
+)
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
 OTP_REQUEST_COOLDOWN_SECONDS = 30
@@ -265,8 +269,12 @@ def normalize_auth_settings(data):
     return settings
 
 def save_auth_settings(settings):
+    target = normalize_auth_settings(settings)
+    directory = os.path.dirname(AUTH_SETTINGS_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
     with open(AUTH_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(normalize_auth_settings(settings), f, ensure_ascii=False, indent=2)
+        json.dump(target, f, ensure_ascii=False, indent=2)
 
 def load_auth_settings():
     if os.path.exists(AUTH_SETTINGS_FILE):
@@ -279,7 +287,11 @@ def load_auth_settings():
         data = {}
     settings = normalize_auth_settings(data)
     if not os.path.exists(AUTH_SETTINGS_FILE):
-        save_auth_settings(settings)
+        try:
+            save_auth_settings(settings)
+        except Exception:
+            # Serverless deployments may not preserve local writes; continue with in-memory defaults.
+            pass
     return settings
 
 def persist_auth_settings(settings):
@@ -1681,6 +1693,8 @@ def schedule_worker():
         scheduler_stop_event.wait(20)
 
 def ensure_scheduler_thread():
+    if IS_VERCEL:
+        return
     global scheduler_thread
     if scheduler_thread and scheduler_thread.is_alive():
         return
