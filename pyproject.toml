@@ -1,0 +1,6 @@
+[project]
+name = "social-performance"
+version = "0.1.0"
+
+[project.scripts]
+app = "scraper:app"
