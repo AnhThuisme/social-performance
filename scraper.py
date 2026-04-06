@@ -21,6 +21,7 @@ from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
 import uvicorn
 import gspread
+import redis
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
@@ -33,6 +34,19 @@ SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "credential.json").stri
 AUTH_SETTINGS_FILE = (
     str(os.getenv("AUTH_SETTINGS_FILE", "") or "").strip()
     or ("/tmp/auth_settings.json" if IS_VERCEL else "auth_settings.json")
+)
+AUTH_SETTINGS_KV_KEY = str(os.getenv("AUTH_SETTINGS_KV_KEY", "social-monitor:auth-settings") or "").strip() or "social-monitor:auth-settings"
+KV_REST_API_URL = (
+    str(os.getenv("KV_REST_API_URL", "") or "").strip()
+    or str(os.getenv("UPSTASH_REDIS_REST_URL", "") or "").strip()
+)
+KV_REST_API_TOKEN = (
+    str(os.getenv("KV_REST_API_TOKEN", "") or "").strip()
+    or str(os.getenv("UPSTASH_REDIS_REST_TOKEN", "") or "").strip()
+)
+AUTH_SETTINGS_REDIS_URL = (
+    str(os.getenv("AUTH_SETTINGS_REDIS_URL", "") or "").strip()
+    or str(os.getenv("REDIS_URL", "") or "").strip()
 )
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
@@ -117,6 +131,7 @@ WEEKDAY_NAMES = [
 last_schedule_run_key = ""
 scheduler_thread = None
 scheduler_stop_event = threading.Event()
+AUTH_SETTINGS_REDIS_CLIENT = None
 
 def normalize_email_address(value: str) -> str:
     return (value or "").strip().lower()
@@ -268,27 +283,153 @@ def normalize_auth_settings(data):
     settings["session_secret"] = str(settings.get("session_secret", "") or "").strip() or secrets.token_hex(32)
     return settings
 
-def save_auth_settings(settings):
+def has_auth_settings_kv() -> bool:
+    return bool(KV_REST_API_URL and KV_REST_API_TOKEN)
+
+def has_auth_settings_redis_url() -> bool:
+    return bool(AUTH_SETTINGS_REDIS_URL)
+
+def get_auth_settings_redis_client():
+    global AUTH_SETTINGS_REDIS_CLIENT
+    if AUTH_SETTINGS_REDIS_CLIENT is not None:
+        return AUTH_SETTINGS_REDIS_CLIENT
+    if not has_auth_settings_redis_url():
+        raise RuntimeError("Missing Redis URL credentials.")
+    AUTH_SETTINGS_REDIS_CLIENT = redis.Redis.from_url(
+        AUTH_SETTINGS_REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=15,
+        socket_timeout=15,
+    )
+    return AUTH_SETTINGS_REDIS_CLIENT
+
+def execute_auth_settings_kv_command(*command):
+    if not has_auth_settings_kv():
+        raise RuntimeError("Missing Redis REST credentials.")
+    payload = list(command[0]) if len(command) == 1 and isinstance(command[0], (list, tuple)) else list(command)
+    response = requests.post(
+        KV_REST_API_URL,
+        headers={
+            "Authorization": f"Bearer {KV_REST_API_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json() if response.content else {}
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(str(data.get("error")))
+    return data.get("result") if isinstance(data, dict) else None
+
+def save_auth_settings_to_kv(settings):
+    target = normalize_auth_settings(settings)
+    execute_auth_settings_kv_command("SET", AUTH_SETTINGS_KV_KEY, json.dumps(target, ensure_ascii=False, separators=(",", ":")))
+    return target
+
+def load_auth_settings_from_kv():
+    raw_value = execute_auth_settings_kv_command("GET", AUTH_SETTINGS_KV_KEY)
+    if raw_value in (None, ""):
+        return {}
+    if isinstance(raw_value, str):
+        try:
+            return json.loads(raw_value)
+        except Exception:
+            return {}
+    return raw_value if isinstance(raw_value, dict) else {}
+
+def initialize_auth_settings_in_kv(settings):
+    target = normalize_auth_settings(settings)
+    serialized = json.dumps(target, ensure_ascii=False, separators=(",", ":"))
+    created = execute_auth_settings_kv_command("SETNX", AUTH_SETTINGS_KV_KEY, serialized)
+    if int(created or 0) == 1:
+        return target
+    loaded = load_auth_settings_from_kv()
+    return normalize_auth_settings(loaded or target)
+
+def save_auth_settings_to_redis(settings):
+    target = normalize_auth_settings(settings)
+    client = get_auth_settings_redis_client()
+    client.set(AUTH_SETTINGS_KV_KEY, json.dumps(target, ensure_ascii=False, separators=(",", ":")))
+    return target
+
+def load_auth_settings_from_redis():
+    client = get_auth_settings_redis_client()
+    raw_value = client.get(AUTH_SETTINGS_KV_KEY)
+    if raw_value in (None, ""):
+        return {}
+    if isinstance(raw_value, str):
+        try:
+            return json.loads(raw_value)
+        except Exception:
+            return {}
+    return raw_value if isinstance(raw_value, dict) else {}
+
+def initialize_auth_settings_in_redis(settings):
+    target = normalize_auth_settings(settings)
+    client = get_auth_settings_redis_client()
+    created = client.setnx(AUTH_SETTINGS_KV_KEY, json.dumps(target, ensure_ascii=False, separators=(",", ":")))
+    if bool(created):
+        return target
+    loaded = load_auth_settings_from_redis()
+    return normalize_auth_settings(loaded or target)
+
+def save_auth_settings_to_file(settings):
     target = normalize_auth_settings(settings)
     directory = os.path.dirname(AUTH_SETTINGS_FILE)
     if directory:
         os.makedirs(directory, exist_ok=True)
     with open(AUTH_SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(target, f, ensure_ascii=False, indent=2)
+    return target
 
-def load_auth_settings():
+def load_auth_settings_from_file():
     if os.path.exists(AUTH_SETTINGS_FILE):
         try:
             with open(AUTH_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_auth_settings(settings):
+    target = normalize_auth_settings(settings)
+    if has_auth_settings_kv():
+        return save_auth_settings_to_kv(target)
+    if has_auth_settings_redis_url():
+        return save_auth_settings_to_redis(target)
+    return save_auth_settings_to_file(target)
+
+def load_auth_settings():
+    if has_auth_settings_kv():
+        try:
+            data = load_auth_settings_from_kv()
         except Exception:
             data = {}
-    else:
-        data = {}
+        if data:
+            return normalize_auth_settings(data)
+        try:
+            return initialize_auth_settings_in_kv(build_default_auth_settings())
+        except Exception:
+            return normalize_auth_settings(data)
+
+    if has_auth_settings_redis_url():
+        try:
+            data = load_auth_settings_from_redis()
+        except Exception:
+            data = {}
+        if data:
+            return normalize_auth_settings(data)
+        try:
+            return initialize_auth_settings_in_redis(build_default_auth_settings())
+        except Exception:
+            return normalize_auth_settings(data)
+
+    data = load_auth_settings_from_file()
     settings = normalize_auth_settings(data)
     if not os.path.exists(AUTH_SETTINGS_FILE):
         try:
-            save_auth_settings(settings)
+            save_auth_settings_to_file(settings)
         except Exception:
             # Serverless deployments may not preserve local writes; continue with in-memory defaults.
             pass
@@ -1983,11 +2124,33 @@ def detect_sheet_layout(sheet, sample_rows: int = 5):
 def detect_sheet_columns(sheet):
     return detect_sheet_layout(sheet).get("columns", {})
 
+def make_unique_sheet_headers(headers):
+    unique_headers = []
+    seen = {}
+    for idx, header in enumerate(headers or [], start=1):
+        base_header = str(header or "").strip() or f"Column {idx}"
+        duplicate_count = seen.get(base_header, 0) + 1
+        seen[base_header] = duplicate_count
+        if duplicate_count == 1:
+            unique_headers.append(base_header)
+        else:
+            unique_headers.append(f"{base_header}__{duplicate_count}")
+    return unique_headers
+
 def get_sheet_records(sheet, layout=None):
     resolved_layout = layout or detect_sheet_layout(sheet)
     header_row = max(1, int(resolved_layout.get("header_row") or 1))
-    records = sheet.get_all_records(head=header_row)
-    return records, header_row, list(resolved_layout.get("headers") or [])
+    raw_headers = list(resolved_layout.get("headers") or sheet.row_values(header_row) or [])
+    headers = make_unique_sheet_headers(raw_headers)
+    all_rows = sheet.get_all_values()
+    data_rows = all_rows[header_row:] if len(all_rows) >= header_row else []
+    records = []
+    for row in data_rows:
+        padded_row = list(row[: len(headers)])
+        if len(padded_row) < len(headers):
+            padded_row.extend([""] * (len(headers) - len(padded_row)))
+        records.append(dict(zip(headers, padded_row)))
+    return records, header_row, headers
 
 def resolve_effective_start_row(header_row: int) -> int:
     return max(2, START_ROW, int(header_row or 1) + 1)

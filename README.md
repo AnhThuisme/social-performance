@@ -16,6 +16,25 @@ FastAPI dashboard de quet social metrics tu Google Sheets, co Selenium, OTP mail
 
 App mac dinh lang nghe tren `0.0.0.0:${PORT:-8000}`.
 
+## Luu user ben vung tren Vercel
+
+Neu deploy tren Vercel thi danh sach nhan vien, access policy va mail config khong nen luu vao file local vi serverless filesystem la tam thoi. App nay da ho tro luu auth settings vao Redis REST.
+
+Dung nhanh nhat voi Vercel Redis:
+
+- `REDIS_URL`
+
+Dung 1 trong 2 cap bien moi truong sau:
+
+- `KV_REST_API_URL` + `KV_REST_API_TOKEN`
+- `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`
+
+Key mac dinh:
+
+- `AUTH_SETTINGS_KV_KEY=social-monitor:auth-settings`
+
+Chi can ket noi Redis tren Vercel Marketplace / Upstash, them cap env phu hop, roi redeploy. Sau do cac thay doi o tab Nhan vien, access policy va mail config se khong bi mat sau reload.
+
 ## Deploy bang Docker
 
 Repo nay phu hop hon voi host ho tro Docker nhu Render, Railway, Fly.io, VPS, hoac bat ky noi nao chay container duoc.
