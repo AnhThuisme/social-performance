@@ -7102,9 +7102,12 @@ def home(request: Request):
                     applySavedScheduleTargetsToPosts(true);
                 }};
 
-                const setActivePanel = (sectionId) => {{
+                const setActivePanel = (sectionId, options = {{}}) => {{
+                    const shouldScroll = options.scroll !== false;
+                    const scrollBehavior = options.behavior || "smooth";
                     const availableIds = dashboardSections.map((section) => section.dataset.dashboardSection);
                     const targetId = availableIds.includes(sectionId) ? sectionId : "tong-quan";
+                    const activeSection = dashboardSections.find((section) => section.dataset.dashboardSection === targetId) || null;
 
                     sidebarLinks.forEach((link) => {{
                         link.classList.toggle("is-active", link.dataset.navLink === targetId);
@@ -7116,6 +7119,13 @@ def home(request: Request):
                     if (window.location.hash !== `#${{targetId}}`) {{
                         history.replaceState(null, "", `#${{targetId}}`);
                     }}
+
+                    if (shouldScroll && activeSection) {{
+                        window.requestAnimationFrame(() => {{
+                            const targetTop = Math.max(0, window.scrollY + activeSection.getBoundingClientRect().top - 20);
+                            window.scrollTo({{ top: targetTop, behavior: scrollBehavior }});
+                        }});
+                    }}
                 }};
 
                 sidebarLinks.forEach((link) => {{
@@ -7126,11 +7136,11 @@ def home(request: Request):
                 }});
 
                 window.addEventListener("hashchange", () => {{
-                    setActivePanel((window.location.hash || "").replace("#", ""));
+                    setActivePanel((window.location.hash || "").replace("#", ""), {{ behavior: "auto" }});
                 }});
 
                 initializePostsPanel();
-                setActivePanel((window.location.hash || "").replace("#", "") || "tong-quan");
+                setActivePanel((window.location.hash || "").replace("#", "") || "tong-quan", {{ scroll: false }});
                 setInterval(refreshDashboard, 4000);
             }});
         </script>
