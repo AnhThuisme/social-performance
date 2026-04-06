@@ -1507,6 +1507,67 @@ def push_schedule_run_history(entry: dict):
     schedule_run_history.insert(0, entry)
     schedule_run_history = schedule_run_history[:8]
 
+
+def build_schedule_target_key(sheet_id: Optional[str], sheet_name: str, row_idx, link: str) -> str:
+    normalized_sheet_id = extract_sheet_id(str(sheet_id or "").strip()) or str(sheet_id or "").strip()
+    normalized_sheet_name = normalize_header(sheet_name or "")
+    normalized_row_idx = parse_start_row_input(str(row_idx or "")) or 0
+    normalized_link = str(link or "").strip()
+    return f"{normalized_sheet_id}::{normalized_sheet_name}::{normalized_row_idx}::{normalized_link}"
+
+
+def summarize_schedule_targets(targets) -> str:
+    normalized = normalize_schedule_targets(targets)
+    count = len(normalized)
+    if not count:
+        return "Chưa chọn bài nào. Lịch sẽ chạy toàn bộ tab đã lưu."
+    tab_count = len({(item.get("sheet_id"), normalize_header(item.get("sheet_name") or "")) for item in normalized})
+    if count == 1:
+        return "Đang chọn 1 bài cho lịch tự động."
+    if tab_count <= 1:
+        return f"Đang chọn {count} bài cho lịch tự động."
+    return f"Đang chọn {count} bài ở {tab_count} tab cho lịch tự động."
+
+
+def build_schedule_targets_html(targets, limit: int = 10) -> str:
+    normalized = normalize_schedule_targets(targets)
+    if not normalized:
+        return '<div class="schedule-target-empty">Chưa có bài nào được gắn với lịch. Vào tab Bài đăng để tích chọn bài cần chạy tự động.</div>'
+
+    cards = []
+    for item in normalized[:limit]:
+        title = str(item.get("title") or item.get("link") or f"Dòng {item.get('row_idx') or '-'}").strip()
+        link = str(item.get("link") or "").strip()
+        sheet_name = str(item.get("sheet_name") or "Sheet").strip()
+        platform = str(item.get("platform") or "Khác").strip()
+        campaign = str(item.get("campaign") or "").strip()
+        row_text = f"Dòng {parse_metric_number(item.get('row_idx'))}"
+        safe_title = html.escape(shorten_text(title, 92))
+        safe_platform = html.escape(platform)
+        safe_meta = html.escape(f"{sheet_name} • {row_text} • {campaign or 'Không gắn campaign'}")
+        title_html = (
+            f'<a href="{html.escape(link, quote=True)}" target="_blank" rel="noreferrer" class="schedule-target-link">{safe_title}</a>'
+            if link
+            else f'<div class="schedule-target-link">{safe_title}</div>'
+        )
+        cards.append(
+            f"""
+            <div class="schedule-target-item">
+                <div class="schedule-target-top">
+                    {title_html}
+                    <span class="schedule-target-pill">{safe_platform}</span>
+                </div>
+                <div class="schedule-target-meta">{safe_meta}</div>
+            </div>
+            """
+        )
+
+    remaining = len(normalized) - limit
+    if remaining > 0:
+        cards.append(f'<div class="schedule-target-empty">Còn {remaining} bài khác đang được áp dụng cho lịch tự động.</div>')
+
+    return "".join(cards)
+
 def normalize_schedule_targets(raw_targets, fallback_sheet_id: Optional[str] = None):
     normalized = []
     seen = set()
@@ -1523,7 +1584,7 @@ def normalize_schedule_targets(raw_targets, fallback_sheet_id: Optional[str] = N
         campaign = shorten_text(str(raw.get("campaign") or "").strip(), 80)
         if not sheet_id or not sheet_name or row_idx is None:
             continue
-        dedupe_key = (sheet_id, sheet_name.lower(), row_idx, link)
+        dedupe_key = build_schedule_target_key(sheet_id, sheet_name, row_idx, link)
         if dedupe_key in seen:
             continue
         seen.add(dedupe_key)
@@ -1564,6 +1625,14 @@ def get_schedule_sheet_binding(use_active_fallback: bool = True):
 
 def build_schedule_scope_text():
     binding = get_schedule_sheet_binding()
+    normalized_targets = normalize_schedule_targets(schedule_targets, binding["sheet_id"] or ACTIVE_SHEET_ID)
+    if normalized_targets:
+        tab_count = len({(item.get("sheet_id"), normalize_header(item.get("sheet_name") or "")) for item in normalized_targets})
+        if binding["is_saved"]:
+            if tab_count > 1:
+                return f"Lịch đang nhớ {len(normalized_targets)} bài đã chọn ở {tab_count} tab trong spreadsheet hiện tại."
+            return f"Lịch đang nhớ {len(normalized_targets)} bài đã chọn và sẽ chỉ quét đúng các bài này khi đến giờ."
+        return f"Lịch sẽ dùng {len(normalized_targets)} bài đã chọn nếu bạn bấm Lưu lịch ngay bây giờ."
     sheet_name = binding["sheet_name"]
     if not sheet_name:
         return "Hãy chọn sheet ở phần Cấu hình trước, rồi bấm Lưu lịch để lịch tự động nhớ tab cần chạy."
@@ -1573,6 +1642,7 @@ def build_schedule_scope_text():
 
 def build_schedule_config_payload():
     binding = get_schedule_sheet_binding()
+    normalized_targets = normalize_schedule_targets(schedule_targets, binding["sheet_id"] or ACTIVE_SHEET_ID)
     return {
         "label": schedule_label(),
         "sheet_name_text": binding["sheet_name"] or "Chưa chốt tab nào",
@@ -1580,6 +1650,10 @@ def build_schedule_config_payload():
         "is_saved": binding["is_saved"],
         "scope_text": build_schedule_scope_text(),
         "snapshot_url": build_snapshot_url(binding["sheet_id"], binding["sheet_gid"]) if binding["sheet_id"] else "",
+        "target_count": len(normalized_targets),
+        "targets_summary_text": summarize_schedule_targets(normalized_targets),
+        "targets_html": build_schedule_targets_html(normalized_targets),
+        "targets": normalized_targets,
     }
 
 def build_schedule_tracking_payload():
@@ -1684,10 +1758,19 @@ def schedule_worker():
                 if should_run_schedule(now):
                     add_log(f"Kích hoạt lịch tự động: {schedule_label()}")
                     binding = get_schedule_sheet_binding()
+                    selected_targets = normalize_schedule_targets(
+                        [item for item in schedule_targets if (item.get("sheet_id") or "") == (binding["sheet_id"] or "")],
+                        binding["sheet_id"],
+                    )
                     if not binding["sheet_id"] or not binding["sheet_name"]:
                         add_log("Bỏ qua lịch tự động vì chưa có sheet/tab được lưu cho lịch.")
                     else:
-                        run_scraper_logic(sheet_id=binding["sheet_id"], sheet_name=binding["sheet_name"], source="schedule")
+                        run_scraper_logic(
+                            sheet_id=binding["sheet_id"],
+                            sheet_name=binding["sheet_name"],
+                            targets=selected_targets,
+                            source="schedule",
+                        )
         except Exception as e:
             add_log(f"Lỗi lịch tự động: {str(e)}")
         scheduler_stop_event.wait(20)
@@ -2072,6 +2155,10 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
     sheet_title = str(getattr(ws, "title", "") or f"Sheet {tab_index + 1}")
     sheet_slug = f"{build_dom_slug(sheet_title, 'sheet')}-{tab_index}"
     platform_counts = {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0}
+    selected_target_keys = {
+        build_schedule_target_key(item.get("sheet_id"), item.get("sheet_name"), item.get("row_idx"), item.get("link"))
+        for item in normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID)
+    }
     rows_html = []
     total_posts = 0
     total_views = 0
@@ -2150,6 +2237,10 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
         safe_title_attr = html.escape(title, quote=True)
         safe_platform_attr = html.escape(platform, quote=True)
         safe_campaign_attr = html.escape(campaign, quote=True)
+        schedule_target_key = build_schedule_target_key(ACTIVE_SHEET_ID, sheet_title, row_idx, link)
+        is_schedule_target = schedule_target_key in selected_target_keys
+        row_schedule_class = " is-schedule-target" if is_schedule_target else ""
+        checked_attr = " checked" if is_schedule_target else ""
         search_blob = html.escape(
             " ".join([title, creator, campaign, platform, link, date_text, sheet_title]).lower(),
             quote=True,
@@ -2157,7 +2248,7 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
 
         rows_html.append(
             f"""
-            <tr class="post-row posts-table-row" data-platform="{platform_key}" data-search="{search_blob}">
+            <tr class="post-row posts-table-row{row_schedule_class}" data-platform="{platform_key}" data-search="{search_blob}">
                 <td class="posts-cell posts-cell-check">
                     <input
                         type="checkbox"
@@ -2170,7 +2261,9 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
                         data-title="{safe_title_attr}"
                         data-platform-name="{safe_platform_attr}"
                         data-campaign-name="{safe_campaign_attr}"
+                        data-target-key="{html.escape(schedule_target_key, quote=True)}"
                         aria-label="Chọn dòng {row_idx}"
+                        {checked_attr}
                     />
                 </td>
                 <td class="posts-cell posts-cell-content">
@@ -2347,16 +2440,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
     <section id="tong-quan" data-dashboard-section="tong-quan" class="dashboard-section dashboard-panel is-active mb-6">
         <div class="overview-shell">
             <div class="overview-header">
-                <div>
-                    <div class="overview-kicker">Tổng quan</div>
-                    <h2 class="overview-title">Bức tranh tổng hợp của sheet hiện tại</h2>
-                    <p class="overview-subtitle">Dữ liệu tổng hợp từ <span class="font-bold text-white" data-active-sheet-name>{html.escape(ACTIVE_SHEET_NAME or "sheet đang chọn")}</span>, gom theo bài đăng, creator, campaign và mức độ tương tác.</p>
-                </div>
-                <div class="overview-actions">
-                    <div class="overview-action-pill"><i class="fa-regular fa-calendar"></i> <span data-schedule-label>{schedule_text}</span></div>
-                    <div class="overview-action-pill overview-action-pill-live"><i class="fa-solid fa-play"></i> {status_chip_text}</div>
-                    <a href="#cau-hinh" class="overview-action-pill overview-action-link" data-nav-link="cau-hinh"><i class="fa-solid fa-sliders"></i> Cấu hình</a>
-                </div>
+                <div class="overview-kicker">Tổng quan</div>
             </div>
 
             <div class="overview-stat-grid">
@@ -2488,6 +2572,7 @@ def build_posts_panel_html(sheet=None):
         (item["total_posts"] for item in datasets if item["sheet_slug"] == active_sheet_slug),
         datasets[0]["total_posts"],
     )
+    schedule_selected_count = len(normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID))
     spreadsheet_snapshot_url = build_snapshot_url(ACTIVE_SHEET_ID, ACTIVE_SHEET_GID)
 
     summary_cards_html = []
@@ -2604,9 +2689,21 @@ def build_posts_panel_html(sheet=None):
                     <h2 class="posts-page-title">Bài đăng</h2>
                     <p class="posts-page-subtitle">Xem tổng theo từng tab trong spreadsheet hiện tại, rồi bấm vào tab muốn xem để mở toàn bộ link và thông tin chi tiết. Đang xem: <span id="posts-active-tab-label" class="text-slate-200 font-bold">{html.escape(active_sheet_title)}</span>.</p>
                 </div>
-                <div class="posts-counter-pill">
-                    <div class="posts-counter-label">Đang hiển thị</div>
-                    <div class="posts-counter-value" id="posts-visible-count">{active_total_posts} bài</div>
+                <div class="posts-page-actions">
+                    <div class="posts-counter-pill">
+                        <div class="posts-counter-label">Đang hiển thị</div>
+                        <div class="posts-counter-value" id="posts-visible-count">{active_total_posts} bài</div>
+                    </div>
+                    <div class="posts-counter-pill">
+                        <div class="posts-counter-label">Đang chọn cho lịch</div>
+                        <div class="posts-counter-value" id="schedule-selected-count">{schedule_selected_count} bài</div>
+                    </div>
+                    <button type="button" id="save-schedule-targets-btn" class="posts-toolbar-btn">
+                        <i class="fa-regular fa-calendar-check"></i> Lưu bài cho lịch
+                    </button>
+                    <button type="button" id="clear-schedule-targets-btn" class="posts-toolbar-btn">
+                        <i class="fa-solid fa-eraser"></i> Xóa bài lịch
+                    </button>
                 </div>
             </div>
 
@@ -3220,10 +3317,15 @@ def set_schedule(request: Request, mode: str = "off", at: str = "09:00", weekday
     schedule_sheet_id = ACTIVE_SHEET_ID
     schedule_sheet_name = ACTIVE_SHEET_NAME
     schedule_sheet_gid = ACTIVE_SHEET_GID or "0"
-    schedule_targets = []
+    schedule_targets = [
+        item
+        for item in normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID)
+        if (item.get("sheet_id") or "") == (ACTIVE_SHEET_ID or "")
+    ]
     last_schedule_run_key = ""
     ensure_scheduler_thread()
-    add_log(f"Cập nhật lịch cho tab '{schedule_sheet_name}': {schedule_label()}")
+    target_suffix = f" • {len(schedule_targets)} bài đã chọn" if schedule_targets else " • chạy toàn tab"
+    add_log(f"Cập nhật lịch cho tab '{schedule_sheet_name}': {schedule_label()}{target_suffix}")
     if is_fetch_request(request):
         return build_ui_json_response(
             "Đã cập nhật lịch tự động.",
@@ -3438,11 +3540,10 @@ def home(request: Request):
             <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1.16fr)_minmax(380px,0.84fr)] gap-4 items-start">
                 <div class="space-y-4">
             <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10 mb-5">
-                <div class="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4 mb-4">
+                <div class="mb-4">
                     <div>
                         <div class="text-base font-black text-slate-100">Sheet và cấu hình quét</div>
                     </div>
-                    <div id="status-badge" class="{status_payload["status_badge_class"]}">{status_payload["status_badge_text"]}</div>
                 </div>
                 <div class="space-y-4">
                     <div>
@@ -3450,7 +3551,7 @@ def home(request: Request):
                         <div class="text-xs text-slate-400">Spreadsheet ID: <span class="text-blue-300" data-active-sheet-id>{ACTIVE_SHEET_ID or 'Chưa cài đặt'}</span></div>
                         <div class="text-[11px] text-slate-500 mt-2">Nhập sheet trước để nhận diện cột. Sau đó bạn thao tác ở cột trái, còn phần log sẽ luôn nằm ở cột phải để theo dõi xuyên suốt.</div>
                     </div>
-                    <form action="/set-sheet" method="get" class="flex flex-col gap-3">
+                    <form id="set-sheet-form" action="/set-sheet" method="get" class="flex flex-col gap-3">
                         <input id="sheet-url-input" name="sheet_url" value="{snapshot_url}" placeholder="Nhập link Google Sheet hoặc Sheet ID" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-blue-400" />
                         <div class="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_220px] gap-3">
                             <input id="sheet-name-input" name="sheet_name" value="{ACTIVE_SHEET_NAME}" list="sheet-name-options" autocomplete="off" placeholder="Nhập tên tab sheet" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-blue-400" />
@@ -3524,12 +3625,6 @@ def home(request: Request):
                     <input name="start_row" form="set-columns-form" value="{START_ROW}" inputmode="numeric" placeholder="VD: 2" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
                 </div>
             </div>
-            <div class="text-xs text-emerald-200/85 bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2 mb-3" data-column-detected-text>
-                {html.escape(column_config["detected_text"])}
-            </div>
-            <div class="text-xs text-cyan-200/80 bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2 mb-3">
-                Các ô đã tự hiện cột đang nhận. Bạn sửa trực tiếp ngay trong đó nếu cần. Xóa trống ô nào thì ô đó quay về AUTO theo header của sheet. Cột Chiến dịch chỉ dùng để gom nhóm trên web. Dòng bắt đầu nhận số từ 2 trở lên.
-            </div>
             <form id="set-columns-form" action="/set-columns" method="get" class="mb-4">
                 <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu cấu hình nhập liệu</button>
             </form>
@@ -3547,7 +3642,7 @@ def home(request: Request):
                 </div>
                 <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10 xl:sticky xl:top-24">
                     <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
-                        <span>Nhật ký hệ thống</span><span class="text-slate-400">Cập nhật realtime</span>
+                        <span>Nhật ký hệ thống</span><button type="submit" form="set-sheet-form" class="log-save-btn">Lưu thông tin sheet</button>
                     </div>
                     <div id="log-section" class="bg-black/40 rounded-2xl p-5 h-[36rem] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
                         {log_html}
@@ -3641,6 +3736,58 @@ def home(request: Request):
                 border-radius: 16px;
                 border: 1px dashed rgba(148, 163, 184, 0.18);
                 background: rgba(15, 23, 42, 0.32);
+                color: #94a3b8;
+                font-size: 13px;
+            }}
+            .schedule-target-item {{
+                padding: 14px 16px;
+                border-radius: 16px;
+                border: 1px solid rgba(148, 163, 184, 0.12);
+                background: rgba(15, 23, 42, 0.48);
+            }}
+            .schedule-target-top {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }}
+            .schedule-target-link {{
+                color: #f8fafc;
+                font-size: 14px;
+                font-weight: 800;
+                line-height: 1.45;
+                text-decoration: none;
+                word-break: break-word;
+            }}
+            .schedule-target-link:hover {{
+                color: #bfdbfe;
+            }}
+            .schedule-target-pill {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 7px 10px;
+                border-radius: 999px;
+                background: rgba(37, 99, 235, 0.14);
+                border: 1px solid rgba(96, 165, 250, 0.2);
+                color: #dbeafe;
+                font-size: 11px;
+                font-weight: 900;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                white-space: nowrap;
+            }}
+            .schedule-target-meta {{
+                margin-top: 8px;
+                font-size: 12px;
+                color: #94a3b8;
+                line-height: 1.6;
+            }}
+            .schedule-target-empty {{
+                padding: 16px;
+                border-radius: 16px;
+                border: 1px dashed rgba(148, 163, 184, 0.18);
+                background: rgba(15, 23, 42, 0.24);
                 color: #94a3b8;
                 font-size: 13px;
             }}
@@ -3989,6 +4136,13 @@ def home(request: Request):
                 justify-content: space-between;
                 gap: 20px;
             }}
+            .posts-page-actions {{
+                display: flex;
+                align-items: stretch;
+                justify-content: flex-end;
+                gap: 12px;
+                flex-wrap: wrap;
+            }}
             .posts-page-kicker {{
                 font-size: 13px;
                 font-weight: 900;
@@ -4028,6 +4182,10 @@ def home(request: Request):
                 font-size: 24px;
                 font-weight: 900;
                 color: #f8fafc;
+            }}
+            .posts-table-row.is-schedule-target {{
+                box-shadow: inset 4px 0 0 rgba(34, 197, 94, 0.82);
+                background: rgba(15, 118, 110, 0.08);
             }}
             .posts-sheet-summary-shell {{
                 display: grid;
@@ -5099,23 +5257,47 @@ def home(request: Request):
                 color: #64748b;
                 font-weight: 900;
             }}
+            .log-save-btn {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 10px 14px;
+                border-radius: 12px;
+                border: 1px solid rgba(96, 165, 250, 0.24);
+                background: linear-gradient(135deg, rgba(37, 99, 235, 0.22), rgba(59, 130, 246, 0.16));
+                color: #dbeafe;
+                font-size: 12px;
+                font-weight: 900;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                transition: all 0.18s ease;
+            }}
+            .log-save-btn:hover {{
+                background: linear-gradient(135deg, rgba(37, 99, 235, 0.34), rgba(59, 130, 246, 0.24));
+                border-color: rgba(147, 197, 253, 0.38);
+                color: #ffffff;
+                transform: translateY(-1px);
+            }}
             html[data-theme="light"] body {{
-                background: linear-gradient(180deg, #f5f7fb, #fcfdff) !important;
+                background:
+                    radial-gradient(circle at top left, rgba(96, 165, 250, 0.12), transparent 26%),
+                    radial-gradient(circle at 85% 12%, rgba(14, 165, 233, 0.08), transparent 22%),
+                    linear-gradient(180deg, #eef4fa 0%, #f8fbfd 48%, #edf3f8 100%) !important;
                 color: #0f172a !important;
             }}
             html[data-theme="light"] .dashboard-sidebar {{
                 background:
-                    radial-gradient(circle at top, rgba(148, 163, 184, 0.08), transparent 34%),
-                    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(247, 249, 252, 0.96));
-                border-color: rgba(148, 163, 184, 0.18);
-                box-shadow: 0 18px 40px rgba(148, 163, 184, 0.14);
+                    radial-gradient(circle at top, rgba(125, 211, 252, 0.12), transparent 34%),
+                    linear-gradient(180deg, rgba(248, 251, 255, 0.98), rgba(237, 244, 250, 0.96));
+                border-color: rgba(191, 219, 254, 0.5);
+                box-shadow: 0 18px 40px rgba(148, 163, 184, 0.12);
             }}
             html[data-theme="light"] .dashboard-main {{
                 background:
-                    radial-gradient(circle at top left, rgba(148, 163, 184, 0.06), transparent 24%),
-                    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(249, 250, 252, 0.98));
-                border-color: rgba(148, 163, 184, 0.18);
-                box-shadow: 0 22px 50px rgba(148, 163, 184, 0.14);
+                    radial-gradient(circle at top left, rgba(191, 219, 254, 0.16), transparent 26%),
+                    linear-gradient(180deg, rgba(253, 254, 255, 0.98), rgba(242, 247, 251, 0.98));
+                border-color: rgba(203, 213, 225, 0.72);
+                box-shadow: 0 22px 50px rgba(148, 163, 184, 0.12);
             }}
             html[data-theme="light"] .sidebar-brand-title,
             html[data-theme="light"] .sidebar-status-value,
@@ -5208,14 +5390,16 @@ def home(request: Request):
             html[data-theme="light"] .link-history-stat,
             html[data-theme="light"] .schedule-history-item,
             html[data-theme="light"] .schedule-history-empty,
+            html[data-theme="light"] .schedule-target-item,
+            html[data-theme="light"] .schedule-target-empty,
             html[data-theme="light"] .bg-black\\/20,
             html[data-theme="light"] .bg-slate-950\\/40,
             html[data-theme="light"] .bg-slate-900\\/60,
             html[data-theme="light"] .bg-slate-900\\/70,
             html[data-theme="light"] .bg-slate-900\\/55 {{
-                background: rgba(255, 255, 255, 0.92) !important;
-                border-color: rgba(148, 163, 184, 0.18) !important;
-                box-shadow: 0 10px 24px rgba(148, 163, 184, 0.1);
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(243, 247, 251, 0.96)) !important;
+                border-color: rgba(203, 213, 225, 0.7) !important;
+                box-shadow: 0 10px 24px rgba(148, 163, 184, 0.08);
             }}
             html[data-theme="light"] .metric-posts {{
                 background: rgba(99, 102, 241, 0.1);
@@ -5239,9 +5423,10 @@ def home(request: Request):
             html[data-theme="light"] .employee-role-select,
             html[data-theme="light"] .employee-icon-btn,
             html[data-theme="light"] .date-shell,
-            html[data-theme="light"] .sidebar-link-icon {{
-                background: rgba(248, 250, 252, 0.92) !important;
-                border-color: rgba(148, 163, 184, 0.18) !important;
+            html[data-theme="light"] .sidebar-link-icon,
+            html[data-theme="light"] .schedule-target-pill {{
+                background: rgba(243, 248, 252, 0.96) !important;
+                border-color: rgba(191, 219, 254, 0.46) !important;
                 color: #0f172a;
             }}
             html[data-theme="light"] .sidebar-link {{
@@ -5250,6 +5435,17 @@ def home(request: Request):
             html[data-theme="light"] .sidebar-link:hover {{
                 background: rgba(226, 232, 240, 0.8);
                 color: #0f172a;
+            }}
+            html[data-theme="light"] .log-save-btn {{
+                background: linear-gradient(135deg, rgba(226, 239, 255, 0.98), rgba(211, 227, 253, 0.96));
+                border-color: rgba(191, 219, 254, 0.9);
+                color: #1d4ed8;
+                box-shadow: 0 8px 18px rgba(148, 163, 184, 0.12);
+            }}
+            html[data-theme="light"] .log-save-btn:hover {{
+                background: linear-gradient(135deg, rgba(214, 232, 255, 0.98), rgba(196, 219, 252, 0.96));
+                color: #1e3a8a;
+                border-color: rgba(96, 165, 250, 0.6);
             }}
             html[data-theme="light"] .sidebar-link.is-active {{
                 background: linear-gradient(135deg, rgba(226, 232, 240, 0.82), rgba(241, 245, 249, 0.88));
@@ -5267,8 +5463,16 @@ def home(request: Request):
             html[data-theme="light"] .link-history-cell-date,
             html[data-theme="light"] .text-slate-100,
             html[data-theme="light"] .text-slate-200,
-            html[data-theme="light"] .text-slate-300 {{
+            html[data-theme="light"] .text-slate-300,
+            html[data-theme="light"] .schedule-target-link {{
                 color: #0f172a !important;
+            }}
+            html[data-theme="light"] .schedule-target-meta {{
+                color: #64748b !important;
+            }}
+            html[data-theme="light"] .posts-table-row.is-schedule-target {{
+                background: rgba(16, 185, 129, 0.08) !important;
+                box-shadow: inset 4px 0 0 rgba(16, 185, 129, 0.55);
             }}
             html[data-theme="light"] .post-title-link:hover,
             html[data-theme="light"] .link-history-link,
@@ -5282,9 +5486,27 @@ def home(request: Request):
             html[data-theme="light"] select,
             html[data-theme="light"] textarea,
             html[data-theme="light"] .posts-search-input {{
-                background: #f8fbff !important;
+                background: #f4f8fc !important;
                 color: #0f172a !important;
-                border-color: rgba(148, 163, 184, 0.25) !important;
+                border-color: rgba(191, 219, 254, 0.52) !important;
+            }}
+            html[data-theme="light"] #status-badge {{
+                background: linear-gradient(135deg, rgba(226, 232, 240, 0.96), rgba(203, 213, 225, 0.92)) !important;
+                color: #334155 !important;
+                border-color: rgba(148, 163, 184, 0.28) !important;
+                box-shadow: none !important;
+            }}
+            html[data-theme="light"] .bg-slate-800\\/80 {{
+                background: rgba(203, 213, 225, 0.78) !important;
+            }}
+            html[data-theme="light"] #log-section,
+            html[data-theme="light"] .bg-black\\/40 {{
+                background: linear-gradient(180deg, rgba(239, 244, 249, 0.98), rgba(228, 236, 245, 0.98)) !important;
+                border-color: rgba(203, 213, 225, 0.8) !important;
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.82), inset 0 -1px 0 rgba(148, 163, 184, 0.08) !important;
+            }}
+            html[data-theme="light"] #current-task {{
+                color: #1e293b !important;
             }}
             html[data-theme="light"] .date-shell input {{
                 background: transparent !important;
@@ -5369,6 +5591,9 @@ def home(request: Request):
                     flex-direction: column;
                     align-items: stretch;
                 }}
+                .posts-page-actions {{
+                    justify-content: stretch;
+                }}
                 .overview-stat-grid,
                 .overview-campaign-metrics {{
                     grid-template-columns: 1fr;
@@ -5412,6 +5637,8 @@ def home(request: Request):
                 const scheduleTrackSuccess = document.getElementById("schedule-track-success");
                 const scheduleTrackFailed = document.getElementById("schedule-track-failed");
                 const scheduleTrackHistory = document.getElementById("schedule-track-history");
+                const scheduleTargetSummary = document.getElementById("schedule-target-summary");
+                const scheduleTargetList = document.getElementById("schedule-target-list");
                 const themeToggle = document.getElementById("theme-toggle");
                 const themeToggleIcon = document.getElementById("theme-toggle-icon");
                 const themeToggleLabel = document.getElementById("theme-toggle-label");
@@ -5468,6 +5695,11 @@ def home(request: Request):
                 let sheetTabsDebounce = null;
                 let employeeUsersState = [];
                 let employeeStatusFilter = "all";
+                let postsScheduleCount = document.getElementById("schedule-selected-count");
+                let saveScheduleTargetsBtn = document.getElementById("save-schedule-targets-btn");
+                let clearScheduleTargetsBtn = document.getElementById("clear-schedule-targets-btn");
+                let savedScheduleTargets = {json.dumps(schedule_config["targets"], ensure_ascii=False)};
+                let scheduleSelectionDirty = false;
 
                 const applyTheme = (theme) => {{
                     const normalizedTheme = theme === "light" ? "light" : "dark";
@@ -5666,6 +5898,7 @@ def home(request: Request):
                                 applyScheduleTrackingState(data);
                                 if (typeof data.posts_html === "string") {{
                                     replacePostsPanelHtml(data.posts_html);
+                                    setActivePanel("bai-dang");
                                 }}
                                 if (sheetUrlInput?.value) {{
                                     fetchSheetTabs(sheetUrlInput.value, true);
@@ -6002,6 +6235,79 @@ def home(request: Request):
                     postsActiveTabLabel = document.getElementById("posts-active-tab-label");
                     postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
                     postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
+                    postsScheduleCount = document.getElementById("schedule-selected-count");
+                    saveScheduleTargetsBtn = document.getElementById("save-schedule-targets-btn");
+                    clearScheduleTargetsBtn = document.getElementById("clear-schedule-targets-btn");
+                }};
+
+                const normalizeScheduleKeyPart = (value) => String(value || "")
+                    .trim()
+                    .toLowerCase()
+                    .normalize("NFD")
+                    .replace(/[\\u0300-\\u036f]/g, "")
+                    .replace(/[^a-z0-9]+/g, "");
+
+                const getScheduleTargetKey = (item) => {{
+                    const providedKey = String(item?.target_key || "").trim();
+                    if (providedKey) return providedKey;
+                    const sheetId = String(item?.sheet_id || "").trim();
+                    const sheetName = normalizeScheduleKeyPart(item?.sheet_name || "");
+                    const rowIdx = Number.parseInt(String(item?.row_idx || "0"), 10) || 0;
+                    const link = String(item?.link || "").trim();
+                    return `${{sheetId}}::${{sheetName}}::${{rowIdx}}::${{link}}`;
+                }};
+
+                const getTargetFromCheckbox = (checkbox) => {{
+                    const rowIdx = Number.parseInt(String(checkbox?.dataset?.rowIdx || "0"), 10) || 0;
+                    return {{
+                        sheet_id: String(checkbox?.dataset?.sheetId || "").trim(),
+                        sheet_name: String(checkbox?.dataset?.sheetName || "").trim(),
+                        row_idx: rowIdx,
+                        link: String(checkbox?.dataset?.link || "").trim(),
+                        title: String(checkbox?.dataset?.title || "").trim(),
+                        platform: String(checkbox?.dataset?.platformName || "").trim(),
+                        campaign: String(checkbox?.dataset?.campaignName || "").trim(),
+                        target_key: String(checkbox?.dataset?.targetKey || "").trim(),
+                    }};
+                }};
+
+                const collectCheckedScheduleTargets = () => {{
+                    const seen = new Set();
+                    return Array.from(document.querySelectorAll("[data-post-select]:checked"))
+                        .map((checkbox) => getTargetFromCheckbox(checkbox))
+                        .filter((item) => item.sheet_id && item.sheet_name && item.row_idx > 0)
+                        .filter((item) => {{
+                            const key = getScheduleTargetKey(item);
+                            if (seen.has(key)) return false;
+                            seen.add(key);
+                            return true;
+                        }});
+                }};
+
+                const updateScheduleRowVisuals = () => {{
+                    document.querySelectorAll("[data-post-select]").forEach((checkbox) => {{
+                        const row = checkbox.closest(".post-row");
+                        if (!row) return;
+                        row.classList.toggle("is-schedule-target", Boolean(checkbox.checked));
+                    }});
+                }};
+
+                const updateScheduleSelectionCounter = () => {{
+                    const checkedCount = collectCheckedScheduleTargets().length;
+                    if (postsScheduleCount) {{
+                        postsScheduleCount.textContent = `${{checkedCount}} bài`;
+                    }}
+                    updateScheduleRowVisuals();
+                }};
+
+                const applySavedScheduleTargetsToPosts = (force = false) => {{
+                    if (scheduleSelectionDirty && !force) return;
+                    const targetKeys = new Set((Array.isArray(savedScheduleTargets) ? savedScheduleTargets : []).map((item) => getScheduleTargetKey(item)));
+                    document.querySelectorAll("[data-post-select]").forEach((checkbox) => {{
+                        const item = getTargetFromCheckbox(checkbox);
+                        checkbox.checked = targetKeys.has(getScheduleTargetKey(item));
+                    }});
+                    updateScheduleSelectionCounter();
                 }};
 
                 const parseEmployeeUsersData = () => {{
@@ -6314,6 +6620,9 @@ def home(request: Request):
                     const scheduleConfig = data?.schedule_config;
                     if (!scheduleConfig) return;
                     const label = scheduleConfig.label || "Chưa bật";
+                    if (Array.isArray(scheduleConfig.targets)) {{
+                        savedScheduleTargets = scheduleConfig.targets;
+                    }}
                     scheduleLabelEls.forEach((el) => {{
                         el.textContent = label;
                     }});
@@ -6331,6 +6640,13 @@ def home(request: Request):
                         scheduleBoundLink.classList.toggle("hidden", !hasLink);
                         scheduleBoundLink.href = hasLink ? scheduleConfig.snapshot_url : "#";
                     }}
+                    if (scheduleTargetSummary) {{
+                        scheduleTargetSummary.textContent = scheduleConfig.targets_summary_text || "Chưa chọn bài nào. Lịch sẽ chạy toàn bộ tab đã lưu.";
+                    }}
+                    if (scheduleTargetList && typeof scheduleConfig.targets_html === "string") {{
+                        scheduleTargetList.innerHTML = scheduleConfig.targets_html;
+                    }}
+                    applySavedScheduleTargetsToPosts();
                 }};
 
                 const applyScheduleTrackingState = (data) => {{
@@ -6438,6 +6754,32 @@ def home(request: Request):
 
                 const syncPostsSelectionState = () => {{
                     postsTabPanels.forEach((panel) => updatePanelSelectAllState(panel));
+                    updateScheduleSelectionCounter();
+                }};
+
+                const persistScheduleTargets = async (targets, emptyMessage = "Đã xóa chọn lọc bài cho lịch tự động.") => {{
+                    try {{
+                        const response = await fetch("/set-schedule-targets", {{
+                            method: "POST",
+                            headers: {{ "Content-Type": "application/json", "X-Requested-With": "fetch" }},
+                            body: JSON.stringify({{
+                                sheet_id: String(activeSheetIdEls[0]?.textContent || "").trim(),
+                                targets,
+                            }}),
+                        }});
+                        const data = await response.json();
+                        if (data.ok) {{
+                            scheduleSelectionDirty = false;
+                            applyScheduleConfigState(data);
+                            updateScheduleSelectionCounter();
+                        }}
+                        showNotice(
+                            data.message || (targets.length ? `Đã lưu ${{targets.length}} bài cho lịch tự động.` : emptyMessage),
+                            data.level || (data.ok ? "success" : "error")
+                        );
+                    }} catch (_) {{
+                        showNotice("Không lưu được danh sách bài cho lịch tự động. Vui lòng thử lại.", "error");
+                    }}
                 }};
 
                 const getActivePostsPanel = () => postsTabPanels.find((panel) => panel.classList.contains("is-active")) || null;
@@ -6541,10 +6883,35 @@ def home(request: Request):
 
                         rowChecks.forEach((checkbox) => {{
                             checkbox.addEventListener("change", () => {{
+                                scheduleSelectionDirty = true;
                                 syncPostsSelectionState();
                             }});
                         }});
                     }});
+
+                    if (saveScheduleTargetsBtn) {{
+                        saveScheduleTargetsBtn.addEventListener("click", async () => {{
+                            const targets = collectCheckedScheduleTargets();
+                            await persistScheduleTargets(
+                                targets,
+                                "Đã xóa chọn lọc bài. Lịch tự động sẽ quay về chạy toàn tab đang dùng."
+                            );
+                        }});
+                    }}
+
+                    if (clearScheduleTargetsBtn) {{
+                        clearScheduleTargetsBtn.addEventListener("click", async () => {{
+                            document.querySelectorAll("[data-post-select]").forEach((checkbox) => {{
+                                checkbox.checked = false;
+                            }});
+                            scheduleSelectionDirty = true;
+                            syncPostsSelectionState();
+                            await persistScheduleTargets(
+                                [],
+                                "Đã xóa chọn lọc bài. Lịch tự động sẽ quay về chạy toàn tab đang dùng."
+                            );
+                        }});
+                    }}
 
                     if (postsTabCards.length) {{
                         const initialPostsTab = postsTabCards.find((card) => card.classList.contains("is-active"))?.dataset.postsTabTrigger
@@ -6555,6 +6922,7 @@ def home(request: Request):
                         if (postsActiveTabLabel) postsActiveTabLabel.textContent = "Chưa chọn";
                     }}
                     syncPostsSelectionState();
+                    applySavedScheduleTargetsToPosts(true);
                 }};
 
                 const replacePostsPanelHtml = (postsHtml) => {{
@@ -6568,6 +6936,7 @@ def home(request: Request):
                     currentPostsSection.innerHTML = nextPostsSection.innerHTML;
                     syncPostsDomRefs();
                     initializePostsPanel();
+                    applySavedScheduleTargetsToPosts(true);
                 }};
 
                 const setActivePanel = (sectionId) => {{
@@ -6626,22 +6995,8 @@ def home(request: Request):
                     <a href="#bai-dang" class="sidebar-link" data-nav-link="bai-dang"><span class="sidebar-link-icon"><i class="fa-regular fa-newspaper"></i></span><span>Bài đăng</span></a>
                     {employee_sidebar_link}
                     <a href="#lich-tu-dong" class="sidebar-link" data-nav-link="lich-tu-dong"><span class="sidebar-link-icon"><i class="fa-regular fa-calendar-days"></i></span><span>Lịch tự động</span></a>
+                    <a href="#theo-doi-lan-chay" class="sidebar-link" data-nav-link="theo-doi-lan-chay"><span class="sidebar-link-icon"><i class="fa-solid fa-clock-rotate-left"></i></span><span>Theo dõi lần chạy</span></a>
                 </nav>
-                <div class="sidebar-schedule-card">
-                    <div class="sidebar-schedule-kicker">Sheet của lịch</div>
-                    <div id="schedule-bound-sheet-name" class="sidebar-schedule-name">{html.escape(schedule_config["sheet_name_text"])}</div>
-                    <div id="schedule-bound-sheet-id" class="sidebar-schedule-id">{html.escape(schedule_config["sheet_id_text"])}</div>
-                    <div id="schedule-bound-scope" class="sidebar-schedule-scope">{html.escape(schedule_config["scope_text"])}</div>
-                    <a
-                        id="schedule-bound-link"
-                        href="{html.escape(schedule_config['snapshot_url'], quote=True) if schedule_config['snapshot_url'] else '#'}"
-                        target="_blank"
-                        rel="noreferrer"
-                        class="sidebar-schedule-link {'hidden' if not schedule_config['snapshot_url'] else ''}"
-                    >
-                        Mở sheet lịch
-                    </a>
-                </div>
             </aside>
 
             <main class="dashboard-main">
@@ -6736,62 +7091,87 @@ def home(request: Request):
                                 </div>
                                 <div class="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
                                     <div class="flex items-center justify-between gap-3 mb-3">
-                                        <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Theo dõi lần chạy</div>
-                                        <div class="text-xs text-slate-500">Tự cập nhật theo lịch và khi bấm chạy tay</div>
+                                        <div>
+                                            <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Bài đang set lịch</div>
+                                            <div id="schedule-target-summary" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_config["targets_summary_text"])}</div>
+                                        </div>
+                                        <a href="#bai-dang" class="posts-toolbar-btn" data-nav-link="bai-dang">
+                                            <i class="fa-regular fa-newspaper"></i> Chọn từ bài đăng
+                                        </a>
                                     </div>
-                                    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3">
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Lần kế tiếp</div>
-                                            <div id="schedule-track-next" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["next_run_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Bắt đầu gần nhất</div>
-                                            <div id="schedule-track-started" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_started_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Kết thúc gần nhất</div>
-                                            <div id="schedule-track-finished" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_finished_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thời lượng</div>
-                                            <div id="schedule-track-duration" class="mt-2 text-sm font-black text-cyan-200">{html.escape(schedule_tracking["last_duration_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Đang chạy từ</div>
-                                            <div id="schedule-track-running" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["is_running_text"])}</div>
-                                        </div>
-                                    </div>
-                                    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3 mt-3">
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Trạng thái</div>
-                                            <div id="schedule-track-status" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_status_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Nguồn chạy</div>
-                                            <div id="schedule-track-source" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_source_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Tab đã chạy</div>
-                                            <div id="schedule-track-sheet" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_sheet_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Link đã quét</div>
-                                            <div id="schedule-track-processed" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_processed_text"])}</div>
-                                        </div>
-                                        <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                            <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thành công / trượt</div>
-                                            <div class="mt-2 text-sm font-black text-slate-100"><span id="schedule-track-success">{html.escape(schedule_tracking["last_success_text"])}</span> / <span id="schedule-track-failed">{html.escape(schedule_tracking["last_failed_text"])}</span></div>
-                                        </div>
-                                    </div>
-                                    <div class="mt-4">
-                                        <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 font-black mb-2">Lịch sử gần nhất</div>
-                                        <div id="schedule-track-history" class="grid gap-2">
-                                            {schedule_tracking["history_html"]}
-                                        </div>
+                                    <div id="schedule-target-list" class="grid gap-2">
+                                        {schedule_config["targets_html"]}
                                     </div>
                                 </div>
                                 <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu lịch</button>
                             </form>
+                        </div>
+                    </section>
+
+                    <section id="theo-doi-lan-chay" data-dashboard-section="theo-doi-lan-chay" class="dashboard-section dashboard-panel mb-6">
+                        <div class="dashboard-section-title">Theo dõi lần chạy</div>
+                        <div class="bg-black/20 rounded-3xl p-6 border border-white/5">
+                            <div class="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+                                <div class="flex items-center justify-between gap-3 mb-3">
+                                    <div>
+                                        <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Theo dõi lần chạy</div>
+                                        <div class="mt-2 text-sm text-slate-400">Tự cập nhật theo lịch và khi bấm chạy tay, để bạn biết lần gần nhất hệ thống đã xử lý tab nào.</div>
+                                    </div>
+                                    <a href="#lich-tu-dong" class="posts-toolbar-btn" data-nav-link="lich-tu-dong">
+                                        <i class="fa-regular fa-calendar-days"></i> Mở lịch tự động
+                                    </a>
+                                </div>
+                                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3">
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Lần kế tiếp</div>
+                                        <div id="schedule-track-next" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["next_run_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Bắt đầu gần nhất</div>
+                                        <div id="schedule-track-started" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_started_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Kết thúc gần nhất</div>
+                                        <div id="schedule-track-finished" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_finished_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thời lượng</div>
+                                        <div id="schedule-track-duration" class="mt-2 text-sm font-black text-cyan-200">{html.escape(schedule_tracking["last_duration_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Đang chạy từ</div>
+                                        <div id="schedule-track-running" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["is_running_text"])}</div>
+                                    </div>
+                                </div>
+                                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3 mt-3">
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Trạng thái</div>
+                                        <div id="schedule-track-status" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_status_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Nguồn chạy</div>
+                                        <div id="schedule-track-source" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_source_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Tab đã chạy</div>
+                                        <div id="schedule-track-sheet" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_sheet_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Link đã quét</div>
+                                        <div id="schedule-track-processed" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_processed_text"])}</div>
+                                    </div>
+                                    <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                        <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thành công / trượt</div>
+                                        <div class="mt-2 text-sm font-black text-slate-100"><span id="schedule-track-success">{html.escape(schedule_tracking["last_success_text"])}</span> / <span id="schedule-track-failed">{html.escape(schedule_tracking["last_failed_text"])}</span></div>
+                                    </div>
+                                </div>
+                                <div class="mt-4">
+                                    <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 font-black mb-2">Lịch sử gần nhất</div>
+                                    <div id="schedule-track-history" class="grid gap-2">
+                                        {schedule_tracking["history_html"]}
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </section>
                 </div>
