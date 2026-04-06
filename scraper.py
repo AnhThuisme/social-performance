@@ -2723,18 +2723,8 @@ def build_posts_panel_html(sheet=None):
         </section>
         """
 
-    active_sheet_slug = next(
-        (item["sheet_slug"] for item in datasets if item["sheet_title"] == ACTIVE_SHEET_NAME),
-        datasets[0]["sheet_slug"],
-    )
-    active_sheet_title = next(
-        (item["sheet_title"] for item in datasets if item["sheet_slug"] == active_sheet_slug),
-        datasets[0]["sheet_title"],
-    )
-    active_total_posts = next(
-        (item["total_posts"] for item in datasets if item["sheet_slug"] == active_sheet_slug),
-        datasets[0]["total_posts"],
-    )
+    active_sheet_title = "Chưa chọn tab"
+    active_total_posts = 0
     schedule_selected_count = len(normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID))
     spreadsheet_snapshot_url = build_snapshot_url(ACTIVE_SHEET_ID, ACTIVE_SHEET_GID)
 
@@ -2742,15 +2732,13 @@ def build_posts_panel_html(sheet=None):
     detail_panels_html = []
     for dataset in datasets:
         safe_sheet_title = html.escape(dataset["sheet_title"])
-        is_active = dataset["sheet_slug"] == active_sheet_slug
-        card_class = " is-active" if is_active else ""
         error_html = (
             f'<div class="posts-sheet-card-error">{html.escape(shorten_text(dataset["error"], 88))}</div>'
             if dataset["error"] else ""
         )
         summary_cards_html.append(
             f"""
-            <button type="button" class="posts-sheet-card{card_class}" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}">
+            <button type="button" class="posts-sheet-card" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}">
                 <div class="posts-sheet-card-head">
                     <div>
                         <div class="posts-sheet-card-kicker">Tab sheet</div>
@@ -2784,10 +2772,9 @@ def build_posts_panel_html(sheet=None):
                 if key == "all" or count > 0
             ]
         )
-        panel_active_class = " is-active" if is_active else ""
         detail_panels_html.append(
             f"""
-            <div class="posts-tab-panel{panel_active_class}" data-posts-tab-panel="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-platform="all">
+            <div class="posts-tab-panel" data-posts-tab-panel="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-platform="all">
                 <div class="posts-tab-panel-head">
                     <div>
                         <div class="posts-tab-panel-kicker">Đang xem tab</div>
@@ -2887,6 +2874,13 @@ def build_posts_panel_html(sheet=None):
             </div>
 
             <div class="posts-tab-panels">
+                <div id="posts-detail-placeholder" class="posts-detail-placeholder">
+                    <div class="posts-empty-card rounded-[1.5rem] p-8 text-center">
+                        <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Chi tiết bài đăng</div>
+                        <div class="mt-3 text-2xl font-black text-slate-100">Chọn một tab sheet để xem chi tiết</div>
+                        <p class="mt-2 text-sm text-slate-400">Bấm vào từng card sheet phía trên để mở bảng bài đăng, lọc dữ liệu và chọn bài cho lịch tự động.</p>
+                    </div>
+                </div>
                 {"".join(detail_panels_html)}
             </div>
         </div>
@@ -4474,6 +4468,12 @@ def home(request: Request):
             .posts-tab-panels {{
                 display: grid;
                 gap: 16px;
+            }}
+            .posts-detail-placeholder {{
+                display: block;
+            }}
+            .posts-detail-placeholder.hidden {{
+                display: none;
             }}
             .posts-tab-panel {{
                 display: none;
@@ -6388,9 +6388,11 @@ def home(request: Request):
                 let postsActiveTabLabel = document.getElementById("posts-active-tab-label");
                 let postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
                 let postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
+                let postsDetailPlaceholder = document.getElementById("posts-detail-placeholder");
                 const sidebarLinks = Array.from(document.querySelectorAll("[data-nav-link]"));
                 const dashboardSections = Array.from(document.querySelectorAll("[data-dashboard-section]"));
                 let refreshInFlight = false;
+                let activePostsTabSlug = "";
 
                 const showNotice = (_message = "", _level = "info") => {{}};
                 const syncPostsDomRefs = () => {{
@@ -6398,6 +6400,7 @@ def home(request: Request):
                     postsActiveTabLabel = document.getElementById("posts-active-tab-label");
                     postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
                     postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
+                    postsDetailPlaceholder = document.getElementById("posts-detail-placeholder");
                     postsScheduleCount = document.getElementById("schedule-selected-count");
                     saveScheduleTargetsBtn = document.getElementById("save-schedule-targets-btn");
                     clearScheduleTargetsBtn = document.getElementById("clear-schedule-targets-btn");
@@ -6952,6 +6955,9 @@ def home(request: Request):
                         if (postsVisibleCount) {{
                             postsVisibleCount.textContent = "0 bài";
                         }}
+                        if (postsActiveTabLabel) {{
+                            postsActiveTabLabel.textContent = "Chưa chọn tab";
+                        }}
                         return;
                     }}
                     const searchInput = panel.querySelector(".posts-search-field");
@@ -6988,13 +6994,17 @@ def home(request: Request):
                 const setActivePostsTab = (tabSlug) => {{
                     const safeSlug = postsTabCards.some((card) => card.dataset.postsTabTrigger === tabSlug)
                         ? tabSlug
-                        : (postsTabCards[0]?.dataset.postsTabTrigger || "");
+                        : "";
+                    activePostsTabSlug = safeSlug;
                     postsTabCards.forEach((card) => {{
                         card.classList.toggle("is-active", card.dataset.postsTabTrigger === safeSlug);
                     }});
                     postsTabPanels.forEach((panel) => {{
                         panel.classList.toggle("is-active", panel.dataset.postsTabPanel === safeSlug);
                     }});
+                    if (postsDetailPlaceholder) {{
+                        postsDetailPlaceholder.classList.toggle("hidden", Boolean(safeSlug));
+                    }}
                     applyPostFilters(getActivePostsPanel());
                 }};
 
@@ -7077,12 +7087,13 @@ def home(request: Request):
                     }}
 
                     if (postsTabCards.length) {{
-                        const initialPostsTab = postsTabCards.find((card) => card.classList.contains("is-active"))?.dataset.postsTabTrigger
-                            || postsTabCards[0].dataset.postsTabTrigger;
-                        setActivePostsTab(initialPostsTab || "");
+                        const initialPostsTab = postsTabCards.some((card) => card.dataset.postsTabTrigger === activePostsTabSlug)
+                            ? activePostsTabSlug
+                            : "";
+                        setActivePostsTab(initialPostsTab);
                     }} else {{
                         if (postsVisibleCount) postsVisibleCount.textContent = "0 bài";
-                        if (postsActiveTabLabel) postsActiveTabLabel.textContent = "Chưa chọn";
+                        if (postsActiveTabLabel) postsActiveTabLabel.textContent = "Chưa chọn tab";
                     }}
                     syncPostsSelectionState();
                     applySavedScheduleTargetsToPosts(true);
