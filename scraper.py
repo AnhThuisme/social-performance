@@ -36,6 +36,11 @@ AUTH_SETTINGS_FILE = (
     or ("/tmp/auth_settings.json" if IS_VERCEL else "auth_settings.json")
 )
 AUTH_SETTINGS_KV_KEY = str(os.getenv("AUTH_SETTINGS_KV_KEY", "social-monitor:auth-settings") or "").strip() or "social-monitor:auth-settings"
+APP_RUNTIME_STATE_FILE = (
+    str(os.getenv("APP_RUNTIME_STATE_FILE", "") or "").strip()
+    or ("/tmp/app_runtime_state.json" if IS_VERCEL else "app_runtime_state.json")
+)
+APP_RUNTIME_STATE_KEY = str(os.getenv("APP_RUNTIME_STATE_KEY", "social-monitor:runtime-state") or "").strip() or "social-monitor:runtime-state"
 KV_REST_API_URL = (
     str(os.getenv("KV_REST_API_URL", "") or "").strip()
     or str(os.getenv("UPSTASH_REDIS_REST_URL", "") or "").strip()
@@ -132,6 +137,8 @@ last_schedule_run_key = ""
 scheduler_thread = None
 scheduler_stop_event = threading.Event()
 AUTH_SETTINGS_REDIS_CLIENT = None
+MAX_RUNTIME_LOGS = 50
+MAX_RUNTIME_HISTORY = 8
 
 def normalize_email_address(value: str) -> str:
     return (value or "").strip().lower()
@@ -434,6 +441,297 @@ def load_auth_settings():
             # Serverless deployments may not preserve local writes; continue with in-memory defaults.
             pass
     return settings
+
+
+RUNTIME_STATE_HYDRATING = False
+
+
+def _serialize_runtime_datetime(value: Optional[datetime]) -> str:
+    if not isinstance(value, datetime):
+        return ""
+    try:
+        return value.isoformat()
+    except Exception:
+        return ""
+
+
+def _deserialize_runtime_datetime(value) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
+
+
+def _safe_runtime_int(value, default: int = 0, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _safe_runtime_float(value, default: float = 0.0, minimum: Optional[float] = None) -> float:
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    return parsed
+
+
+def _normalize_runtime_state(data):
+    if not isinstance(data, dict):
+        return {}
+
+    active_sheet_id_raw = str(data.get("active_sheet_id", "") or "").strip()
+    schedule_sheet_id_raw = str(data.get("schedule_sheet_id", "") or "").strip()
+    normalized_overrides = {}
+    raw_overrides = data.get("column_overrides", {})
+    if isinstance(raw_overrides, dict):
+        for field in COLUMN_OVERRIDES:
+            raw_value = raw_overrides.get(field)
+            if raw_value in (None, "", 0, "0"):
+                normalized_overrides[field] = None
+                continue
+            try:
+                parsed_value = int(raw_value)
+            except Exception:
+                parsed_value = None
+            normalized_overrides[field] = parsed_value if parsed_value and parsed_value > 0 else None
+    else:
+        normalized_overrides = {field: None for field in COLUMN_OVERRIDES}
+
+    normalized_start_row = _safe_runtime_int(data.get("start_row", START_ROW) or START_ROW, default=START_ROW, minimum=2)
+
+    schedule_mode_value = str(data.get("schedule_mode", "off") or "off").strip().lower()
+    if schedule_mode_value not in {"off", "daily", "weekly", "monthly"}:
+        schedule_mode_value = "off"
+
+    hour, minute = parse_schedule_time(str(data.get("schedule_time", schedule_time) or schedule_time))
+    schedule_weekday_value = _safe_runtime_int(data.get("schedule_weekday", schedule_weekday) or schedule_weekday, default=schedule_weekday, minimum=0, maximum=6)
+    schedule_monthday_value = _safe_runtime_int(data.get("schedule_monthday", schedule_monthday) or schedule_monthday, default=schedule_monthday, minimum=1, maximum=28)
+    try:
+        normalized_end_date = parse_schedule_date(str(data.get("schedule_end_date", schedule_end_date) or schedule_end_date))
+    except Exception:
+        normalized_end_date = ""
+
+    raw_targets = data.get("schedule_targets", [])
+    normalized_targets = normalize_schedule_targets(raw_targets, extract_sheet_id(active_sheet_id_raw) or active_sheet_id_raw or None)
+
+    raw_history = data.get("schedule_run_history", [])
+    normalized_history = [item for item in raw_history if isinstance(item, dict)][:MAX_RUNTIME_HISTORY]
+    raw_logs = data.get("logs", [])
+    normalized_logs = [str(item) for item in raw_logs if str(item or "").strip()][:MAX_RUNTIME_LOGS]
+
+    return {
+        "active_sheet_id": extract_sheet_id(active_sheet_id_raw) or active_sheet_id_raw,
+        "active_sheet_name": str(data.get("active_sheet_name", "") or "").strip(),
+        "active_sheet_gid": str(data.get("active_sheet_gid", "0") or "0").strip() or "0",
+        "column_overrides": normalized_overrides,
+        "start_row": normalized_start_row,
+        "schedule_mode": schedule_mode_value,
+        "schedule_time": f"{hour:02d}:{minute:02d}",
+        "schedule_weekday": schedule_weekday_value,
+        "schedule_monthday": schedule_monthday_value,
+        "schedule_end_date": normalized_end_date,
+        "schedule_sheet_id": extract_sheet_id(schedule_sheet_id_raw) or schedule_sheet_id_raw,
+        "schedule_sheet_name": str(data.get("schedule_sheet_name", "") or "").strip(),
+        "schedule_sheet_gid": str(data.get("schedule_sheet_gid", "0") or "0").strip() or "0",
+        "schedule_targets": normalized_targets,
+        "schedule_last_run_started_at": _deserialize_runtime_datetime(data.get("schedule_last_run_started_at")),
+        "schedule_last_run_finished_at": _deserialize_runtime_datetime(data.get("schedule_last_run_finished_at")),
+        "schedule_last_run_duration_seconds": _safe_runtime_float(data.get("schedule_last_run_duration_seconds", 0.0) or 0.0, default=0.0, minimum=0.0),
+        "schedule_last_run_status": str(data.get("schedule_last_run_status", "idle") or "idle").strip() or "idle",
+        "schedule_last_run_source": str(data.get("schedule_last_run_source", "") or "").strip(),
+        "schedule_last_run_sheet_name": str(data.get("schedule_last_run_sheet_name", "") or "").strip(),
+        "schedule_last_run_processed": _safe_runtime_int(data.get("schedule_last_run_processed", 0) or 0, default=0, minimum=0),
+        "schedule_last_run_success": _safe_runtime_int(data.get("schedule_last_run_success", 0) or 0, default=0, minimum=0),
+        "schedule_last_run_failed": _safe_runtime_int(data.get("schedule_last_run_failed", 0) or 0, default=0, minimum=0),
+        "schedule_run_history": normalized_history,
+        "logs": normalized_logs,
+        "last_schedule_run_key": str(data.get("last_schedule_run_key", "") or "").strip(),
+    }
+
+
+def build_runtime_state_payload():
+    return {
+        "version": 1,
+        "active_sheet_id": ACTIVE_SHEET_ID or "",
+        "active_sheet_name": ACTIVE_SHEET_NAME or "",
+        "active_sheet_gid": ACTIVE_SHEET_GID or "0",
+        "column_overrides": dict(COLUMN_OVERRIDES),
+        "start_row": int(START_ROW or 2),
+        "schedule_mode": schedule_mode,
+        "schedule_time": schedule_time,
+        "schedule_weekday": int(schedule_weekday or 0),
+        "schedule_monthday": int(schedule_monthday or 1),
+        "schedule_end_date": schedule_end_date or "",
+        "schedule_sheet_id": schedule_sheet_id or "",
+        "schedule_sheet_name": schedule_sheet_name or "",
+        "schedule_sheet_gid": schedule_sheet_gid or "0",
+        "schedule_targets": normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID),
+        "schedule_last_run_started_at": _serialize_runtime_datetime(schedule_last_run_started_at),
+        "schedule_last_run_finished_at": _serialize_runtime_datetime(schedule_last_run_finished_at),
+        "schedule_last_run_duration_seconds": float(schedule_last_run_duration_seconds or 0.0),
+        "schedule_last_run_status": schedule_last_run_status or "idle",
+        "schedule_last_run_source": schedule_last_run_source or "",
+        "schedule_last_run_sheet_name": schedule_last_run_sheet_name or "",
+        "schedule_last_run_processed": int(schedule_last_run_processed or 0),
+        "schedule_last_run_success": int(schedule_last_run_success or 0),
+        "schedule_last_run_failed": int(schedule_last_run_failed or 0),
+        "schedule_run_history": list(schedule_run_history[:MAX_RUNTIME_HISTORY]),
+        "logs": list(logs[:MAX_RUNTIME_LOGS]),
+        "last_schedule_run_key": last_schedule_run_key or "",
+    }
+
+
+def save_runtime_state_to_kv(payload: dict):
+    execute_auth_settings_kv_command(
+        "SET",
+        APP_RUNTIME_STATE_KEY,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def load_runtime_state_from_kv():
+    raw_value = execute_auth_settings_kv_command("GET", APP_RUNTIME_STATE_KEY)
+    if raw_value in (None, ""):
+        return {}
+    if isinstance(raw_value, str):
+        try:
+            return json.loads(raw_value)
+        except Exception:
+            return {}
+    return raw_value if isinstance(raw_value, dict) else {}
+
+
+def save_runtime_state_to_redis(payload: dict):
+    client = get_auth_settings_redis_client()
+    client.set(APP_RUNTIME_STATE_KEY, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+def load_runtime_state_from_redis():
+    client = get_auth_settings_redis_client()
+    raw_value = client.get(APP_RUNTIME_STATE_KEY)
+    if raw_value in (None, ""):
+        return {}
+    if isinstance(raw_value, str):
+        try:
+            return json.loads(raw_value)
+        except Exception:
+            return {}
+    return raw_value if isinstance(raw_value, dict) else {}
+
+
+def save_runtime_state_to_file(payload: dict):
+    directory = os.path.dirname(APP_RUNTIME_STATE_FILE)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(APP_RUNTIME_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def load_runtime_state_from_file():
+    if not os.path.exists(APP_RUNTIME_STATE_FILE):
+        return {}
+    try:
+        with open(APP_RUNTIME_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_runtime_state(payload: Optional[dict] = None):
+    target = _normalize_runtime_state(payload if isinstance(payload, dict) else build_runtime_state_payload())
+    if has_auth_settings_kv():
+        save_runtime_state_to_kv(target)
+        return target
+    if has_auth_settings_redis_url():
+        save_runtime_state_to_redis(target)
+        return target
+    save_runtime_state_to_file(target)
+    return target
+
+
+def load_runtime_state():
+    if has_auth_settings_kv():
+        try:
+            return _normalize_runtime_state(load_runtime_state_from_kv())
+        except Exception:
+            return {}
+    if has_auth_settings_redis_url():
+        try:
+            return _normalize_runtime_state(load_runtime_state_from_redis())
+        except Exception:
+            return {}
+    return _normalize_runtime_state(load_runtime_state_from_file())
+
+
+def persist_runtime_state():
+    if RUNTIME_STATE_HYDRATING:
+        return
+    try:
+        save_runtime_state()
+    except Exception:
+        pass
+
+
+def restore_runtime_state():
+    global RUNTIME_STATE_HYDRATING
+    global ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME, ACTIVE_SHEET_GID
+    global COLUMN_OVERRIDES, START_ROW
+    global schedule_mode, schedule_time, schedule_weekday, schedule_monthday, schedule_end_date
+    global schedule_sheet_id, schedule_sheet_name, schedule_sheet_gid, schedule_targets
+    global schedule_last_run_started_at, schedule_last_run_finished_at, schedule_last_run_duration_seconds
+    global schedule_last_run_status, schedule_last_run_source, schedule_last_run_sheet_name
+    global schedule_last_run_processed, schedule_last_run_success, schedule_last_run_failed
+    global schedule_run_history, logs, last_schedule_run_key
+
+    state = load_runtime_state()
+    if not state:
+        return
+
+    RUNTIME_STATE_HYDRATING = True
+    try:
+        ACTIVE_SHEET_ID = state.get("active_sheet_id", "") or ""
+        ACTIVE_SHEET_NAME = state.get("active_sheet_name", "") or ""
+        ACTIVE_SHEET_GID = state.get("active_sheet_gid", "0") or "0"
+        COLUMN_OVERRIDES = {
+            field: state.get("column_overrides", {}).get(field)
+            for field in COLUMN_OVERRIDES
+        }
+        START_ROW = _safe_runtime_int(state.get("start_row", START_ROW) or START_ROW, default=START_ROW, minimum=2)
+        schedule_mode = state.get("schedule_mode", schedule_mode) or schedule_mode
+        schedule_time = state.get("schedule_time", schedule_time) or schedule_time
+        schedule_weekday = _safe_runtime_int(state.get("schedule_weekday", schedule_weekday) or schedule_weekday, default=schedule_weekday, minimum=0, maximum=6)
+        schedule_monthday = _safe_runtime_int(state.get("schedule_monthday", schedule_monthday) or schedule_monthday, default=schedule_monthday, minimum=1, maximum=28)
+        schedule_end_date = state.get("schedule_end_date", "") or ""
+        schedule_sheet_id = state.get("schedule_sheet_id", "") or ""
+        schedule_sheet_name = state.get("schedule_sheet_name", "") or ""
+        schedule_sheet_gid = state.get("schedule_sheet_gid", "0") or "0"
+        schedule_targets = normalize_schedule_targets(state.get("schedule_targets", []), ACTIVE_SHEET_ID or None)
+        schedule_last_run_started_at = state.get("schedule_last_run_started_at")
+        schedule_last_run_finished_at = state.get("schedule_last_run_finished_at")
+        schedule_last_run_duration_seconds = _safe_runtime_float(state.get("schedule_last_run_duration_seconds", 0.0) or 0.0, default=0.0, minimum=0.0)
+        schedule_last_run_status = state.get("schedule_last_run_status", "idle") or "idle"
+        schedule_last_run_source = state.get("schedule_last_run_source", "") or ""
+        schedule_last_run_sheet_name = state.get("schedule_last_run_sheet_name", "") or ""
+        schedule_last_run_processed = _safe_runtime_int(state.get("schedule_last_run_processed", 0) or 0, default=0, minimum=0)
+        schedule_last_run_success = _safe_runtime_int(state.get("schedule_last_run_success", 0) or 0, default=0, minimum=0)
+        schedule_last_run_failed = _safe_runtime_int(state.get("schedule_last_run_failed", 0) or 0, default=0, minimum=0)
+        schedule_run_history = list(state.get("schedule_run_history", []))[:MAX_RUNTIME_HISTORY]
+        logs = list(state.get("logs", []))[:MAX_RUNTIME_LOGS]
+        last_schedule_run_key = state.get("last_schedule_run_key", "") or ""
+    finally:
+        RUNTIME_STATE_HYDRATING = False
 
 def persist_auth_settings(settings):
     global AUTH_SETTINGS
@@ -1354,7 +1652,9 @@ def add_log(msg):
     timestamp = datetime.now().strftime("%H:%M:%S")
     # store full messages (trim list length), useful for debugging unicode/errors
     logs.insert(0, f"[{timestamp}] {msg}")
-    if len(logs) > 50: logs.pop()
+    if len(logs) > MAX_RUNTIME_LOGS:
+        logs = logs[:MAX_RUNTIME_LOGS]
+    persist_runtime_state()
 
 def build_log_html():
     if not logs:
@@ -1646,7 +1946,8 @@ def compute_next_schedule_run(reference: Optional[datetime] = None):
 def push_schedule_run_history(entry: dict):
     global schedule_run_history
     schedule_run_history.insert(0, entry)
-    schedule_run_history = schedule_run_history[:8]
+    schedule_run_history = schedule_run_history[:MAX_RUNTIME_HISTORY]
+    persist_runtime_state()
 
 
 def build_schedule_target_key(sheet_id: Optional[str], sheet_name: str, row_idx, link: str) -> str:
@@ -3102,6 +3403,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
 # --- API & UI ---
 @app.on_event("startup")
 def on_startup():
+    restore_runtime_state()
     ensure_scheduler_thread()
 
 @app.get("/healthz")

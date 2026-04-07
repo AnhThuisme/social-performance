@@ -32,8 +32,17 @@ Dung 1 trong 2 cap bien moi truong sau:
 Key mac dinh:
 
 - `AUTH_SETTINGS_KV_KEY=social-monitor:auth-settings`
+- `APP_RUNTIME_STATE_KEY=social-monitor:runtime-state`
 
 Chi can ket noi Redis tren Vercel Marketplace / Upstash, them cap env phu hop, roi redeploy. Sau do cac thay doi o tab Nhan vien, access policy va mail config se khong bi mat sau reload.
+
+App cung luu ben vung mot phan runtime state tren Redis de tranh bi mat sau moi lan push/deploy, bao gom:
+
+- sheet dang chon
+- cau hinh cot va dong bat dau
+- lich tu dong
+- danh sach bai da gan cho lich
+- lich su lan chay gan day va log moi nhat
 
 ## Selenium tren Vercel
 
