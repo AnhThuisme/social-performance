@@ -18,6 +18,8 @@ DEFAULT_SETTLE_SECONDS = max(0.2, float(os.getenv("SELENIUM_SETTLE_SECONDS", "0.
 DEFAULT_SCROLL_SETTLE_SECONDS = max(0.05, float(os.getenv("SELENIUM_SCROLL_SETTLE_SECONDS", "0.18") or "0.18"))
 DEFAULT_READY_POLL_SECONDS = max(0.05, float(os.getenv("SELENIUM_READY_POLL_SECONDS", "0.15") or "0.15"))
 DEFAULT_READY_TIMEOUT_SECONDS = max(0.5, float(os.getenv("SELENIUM_READY_TIMEOUT_SECONDS", "2.4") or "2.4"))
+REMOTE_DRIVER_RETRY_ATTEMPTS = max(1, int(os.getenv("SELENIUM_REMOTE_RETRY_ATTEMPTS", "3") or "3"))
+REMOTE_DRIVER_RETRY_DELAY_SECONDS = max(0.5, float(os.getenv("SELENIUM_REMOTE_RETRY_DELAY_SECONDS", "2") or "2"))
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -129,6 +131,10 @@ def _remote_url() -> str:
     elif normalized.endswith("/status"):
         normalized = normalized[: -len("/status")]
     return normalized
+
+
+def has_remote_selenium_url() -> bool:
+    return bool(_remote_url())
 
 
 def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
@@ -267,13 +273,27 @@ def create_selenium_driver(
     builders.extend(local_builders)
 
     for browser_name, builder in builders:
-        try:
-            driver = builder(headless=headless)
-            mode = "headless" if headless else "normal"
-            _emit(logger, f"Selenium dang dung {browser_name} {mode}")
-            return driver
-        except Exception as exc:
-            errors.append(f"{browser_name}: {str(exc)[:180]}")
+        is_remote_builder = browser_name.lower().startswith("remote ")
+        max_attempts = REMOTE_DRIVER_RETRY_ATTEMPTS if is_remote_builder else 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                driver = builder(headless=headless)
+                mode = "headless" if headless else "normal"
+                _emit(logger, f"Selenium dang dung {browser_name} {mode}")
+                return driver
+            except Exception as exc:
+                error_detail = describe_webdriver_error(exc)
+                recoverable = is_remote_builder and is_recoverable_webdriver_error(error_detail)
+                if recoverable and attempt < max_attempts:
+                    delay_seconds = REMOTE_DRIVER_RETRY_DELAY_SECONDS * attempt
+                    _emit(
+                        logger,
+                        f"{browser_name} tam thoi chua san sang, thu mo lai lan {attempt + 1}/{max_attempts} sau {delay_seconds:.1f}s...",
+                    )
+                    time.sleep(delay_seconds)
+                    continue
+                errors.append(f"{browser_name}: {error_detail[:180]}")
+                break
 
     message = "Khong mo duoc Selenium browser. " + " | ".join(errors)
     if IS_VERCEL_RUNTIME and not _remote_url():

@@ -30,6 +30,7 @@ from social_selenium import (
     create_selenium_driver,
     close_selenium_driver,
     fetch_social_stats,
+    has_remote_selenium_url,
 )
 
 try:
@@ -3557,8 +3558,11 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         try:
                             social_driver = create_selenium_driver(logger=add_log)
                         except Exception as driver_error:
-                            social_driver_failed = True
                             add_log(str(driver_error))
+                            if has_remote_selenium_url():
+                                social_driver = None
+                            else:
+                                social_driver_failed = True
                     if social_driver_failed:
                         stats = None
                     else:
