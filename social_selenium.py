@@ -72,13 +72,27 @@ def _apply_stealth(driver):
 
 
 def _remote_url() -> str:
-    return _first_env("SELENIUM_REMOTE_URL", "REMOTE_WEBDRIVER_URL")
+    raw_value = _first_env("SELENIUM_REMOTE_URL", "REMOTE_WEBDRIVER_URL")
+    if not raw_value:
+        return ""
+
+    normalized = raw_value.strip().strip("\"'").rstrip("/")
+    if normalized.lower() in {"value", "your-value", "your_url_here"}:
+        return ""
+    if normalized.endswith("/wd/hub/status"):
+        normalized = normalized[: -len("/wd/hub/status")]
+    elif normalized.endswith("/status"):
+        normalized = normalized[: -len("/status")]
+    return normalized
 
 
 def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
     remote_url = _remote_url()
     if not remote_url:
-        raise RuntimeError("Missing SELENIUM_REMOTE_URL or REMOTE_WEBDRIVER_URL")
+        raise RuntimeError(
+            "Missing or invalid SELENIUM_REMOTE_URL. "
+            "Use a Selenium server URL like https://your-service.onrender.com/wd/hub"
+        )
 
     browser_key = (browser_name or "chrome").strip().lower()
     if browser_key == "edge":
@@ -90,7 +104,13 @@ def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
         options.add_experimental_option("useAutomationExtension", False)
 
     _add_common_browser_args(options, headless=headless)
-    driver = webdriver.Remote(command_executor=remote_url, options=options)
+    try:
+        driver = webdriver.Remote(command_executor=remote_url, options=options)
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Remote Selenium URL khong dung dinh dang: {remote_url}. "
+            "Hay dung URL server, khong dung trang /status."
+        ) from exc
     driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
     return driver

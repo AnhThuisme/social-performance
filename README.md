@@ -16,6 +16,15 @@ FastAPI dashboard de quet social metrics tu Google Sheets, co Selenium, OTP mail
 
 App mac dinh lang nghe tren `0.0.0.0:${PORT:-8000}`.
 
+## Timezone va giam read quota
+
+App da ho tro 2 bien moi truong de dashboard hien dung gio va giam viec doc Google Sheets qua day:
+
+- `APP_TIMEZONE=Asia/Bangkok`
+- `SHEET_CACHE_TTL_SECONDS=45`
+
+Neu thay loi `Quota exceeded for quota metric 'Read requests'`, hay redeploy ban moi, doi khoang 60 giay cho quota nguoi dung reset, roi thu lai. Cache ngan nay giup giam viec goi lap lai khi nhap sheet, tai danh sach tab va render dashboard.
+
 ## Luu user ben vung tren Vercel
 
 Neu deploy tren Vercel thi danh sach nhan vien, access policy va mail config khong nen luu vao file local vi serverless filesystem la tam thoi. App nay da ho tro luu auth settings vao Redis REST.

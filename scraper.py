@@ -26,6 +26,11 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
 app = FastAPI()
 
 # ==========================================
@@ -139,6 +144,14 @@ scheduler_stop_event = threading.Event()
 AUTH_SETTINGS_REDIS_CLIENT = None
 MAX_RUNTIME_LOGS = 50
 MAX_RUNTIME_HISTORY = 8
+APP_TIMEZONE_NAME = str(os.getenv("APP_TIMEZONE", "Asia/Bangkok") or "").strip() or "Asia/Bangkok"
+SHEET_CACHE_TTL_SECONDS = max(10.0, float(os.getenv("SHEET_CACHE_TTL_SECONDS", "45") or "45"))
+SHEET_RUNTIME_CACHE = {}
+
+try:
+    APP_TIMEZONE = ZoneInfo(APP_TIMEZONE_NAME) if ZoneInfo else None
+except Exception:
+    APP_TIMEZONE = None
 
 def normalize_email_address(value: str) -> str:
     return (value or "").strip().lower()
@@ -154,6 +167,103 @@ def parse_bool_env(value: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def now_local() -> datetime:
+    return datetime.now(APP_TIMEZONE) if APP_TIMEZONE else datetime.now()
+
+
+def localize_datetime(value: Optional[datetime]) -> Optional[datetime]:
+    if not isinstance(value, datetime):
+        return None
+    if APP_TIMEZONE and value.tzinfo is None:
+        return value.replace(tzinfo=APP_TIMEZONE)
+    if APP_TIMEZONE and value.tzinfo is not None:
+        try:
+            return value.astimezone(APP_TIMEZONE)
+        except Exception:
+            return value
+    return value
+
+
+def make_local_datetime(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: int = 0) -> datetime:
+    if APP_TIMEZONE:
+        return datetime(year, month, day, hour, minute, second, tzinfo=APP_TIMEZONE)
+    return datetime(year, month, day, hour, minute, second)
+
+
+def get_sheet_cache(cache_key):
+    cached = SHEET_RUNTIME_CACHE.get(cache_key)
+    if not cached:
+        return None
+    expires_at, value = cached
+    if expires_at <= time.time():
+        SHEET_RUNTIME_CACHE.pop(cache_key, None)
+        return None
+    return value
+
+
+def set_sheet_cache(cache_key, value, ttl: Optional[float] = None):
+    try:
+        cache_ttl = max(1.0, float(ttl if ttl is not None else SHEET_CACHE_TTL_SECONDS))
+    except Exception:
+        cache_ttl = SHEET_CACHE_TTL_SECONDS
+    SHEET_RUNTIME_CACHE[cache_key] = (time.time() + cache_ttl, value)
+    return value
+
+
+def clear_sheet_runtime_cache(sheet_id: Optional[str] = None, sheet_name: Optional[str] = None):
+    normalized_sheet_id = extract_sheet_id(str(sheet_id or "").strip()) or str(sheet_id or "").strip()
+    normalized_sheet_name = str(sheet_name or "").strip()
+    if not normalized_sheet_id and not normalized_sheet_name:
+        SHEET_RUNTIME_CACHE.clear()
+        return
+    removable_keys = []
+    for cache_key in list(SHEET_RUNTIME_CACHE.keys()):
+        key_parts = cache_key if isinstance(cache_key, tuple) else (cache_key,)
+        if normalized_sheet_id and normalized_sheet_id in key_parts:
+            removable_keys.append(cache_key)
+            continue
+        if normalized_sheet_name and normalized_sheet_name in key_parts:
+            removable_keys.append(cache_key)
+    for cache_key in removable_keys:
+        SHEET_RUNTIME_CACHE.pop(cache_key, None)
+
+
+def build_worksheet_cache_key(sheet):
+    try:
+        spreadsheet_id = str(getattr(getattr(sheet, "spreadsheet", None), "id", "") or ACTIVE_SHEET_ID or "").strip()
+    except Exception:
+        spreadsheet_id = str(ACTIVE_SHEET_ID or "").strip()
+    return (
+        spreadsheet_id,
+        str(getattr(sheet, "title", "") or "").strip(),
+        str(getattr(sheet, "id", "") or "").strip(),
+    )
+
+
+def extract_sheet_values(raw_values):
+    if isinstance(raw_values, dict):
+        values = raw_values.get("values", [])
+        return values if isinstance(values, list) else []
+    return raw_values if isinstance(raw_values, list) else []
+
+
+def is_google_sheet_read_quota_error(exc) -> bool:
+    error_text = str(exc or "").lower()
+    return (
+        "quota exceeded" in error_text
+        and "read requests" in error_text
+        and "sheets.googleapis.com" in error_text
+    )
+
+
+def describe_google_sheet_error(exc, include_raw: bool = False) -> str:
+    raw_message = str(exc or "").strip() or "Không rõ lỗi."
+    if is_google_sheet_read_quota_error(exc):
+        friendly = "Google Sheets đang chạm giới hạn đọc dữ liệu. Đợi khoảng 60 giây rồi thử lại."
+        return f"{friendly} ({raw_message})" if include_raw else friendly
+    return raw_message
 
 
 def build_google_credentials():
@@ -819,7 +929,7 @@ def record_user_login(email: str):
         login_count = max(0, int(current_meta.get("login_count", 0) or 0))
     except Exception:
         login_count = 0
-    current_meta["last_login_at"] = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    current_meta["last_login_at"] = now_local().strftime("%d/%m/%Y %H:%M:%S")
     current_meta["login_count"] = login_count + 1
     user_meta[normalized_email] = current_meta
     settings["user_meta"] = user_meta
@@ -1649,7 +1759,7 @@ def build_employee_panel_html(current_user):
 
 def add_log(msg):
     global logs
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    timestamp = now_local().strftime("%H:%M:%S")
     # store full messages (trim list length), useful for debugging unicode/errors
     logs.insert(0, f"[{timestamp}] {msg}")
     if len(logs) > MAX_RUNTIME_LOGS:
@@ -1882,7 +1992,8 @@ def format_datetime_display(value) -> str:
     if isinstance(value, str):
         return value
     try:
-        return value.strftime("%d/%m/%Y %H:%M:%S")
+        localized = localize_datetime(value) or value
+        return localized.strftime("%d/%m/%Y %H:%M:%S")
     except Exception:
         return str(value)
 
@@ -1906,7 +2017,7 @@ def compute_next_schedule_run(reference: Optional[datetime] = None):
     if not binding["sheet_id"] or not binding["sheet_name"]:
         return None
 
-    now = reference or datetime.now()
+    now = localize_datetime(reference) if reference else now_local()
     hour, minute = parse_schedule_time(schedule_time)
     end_date = None
     if schedule_end_date:
@@ -1928,14 +2039,14 @@ def compute_next_schedule_run(reference: Optional[datetime] = None):
     elif schedule_mode == "monthly":
         year = now.year
         month = now.month
-        candidate = datetime(year, month, schedule_monthday, hour, minute)
+        candidate = make_local_datetime(year, month, schedule_monthday, hour, minute)
         if candidate <= now:
             if month == 12:
                 year += 1
                 month = 1
             else:
                 month += 1
-            candidate = datetime(year, month, schedule_monthday, hour, minute)
+            candidate = make_local_datetime(year, month, schedule_monthday, hour, minute)
     else:
         return None
 
@@ -2196,7 +2307,7 @@ def schedule_worker():
     while not scheduler_stop_event.is_set():
         try:
             if schedule_mode != "off" and not is_running:
-                now = datetime.now()
+                now = now_local()
                 if should_run_schedule(now):
                     add_log(f"Kích hoạt lịch tự động: {schedule_label()}")
                     binding = get_schedule_sheet_binding()
@@ -2257,28 +2368,65 @@ def extract_sheet_id(sheet_input: str) -> Optional[str]:
         return candidate
     return None
 
-def get_worksheet(sheet_name, sheet_id: Optional[str] = None):
+def get_spreadsheet(sheet_id: Optional[str] = None):
+    resolved_sheet_id = extract_sheet_id(str(sheet_id or ACTIVE_SHEET_ID or "").strip()) or str(sheet_id or ACTIVE_SHEET_ID or "").strip()
+    if not resolved_sheet_id:
+        raise ValueError("Chưa có Spreadsheet ID để truy cập.")
+    cache_key = ("spreadsheet", resolved_sheet_id)
+    cached = get_sheet_cache(cache_key)
+    if cached is not None:
+        return cached
     gc = get_gspread_client()
-    spreadsheet = gc.open_by_key(sheet_id or ACTIVE_SHEET_ID)
-    return spreadsheet.worksheet(sheet_name)
+    spreadsheet = gc.open_by_key(resolved_sheet_id)
+    return set_sheet_cache(cache_key, spreadsheet)
+
+
+def get_spreadsheet_worksheets(spreadsheet, sheet_id: Optional[str] = None):
+    resolved_sheet_id = extract_sheet_id(str(sheet_id or getattr(spreadsheet, "id", "") or "").strip()) or str(sheet_id or getattr(spreadsheet, "id", "") or "").strip()
+    cache_key = ("worksheets", resolved_sheet_id)
+    cached = get_sheet_cache(cache_key)
+    if cached is not None:
+        return cached
+    worksheets = spreadsheet.worksheets()
+    return set_sheet_cache(cache_key, worksheets)
+
+
+def get_worksheet(sheet_name, sheet_id: Optional[str] = None):
+    resolved_sheet_id = extract_sheet_id(str(sheet_id or ACTIVE_SHEET_ID or "").strip()) or str(sheet_id or ACTIVE_SHEET_ID or "").strip()
+    resolved_sheet_name = str(sheet_name or "").strip()
+    if not resolved_sheet_name:
+        raise ValueError("Thiếu tên tab sheet.")
+    cache_key = ("worksheet", resolved_sheet_id, resolved_sheet_name)
+    cached = get_sheet_cache(cache_key)
+    if cached is not None:
+        return cached
+    spreadsheet = get_spreadsheet(resolved_sheet_id)
+    worksheet = spreadsheet.worksheet(resolved_sheet_name)
+    return set_sheet_cache(cache_key, worksheet)
 
 def list_spreadsheet_tabs(sheet_input: str):
     sheet_id = extract_sheet_id(sheet_input or "")
     if not sheet_id:
         raise ValueError("Link/ID spreadsheet không hợp lệ.")
-    gc = get_gspread_client()
-    spreadsheet = gc.open_by_key(sheet_id)
-    return [
+    cache_key = ("tabs", sheet_id)
+    cached = get_sheet_cache(cache_key)
+    if cached is not None:
+        return cached
+    spreadsheet = get_spreadsheet(sheet_id)
+    worksheets = get_spreadsheet_worksheets(spreadsheet, sheet_id)
+    tabs = [
         {
             "title": ws.title,
             "gid": str(ws.id),
         }
-        for ws in spreadsheet.worksheets()
+        for ws in worksheets
     ]
+    return set_sheet_cache(cache_key, tabs)
 
 def set_active_sheet(sheet_name, sheet_id: Optional[str] = None):
     global ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME, ACTIVE_SHEET_GID
     target_sheet_id = sheet_id or ACTIVE_SHEET_ID
+    clear_sheet_runtime_cache(target_sheet_id, sheet_name)
     ws = get_worksheet(sheet_name, target_sheet_id)
     ACTIVE_SHEET_ID = target_sheet_id
     ACTIVE_SHEET_NAME = sheet_name
@@ -2390,14 +2538,30 @@ def detect_columns_from_headers(headers):
     return columns
 
 def detect_sheet_layout(sheet, sample_rows: int = 5):
+    spreadsheet_id, sheet_title, sheet_gid = build_worksheet_cache_key(sheet)
+    cache_key = ("layout", spreadsheet_id, sheet_title, sheet_gid, max(1, int(sample_rows or 1)))
+    cached = get_sheet_cache(cache_key)
+    if cached is not None:
+        return cached
     best_row = 1
     best_headers = []
     best_columns = {}
     best_score = -1
     max_rows = max(1, int(sample_rows or 1))
+    sample_rows_data = []
+
+    try:
+        sample_rows_data = extract_sheet_values(sheet.get(f"1:{max_rows}"))
+    except Exception:
+        sample_rows_data = []
 
     for row_idx in range(1, max_rows + 1):
-        headers = sheet.row_values(row_idx)
+        headers = list(sample_rows_data[row_idx - 1]) if row_idx - 1 < len(sample_rows_data) else []
+        if not headers:
+            try:
+                headers = sheet.row_values(row_idx)
+            except Exception:
+                headers = []
         if not any(str(cell or "").strip() for cell in headers):
             continue
         columns = detect_columns_from_headers(headers)
@@ -2413,14 +2577,16 @@ def detect_sheet_layout(sheet, sample_rows: int = 5):
             best_score = score
 
     if best_score < 0:
-        best_headers = sheet.row_values(1)
+        best_headers = list(sample_rows_data[0]) if sample_rows_data else []
+        if not best_headers:
+            best_headers = sheet.row_values(1)
         best_columns = detect_columns_from_headers(best_headers)
 
-    return {
+    return set_sheet_cache(cache_key, {
         "header_row": best_row,
         "headers": best_headers,
         "columns": best_columns,
-    }
+    })
 
 def detect_sheet_columns(sheet):
     return detect_sheet_layout(sheet).get("columns", {})
@@ -2441,9 +2607,19 @@ def make_unique_sheet_headers(headers):
 def get_sheet_records(sheet, layout=None):
     resolved_layout = layout or detect_sheet_layout(sheet)
     header_row = max(1, int(resolved_layout.get("header_row") or 1))
-    raw_headers = list(resolved_layout.get("headers") or sheet.row_values(header_row) or [])
-    headers = make_unique_sheet_headers(raw_headers)
+    spreadsheet_id, sheet_title, sheet_gid = build_worksheet_cache_key(sheet)
+    cache_key = ("records", spreadsheet_id, sheet_title, sheet_gid, header_row)
+    cached = get_sheet_cache(cache_key)
+    if cached is not None:
+        return cached
+
     all_rows = sheet.get_all_values()
+    raw_headers = list(resolved_layout.get("headers") or [])
+    if (not raw_headers) and len(all_rows) >= header_row:
+        raw_headers = list(all_rows[header_row - 1] or [])
+    elif not raw_headers:
+        raw_headers = list(sheet.row_values(header_row) or [])
+    headers = make_unique_sheet_headers(raw_headers)
     data_rows = all_rows[header_row:] if len(all_rows) >= header_row else []
     records = []
     for row in data_rows:
@@ -2451,7 +2627,7 @@ def get_sheet_records(sheet, layout=None):
         if len(padded_row) < len(headers):
             padded_row.extend([""] * (len(headers) - len(padded_row)))
         records.append(dict(zip(headers, padded_row)))
-    return records, header_row, headers
+    return set_sheet_cache(cache_key, (records, header_row, headers))
 
 def resolve_effective_start_row(header_row: int) -> int:
     return max(2, START_ROW, int(header_row or 1) + 1)
@@ -2808,7 +2984,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             campaign_header = resolve_header_from_column(headers, col_map.get("campaign"))
             start_row = resolve_effective_start_row(header_row)
         except Exception as exc:
-            overview_error = str(exc)
+            overview_error = describe_google_sheet_error(exc)
 
     total_posts = 0
     total_views = 0
@@ -2889,7 +3065,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
     started_text = (
         featured_campaign["started_at"].strftime("%d/%m/%Y")
         if featured_campaign.get("started_at")
-        else datetime.now().strftime("%d/%m/%Y")
+        else now_local().strftime("%d/%m/%Y")
     )
     platforms_text = ", ".join(sorted(featured_campaign.get("platforms") or [])) or "Đa nền tảng"
     status_chip_class = "overview-status-live" if is_running else ("overview-status-done" if is_finished else "overview-status-waiting")
@@ -2994,20 +3170,25 @@ def build_posts_panel_html(sheet=None):
         </section>
         """
 
+    cache_key = ("posts-panel", ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME or "")
+    cached = get_sheet_cache(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        gc = get_gspread_client()
-        spreadsheet = gc.open_by_key(ACTIVE_SHEET_ID)
-        worksheets = spreadsheet.worksheets()
+        spreadsheet = get_spreadsheet(ACTIVE_SHEET_ID)
+        worksheets = get_spreadsheet_worksheets(spreadsheet, ACTIVE_SHEET_ID)
     except Exception as exc:
-        return f"""
+        html_output = f"""
         <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
             <div class="posts-empty-card rounded-[1.5rem] p-8 text-center">
                 <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Bài đăng</div>
                 <div class="mt-3 text-2xl font-black text-slate-100">Không tải được danh sách bài đăng</div>
-                <p class="mt-2 text-sm text-slate-400">{html.escape(str(exc))}</p>
+                <p class="mt-2 text-sm text-slate-400">{html.escape(describe_google_sheet_error(exc))}</p>
             </div>
         </section>
         """
+        return set_sheet_cache(cache_key, html_output, ttl=15)
 
     datasets = []
     for tab_index, ws in enumerate(worksheets):
@@ -3015,7 +3196,7 @@ def build_posts_panel_html(sheet=None):
         datasets.append(dataset)
 
     if not datasets:
-        return """
+        html_output = """
         <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
             <div class="posts-empty-card rounded-[1.5rem] p-8 text-center">
                 <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Bài đăng</div>
@@ -3023,6 +3204,7 @@ def build_posts_panel_html(sheet=None):
             </div>
         </section>
         """
+        return set_sheet_cache(cache_key, html_output)
 
     active_sheet_title = "Chưa chọn"
     schedule_selected_count = len(normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID))
@@ -3131,7 +3313,7 @@ def build_posts_panel_html(sheet=None):
             """
         )
 
-    return f"""
+    html_output = f"""
     <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
         <div class="flex flex-col gap-5">
             <div class="posts-page-head">
@@ -3185,6 +3367,7 @@ def build_posts_panel_html(sheet=None):
         </div>
     </section>
     """
+    return set_sheet_cache(cache_key, html_output)
 
 def build_row_updates(col_map, platform, now, stats):
     row_updates = []
@@ -3258,7 +3441,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
     global schedule_last_run_processed, schedule_last_run_success, schedule_last_run_failed
     social_driver = None
     social_driver_failed = False
-    started_at = datetime.now()
+    started_at = now_local()
     run_started_at = started_at
     run_source = (source or "manual").strip().lower() or "manual"
     run_status = "success"
@@ -3298,7 +3481,6 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         schedule_last_run_success = 0
         schedule_last_run_failed = 0
         is_running, is_finished = True, False
-        now = datetime.now().strftime("%d/%m/%Y %H:%M")
         for sheet_id, selected_sheet, selected_targets in scan_groups:
             add_log(f"Đang kết nối Google Sheets: {selected_sheet}")
             sheet = get_worksheet(selected_sheet, sheet_id)
@@ -3353,7 +3535,8 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                             add_log(str(driver_error))
                     stats = None if social_driver_failed else get_social_stats(url, platform, driver=social_driver)
                 if stats and is_running:
-                    row_updates = build_row_updates(col_map, platform, now, stats)
+                    scan_timestamp = now_local().strftime("%d/%m/%Y %H:%M")
+                    row_updates = build_row_updates(col_map, platform, scan_timestamp, stats)
                     set_pending_updates(i, row_updates)
                     for field, col_idx, value in row_updates:
                         value = normalize_cell_value(field, value)
@@ -3364,6 +3547,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     add_log(f"Dòng {i}: Không lấy được số liệu")
                     failed_count += 1
                 time.sleep(max(0.0, ROW_SCAN_DELAY_SECONDS))
+            clear_sheet_runtime_cache(sheet_id, selected_sheet)
         pending_updates = []
         current_task, is_finished, is_running = "HOÀN TẤT", True, False
         add_log("=== ĐÃ QUÉT XONG ===")
@@ -3371,9 +3555,10 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         run_status = "error"
         pending_updates = []
         is_running, current_task = False, f"Lỗi: {str(e)[:20]}"
-        add_log(f"Lỗi hệ thống: {str(e)}")
+        add_log(f"Lỗi hệ thống: {describe_google_sheet_error(e, include_raw=True)}")
     finally:
-        finished_at = datetime.now()
+        clear_sheet_runtime_cache()
+        finished_at = now_local()
         duration_seconds = max(0.0, (finished_at - started_at).total_seconds())
         if run_status == "success" and not is_finished and not is_running:
             run_status = "stopped" if current_task == "Đã dừng thủ công" else "success"
@@ -3691,9 +3876,10 @@ def set_sheet(request: Request, sheet_name: str = "", sheet_url: str = ""):
             )
         return HTMLResponse("<html><script>window.location.href='/?sheet_ok=1';</script></html>")
     except Exception as e:
-        add_log(f"Không tìm thấy sheet: {requested_sheet} ({str(e)[:60]})")
+        error_text = describe_google_sheet_error(e)
+        add_log(f"Không tìm thấy sheet: {requested_sheet} ({error_text[:80]})")
         if is_fetch_request(request):
-            return build_ui_json_response("Không tìm thấy tab sheet. Kiểm tra lại tên tab và quyền truy cập.", level="error", ok=False)
+            return build_ui_json_response(error_text, level="error", ok=False)
         return HTMLResponse("<html><script>window.location.href='/?sheet_error=1';</script></html>")
 
 
@@ -3824,6 +4010,7 @@ def set_columns(request: Request, link: str = "", campaign: str = "", view: str 
         START_ROW = parsed_start_row
 
     COLUMN_OVERRIDES = parsed
+    clear_sheet_runtime_cache(ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME)
     add_log(
         "Cập nhật cấu hình nhập liệu: "
         + ", ".join([f"{k.upper()}={col_to_a1(v) if v else 'AUTO'}" for k, v in COLUMN_OVERRIDES.items()])
@@ -3867,7 +4054,7 @@ def download_excel(request: Request):
         path = "Social_Export.xlsx"
         df.to_excel(path, index=False, engine="openpyxl")
         safe_sheet_name = re.sub(r"[^A-Za-z0-9_-]+", "_", ACTIVE_SHEET_NAME).strip("_") or "sheet"
-        return FileResponse(path, filename=f"Data_{safe_sheet_name}_{datetime.now().strftime('%H%M')}.xlsx")
+        return FileResponse(path, filename=f"Data_{safe_sheet_name}_{now_local().strftime('%H%M')}.xlsx")
     except ImportError as e:
         add_log(f"Lỗi export Excel: thiếu thư viện ({str(e)})")
         return RedirectResponse(url="/?download_error=1", status_code=302)
@@ -3883,16 +4070,16 @@ def download_excel_all(request: Request):
     if not ACTIVE_SHEET_ID:
         return RedirectResponse(url="/?download_error=2", status_code=302)
     try:
-        gc = get_gspread_client()
-        spreadsheet = gc.open_by_key(ACTIVE_SHEET_ID)
+        spreadsheet = get_spreadsheet(ACTIVE_SHEET_ID)
+        worksheets = get_spreadsheet_worksheets(spreadsheet, ACTIVE_SHEET_ID)
         path = "Social_Export_All.xlsx"
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
-            for ws in spreadsheet.worksheets():
+            for ws in worksheets:
                 records, _, _ = get_sheet_records(ws)
                 df = pd.DataFrame(records)
                 safe_ws_name = (ws.title or "Sheet")[:31]
                 df.to_excel(writer, sheet_name=safe_ws_name, index=False)
-        return FileResponse(path, filename=f"Data_all_tabs_{datetime.now().strftime('%H%M')}.xlsx")
+        return FileResponse(path, filename=f"Data_all_tabs_{now_local().strftime('%H%M')}.xlsx")
     except ImportError as e:
         add_log(f"Lỗi export all tabs: thiếu thư viện ({str(e)})")
         return RedirectResponse(url="/?download_error=1", status_code=302)
@@ -3935,7 +4122,7 @@ def sheet_tabs(request: Request, sheet_url: str = ""):
             "ok": False,
             "sheet_id": requested_sheet_id,
             "tabs": [],
-            "message": f"Không tải được danh sách tab: {str(exc)}",
+            "message": f"Không tải được danh sách tab: {describe_google_sheet_error(exc)}",
         }
 
 
@@ -3963,7 +4150,7 @@ def home(request: Request):
     sheet_error = request.query_params.get("sheet_error", "")
     sheet_ok = request.query_params.get("sheet_ok", "")
     schedule_error = request.query_params.get("schedule_error", "")
-    today = datetime.now()
+    today = now_local()
     schedule_date_value = f"{today.year:04d}-{today.month:02d}-{max(1, min(28, schedule_monthday)):02d}"
     schedule_end_value = schedule_end_date
     schedule_config = build_schedule_config_payload()
@@ -6156,6 +6343,8 @@ def home(request: Request):
                 let endPicker = null;
                 let sheetTabsRequestId = 0;
                 let sheetTabsDebounce = null;
+                const sheetTabsCache = new Map();
+                const SHEET_TABS_CACHE_TTL_MS = 60 * 1000;
                 let employeeUsersState = [];
                 let employeeStatusFilter = "all";
                 let postsScheduleCount = document.getElementById("schedule-selected-count");
@@ -6225,6 +6414,40 @@ def home(request: Request):
                     sheetTabsState.textContent = message;
                 }};
 
+                const normalizeSheetTabsLookupValue = (value) => {{
+                    return (value || "").trim();
+                }};
+
+                const normalizeSheetTabsMessage = (message = "", fallback = "Không tải được danh sách tab.") => {{
+                    const rawMessage = (message || "").trim();
+                    const normalized = rawMessage.toLowerCase();
+                    if (normalized.includes("quota exceeded") && normalized.includes("read requests")) {{
+                        return "Google Sheets đang chạm giới hạn đọc tab. Đợi khoảng 60 giây rồi thử lại.";
+                    }}
+                    return rawMessage || fallback;
+                }};
+
+                const getCachedSheetTabsPayload = (value) => {{
+                    const cacheKey = normalizeSheetTabsLookupValue(value);
+                    if (!cacheKey) return null;
+                    const cached = sheetTabsCache.get(cacheKey);
+                    if (!cached) return null;
+                    if (cached.expiresAt <= Date.now()) {{
+                        sheetTabsCache.delete(cacheKey);
+                        return null;
+                    }}
+                    return cached.payload || null;
+                }};
+
+                const setCachedSheetTabsPayload = (value, payload, ttlMs = SHEET_TABS_CACHE_TTL_MS) => {{
+                    const cacheKey = normalizeSheetTabsLookupValue(value);
+                    if (!cacheKey) return;
+                    sheetTabsCache.set(cacheKey, {{
+                        expiresAt: Date.now() + Math.max(3000, Number(ttlMs) || SHEET_TABS_CACHE_TTL_MS),
+                        payload,
+                    }});
+                }};
+
                 const clearSheetTabs = () => {{
                     if (sheetNameOptions) {{
                         sheetNameOptions.innerHTML = "";
@@ -6273,7 +6496,7 @@ def home(request: Request):
                 }};
 
                 const fetchSheetTabs = async (value, silent = false) => {{
-                    const rawValue = (value || "").trim();
+                    const rawValue = normalizeSheetTabsLookupValue(value);
                     if (!rawValue) {{
                         clearSheetTabs();
                         setSheetTabsMessage("Dán link Google Sheet để hiện danh sách tab có trong file.");
@@ -6290,6 +6513,21 @@ def home(request: Request):
                         setSheetTabsMessage("Đang tải danh sách tab...", "loading");
                     }}
 
+                    const cachedPayload = getCachedSheetTabsPayload(rawValue);
+                    if (cachedPayload) {{
+                        if (!cachedPayload.ok) {{
+                            clearSheetTabs();
+                            setSheetTabsMessage(normalizeSheetTabsMessage(cachedPayload.message), "error");
+                            return;
+                        }}
+                        renderSheetTabs(Array.isArray(cachedPayload.tabs) ? cachedPayload.tabs : []);
+                        setSheetTabsMessage(
+                            normalizeSheetTabsMessage(cachedPayload.message, "Đã tải danh sách tab."),
+                            "success"
+                        );
+                        return;
+                    }}
+
                     try {{
                         const response = await fetch(`/sheet-tabs?sheet_url=${{encodeURIComponent(rawValue)}}`, {{
                             headers: {{ "X-Requested-With": "fetch" }},
@@ -6302,13 +6540,21 @@ def home(request: Request):
                         if (requestId !== sheetTabsRequestId) return;
 
                         if (!data.ok) {{
+                            const errorMessage = normalizeSheetTabsMessage(data.message);
+                            setCachedSheetTabsPayload(rawValue, {{ ok: false, message: errorMessage }}, 15000);
                             clearSheetTabs();
-                            setSheetTabsMessage(data.message || "Không tải được danh sách tab.", "error");
+                            setSheetTabsMessage(errorMessage, "error");
                             return;
                         }}
 
-                        renderSheetTabs(Array.isArray(data.tabs) ? data.tabs : []);
-                        setSheetTabsMessage(data.message || "Đã tải danh sách tab.", "success");
+                        const successPayload = {{
+                            ok: true,
+                            tabs: Array.isArray(data.tabs) ? data.tabs : [],
+                            message: normalizeSheetTabsMessage(data.message, "Đã tải danh sách tab."),
+                        }};
+                        setCachedSheetTabsPayload(rawValue, successPayload);
+                        renderSheetTabs(successPayload.tabs);
+                        setSheetTabsMessage(successPayload.message, "success");
                     }} catch (_) {{
                         if (requestId !== sheetTabsRequestId) return;
                         clearSheetTabs();
@@ -6322,7 +6568,7 @@ def home(request: Request):
                     }}
                     sheetTabsDebounce = setTimeout(() => {{
                         fetchSheetTabs(sheetUrlInput?.value || "");
-                    }}, 450);
+                    }}, 900);
                 }};
 
                 if (sheetUrlInput) {{
