@@ -22,8 +22,25 @@ App da ho tro 2 bien moi truong de dashboard hien dung gio va giam viec doc Goog
 
 - `APP_TIMEZONE=Asia/Bangkok`
 - `SHEET_CACHE_TTL_SECONDS=45`
+- `ROW_SCAN_DELAY_SECONDS=0.04`
+- `BATCH_SHEET_WRITES=true`
 
 Neu thay loi `Quota exceeded for quota metric 'Read requests'`, hay redeploy ban moi, doi khoang 60 giay cho quota nguoi dung reset, roi thu lai. Cache ngan nay giup giam viec goi lap lai khi nhap sheet, tai danh sach tab va render dashboard.
+
+## Tang toc do quet
+
+Ban moi hien tai da duoc toi uu nhanh hon o 2 diem:
+
+- Ghi du lieu theo lo cho tung dong thay vi goi `update_cell` tung o.
+- Selenium dung che do tai trang nhe hon va rut ngan cac khoang cho mac dinh.
+
+Neu muon tinh chinh tiep, sua cac bien sau:
+
+- `ROW_SCAN_DELAY_SECONDS=0.04`
+- `SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS=16`
+- `SELENIUM_SETTLE_SECONDS=0.9`
+- `SELENIUM_SCROLL_SETTLE_SECONDS=0.18`
+- `SELENIUM_READY_TIMEOUT_SECONDS=2.4`
 
 ## Luu user ben vung tren Vercel
 

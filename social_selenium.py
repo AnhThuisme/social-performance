@@ -13,8 +13,11 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.edge.service import Service as EdgeService
 
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 25
-DEFAULT_SETTLE_SECONDS = 2.2
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = max(8.0, float(os.getenv("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "16") or "16"))
+DEFAULT_SETTLE_SECONDS = max(0.2, float(os.getenv("SELENIUM_SETTLE_SECONDS", "0.9") or "0.9"))
+DEFAULT_SCROLL_SETTLE_SECONDS = max(0.05, float(os.getenv("SELENIUM_SCROLL_SETTLE_SECONDS", "0.18") or "0.18"))
+DEFAULT_READY_POLL_SECONDS = max(0.05, float(os.getenv("SELENIUM_READY_POLL_SECONDS", "0.15") or "0.15"))
+DEFAULT_READY_TIMEOUT_SECONDS = max(0.5, float(os.getenv("SELENIUM_READY_TIMEOUT_SECONDS", "2.4") or "2.4"))
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -41,6 +44,10 @@ def _first_env(*names: str) -> str:
 
 
 def _add_common_browser_args(options, headless: bool = True):
+    try:
+        options.page_load_strategy = "eager"
+    except Exception:
+        pass
     args = [
         "--disable-gpu",
         "--no-sandbox",
@@ -48,6 +55,7 @@ def _add_common_browser_args(options, headless: bool = True):
         "--disable-notifications",
         "--disable-popup-blocking",
         "--disable-blink-features=AutomationControlled",
+        "--blink-settings=imagesEnabled=false",
         "--window-size=1440,2200",
         "--lang=en-US",
         f"--user-agent={DEFAULT_USER_AGENT}",
@@ -102,6 +110,13 @@ def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
         options = ChromeOptions()
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
+        options.add_experimental_option(
+            "prefs",
+            {
+                "profile.managed_default_content_settings.images": 2,
+                "profile.default_content_setting_values.notifications": 2,
+            },
+        )
 
     _add_common_browser_args(options, headless=headless)
     try:
@@ -148,6 +163,13 @@ def _build_chrome_driver(headless: bool = True):
     _add_common_browser_args(options, headless=headless)
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+    options.add_experimental_option(
+        "prefs",
+        {
+            "profile.managed_default_content_settings.images": 2,
+            "profile.default_content_setting_values.notifications": 2,
+        },
+    )
     chrome_binary = _first_env("CHROME_BIN", "GOOGLE_CHROME_BIN", "CHROMIUM_BIN")
     chromedriver_path = _first_env("CHROMEDRIVER_PATH")
     if chrome_binary:
@@ -256,12 +278,12 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
                 pass
 
         try:
-            response = requests.head(url, allow_redirects=True, timeout=10)
+            response = requests.head(url, allow_redirects=True, timeout=6)
             if response.url:
                 return response.url.split("#")[0]
         except Exception:
             try:
-                response = requests.get(url, allow_redirects=True, timeout=10, stream=True)
+                response = requests.get(url, allow_redirects=True, timeout=6, stream=True)
                 final_url = response.url
                 response.close()
                 if final_url:
@@ -275,13 +297,14 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
 
 
 def _wait_until_ready(driver):
-    for _ in range(24):
+    deadline = time.time() + DEFAULT_READY_TIMEOUT_SECONDS
+    while time.time() < deadline:
         try:
-            if driver.execute_script("return document.readyState") == "complete":
+            if driver.execute_script("return document.readyState") in {"interactive", "complete"}:
                 break
         except Exception:
             pass
-        time.sleep(0.25)
+        time.sleep(DEFAULT_READY_POLL_SECONDS)
 
 
 def _read_current_page_bundle(driver):
@@ -328,9 +351,9 @@ def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None
     time.sleep(DEFAULT_SETTLE_SECONDS)
     try:
         driver.execute_script("window.scrollTo(0, Math.min(900, document.body.scrollHeight * 0.25));")
-        time.sleep(0.8)
+        time.sleep(DEFAULT_SCROLL_SETTLE_SECONDS)
         driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(0.4)
+        time.sleep(DEFAULT_SCROLL_SETTLE_SECONDS)
     except Exception:
         pass
     return _read_current_page_bundle(driver)

@@ -22,6 +22,7 @@ from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSON
 import uvicorn
 import gspread
 import redis
+from gspread.cell import Cell
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
@@ -71,7 +72,7 @@ GMAIL_SMTP_EMAIL = os.getenv("GMAIL_SMTP_EMAIL", "").strip()
 GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "").strip()
 GMAIL_SMTP_FROM_EMAIL = os.getenv("GMAIL_SMTP_FROM_EMAIL", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.12"))
+ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.04"))
 try:
     START_ROW = max(2, int(os.getenv("START_ROW", "2")))
 except Exception:
@@ -167,6 +168,9 @@ def parse_bool_env(value: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+BATCH_SHEET_WRITES = parse_bool_env(os.getenv("BATCH_SHEET_WRITES", "true"), True)
 
 
 def now_local() -> datetime:
@@ -3396,6 +3400,23 @@ def normalize_cell_value(field, value):
     return value
 
 
+def write_sheet_row_updates(sheet, row_idx: int, row_updates):
+    normalized_updates = []
+    for field, col_idx, value in row_updates or []:
+        normalized_updates.append((field, col_idx, normalize_cell_value(field, value)))
+
+    if not normalized_updates:
+        return
+
+    if BATCH_SHEET_WRITES and len(normalized_updates) > 1:
+        cells = [Cell(row=row_idx, col=col_idx, value=value) for _, col_idx, value in normalized_updates]
+        sheet.update_cells(cells, value_input_option="USER_ENTERED")
+        return
+
+    for field, col_idx, value in normalized_updates:
+        sheet.update_cell(row_idx, col_idx, value)
+
+
 # --- Xá»­ lÃ½ YouTube ---
 def get_youtube_stats(url):
     try:
@@ -3538,9 +3559,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     scan_timestamp = now_local().strftime("%d/%m/%Y %H:%M")
                     row_updates = build_row_updates(col_map, platform, scan_timestamp, stats)
                     set_pending_updates(i, row_updates)
-                    for field, col_idx, value in row_updates:
-                        value = normalize_cell_value(field, value)
-                        sheet.update_cell(i, col_idx, value)
+                    write_sheet_row_updates(sheet, i, row_updates)
                     add_log(f"Dòng {i}: Cập nhật thành công")
                     success_count += 1
                 elif is_running:
