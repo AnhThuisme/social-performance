@@ -24,6 +24,23 @@ DEFAULT_USER_AGENT = (
     "Chrome/136.0.0.0 Safari/537.36"
 )
 IS_VERCEL_RUNTIME = bool(str(os.getenv("VERCEL", "") or "").strip())
+RECOVERABLE_WEBDRIVER_ERROR_MARKERS = (
+    "service unavailable",
+    "invalid session id",
+    "session deleted",
+    "target window already closed",
+    "disconnected",
+    "chrome not reachable",
+    "no such window",
+    "unable to route",
+    "connection refused",
+    "remote end closed connection",
+    "timeout receiving message from renderer",
+)
+
+
+class RecoverableSeleniumError(RuntimeError):
+    pass
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -41,6 +58,26 @@ def _first_env(*names: str) -> str:
         if value:
             return value
     return ""
+
+
+def is_recoverable_webdriver_error(exc_or_message) -> bool:
+    error_text = str(exc_or_message or "").strip().lower()
+    if not error_text:
+        return bool(_remote_url())
+    return any(marker in error_text for marker in RECOVERABLE_WEBDRIVER_ERROR_MARKERS)
+
+
+def describe_webdriver_error(exc) -> str:
+    parts = []
+    direct_text = str(exc or "").strip()
+    if direct_text:
+        parts.append(direct_text)
+    msg_attr = str(getattr(exc, "msg", "") or "").strip()
+    if msg_attr and msg_attr not in parts:
+        parts.append(msg_attr)
+    if not parts:
+        parts.append(exc.__class__.__name__ if exc else "WebDriverException")
+    return " | ".join(parts)
 
 
 def _add_common_browser_args(options, headless: bool = True):
@@ -786,10 +823,13 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
             return payload
         return None
     except WebDriverException as exc:
-        _emit(logger, f"Lỗi Selenium {platform}: {str(exc)[:160]}")
+        error_detail = describe_webdriver_error(exc)
+        _emit(logger, f"Lỗi Selenium {platform}: {error_detail[:200]}")
+        if is_recoverable_webdriver_error(exc):
+            raise RecoverableSeleniumError(error_detail) from exc
         return None
     except Exception as exc:
-        _emit(logger, f"Lỗi đọc dữ liệu {platform}: {str(exc)[:160]}")
+        _emit(logger, f"Lỗi đọc dữ liệu {platform}: {str(exc)[:200]}")
         return None
     finally:
         if own_driver:
