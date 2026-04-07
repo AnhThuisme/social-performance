@@ -20,6 +20,22 @@ DEFAULT_READY_POLL_SECONDS = max(0.05, float(os.getenv("SELENIUM_READY_POLL_SECO
 DEFAULT_READY_TIMEOUT_SECONDS = max(0.5, float(os.getenv("SELENIUM_READY_TIMEOUT_SECONDS", "2.4") or "2.4"))
 REMOTE_DRIVER_RETRY_ATTEMPTS = max(1, int(os.getenv("SELENIUM_REMOTE_RETRY_ATTEMPTS", "3") or "3"))
 REMOTE_DRIVER_RETRY_DELAY_SECONDS = max(0.5, float(os.getenv("SELENIUM_REMOTE_RETRY_DELAY_SECONDS", "2") or "2"))
+REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS = max(
+    3.0,
+    float(os.getenv("SELENIUM_REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS", "8") or "8"),
+)
+REMOTE_STATUS_TIMEOUT_SECONDS = max(
+    REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS,
+    float(os.getenv("SELENIUM_REMOTE_STATUS_TIMEOUT_SECONDS", "75") or "75"),
+)
+REMOTE_STATUS_POLL_SECONDS = max(
+    0.5,
+    float(os.getenv("SELENIUM_REMOTE_STATUS_POLL_SECONDS", "2") or "2"),
+)
+REMOTE_READY_CACHE_SECONDS = max(
+    1.0,
+    float(os.getenv("SELENIUM_REMOTE_READY_CACHE_SECONDS", "12") or "12"),
+)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -43,6 +59,9 @@ RECOVERABLE_WEBDRIVER_ERROR_MARKERS = (
 
 class RecoverableSeleniumError(RuntimeError):
     pass
+
+
+REMOTE_READY_CACHE = {}
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -71,14 +90,21 @@ def is_recoverable_webdriver_error(exc_or_message) -> bool:
 
 def describe_webdriver_error(exc) -> str:
     parts = []
+    class_name = exc.__class__.__name__ if exc else "WebDriverException"
     direct_text = str(exc or "").strip()
     if direct_text:
         parts.append(direct_text)
     msg_attr = str(getattr(exc, "msg", "") or "").strip()
     if msg_attr and msg_attr not in parts:
         parts.append(msg_attr)
+    cause = getattr(exc, "__cause__", None)
+    cause_text = str(cause or "").strip()
+    if cause_text and cause_text not in parts:
+        parts.append(cause_text)
+    if class_name and all(class_name not in item for item in parts):
+        parts.append(class_name)
     if not parts:
-        parts.append(exc.__class__.__name__ if exc else "WebDriverException")
+        parts.append(class_name)
     return " | ".join(parts)
 
 
@@ -137,7 +163,104 @@ def has_remote_selenium_url() -> bool:
     return bool(_remote_url())
 
 
-def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
+def _remote_status_url(remote_url: str) -> str:
+    normalized = str(remote_url or "").strip().rstrip("/")
+    if not normalized:
+        return ""
+    if normalized.endswith("/wd/hub/status"):
+        return normalized
+    if normalized.endswith("/wd/hub"):
+        return normalized + "/status"
+    if normalized.endswith("/status"):
+        return normalized
+    return normalized + "/wd/hub/status"
+
+
+def _remote_status_is_ready(payload) -> bool:
+    if isinstance(payload, dict):
+        value = payload.get("value")
+        if isinstance(value, dict):
+            if value.get("ready") is True:
+                return True
+            if str(value.get("availability", "") or "").strip().upper() == "UP":
+                return True
+        if payload.get("ready") is True:
+            return True
+    return False
+
+
+def _describe_remote_status_payload(payload) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("value")
+    if isinstance(value, dict):
+        message = str(value.get("message", "") or "").strip()
+        if message:
+            return message
+        availability = str(value.get("availability", "") or "").strip()
+        if availability:
+            return f"availability={availability}"
+    message = str(payload.get("message", "") or "").strip()
+    if message:
+        return message
+    status = str(payload.get("status", "") or "").strip()
+    if status:
+        return f"status={status}"
+    return ""
+
+
+def _wait_for_remote_service(
+    remote_url: str,
+    logger: Optional[Callable[[str], None]] = None,
+    browser_name: str = "Remote Chrome",
+):
+    normalized_url = str(remote_url or "").strip()
+    if not normalized_url:
+        return
+
+    cached_ready_at = REMOTE_READY_CACHE.get(normalized_url, 0.0)
+    now = time.time()
+    if cached_ready_at and (now - cached_ready_at) <= REMOTE_READY_CACHE_SECONDS:
+        return
+
+    status_url = _remote_status_url(normalized_url)
+    deadline = now + REMOTE_STATUS_TIMEOUT_SECONDS
+    last_status_text = ""
+    has_waited = False
+
+    while time.time() < deadline:
+        try:
+            response = requests.get(status_url, timeout=REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS)
+            if response.ok:
+                payload = response.json() if response.content else {}
+                if _remote_status_is_ready(payload):
+                    REMOTE_READY_CACHE[normalized_url] = time.time()
+                    if has_waited:
+                        _emit(logger, f"{browser_name} da san sang, dang mo browser...")
+                    return
+                last_status_text = _describe_remote_status_payload(payload) or f"HTTP {response.status_code}"
+            else:
+                last_status_text = f"HTTP {response.status_code}"
+        except Exception as exc:
+            last_status_text = describe_webdriver_error(exc)
+
+        if not has_waited:
+            _emit(logger, f"{browser_name} dang doi Selenium service khoi dong tu remote host...")
+            has_waited = True
+        time.sleep(REMOTE_STATUS_POLL_SECONDS)
+
+    detail = last_status_text or "remote status endpoint chua san sang"
+    raise RuntimeError(
+        f"Selenium remote chua san sang: {detail}. "
+        f"Kiem tra lai {status_url}"
+    )
+
+
+def _build_remote_driver(
+    headless: bool = True,
+    browser_name: str = "chrome",
+    logger: Optional[Callable[[str], None]] = None,
+):
     remote_url = _remote_url()
     if not remote_url:
         raise RuntimeError(
@@ -162,6 +285,11 @@ def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
         )
 
     _add_common_browser_args(options, headless=headless)
+    _wait_for_remote_service(
+        remote_url,
+        logger=logger,
+        browser_name=f"Remote {browser_key.capitalize()}",
+    )
     try:
         driver = webdriver.Remote(command_executor=remote_url, options=options)
     except KeyError as exc:
@@ -171,10 +299,11 @@ def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
         ) from exc
     driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
+    REMOTE_READY_CACHE[remote_url] = time.time()
     return driver
 
 
-def _remote_driver_builders(preferred_browser: str = ""):
+def _remote_driver_builders(preferred_browser: str = "", logger: Optional[Callable[[str], None]] = None):
     remote_url = _remote_url()
     if not remote_url:
         return []
@@ -192,9 +321,10 @@ def _remote_driver_builders(preferred_browser: str = ""):
     return [
         (
             f"Remote {browser_name.capitalize()}",
-            lambda headless, browser_name=browser_name: _build_remote_driver(
+            lambda headless, browser_name=browser_name, logger=logger: _build_remote_driver(
                 headless=headless,
                 browser_name=browser_name,
+                logger=logger,
             ),
         )
         for browser_name in browser_order
@@ -266,7 +396,7 @@ def create_selenium_driver(
 ):
     errors = []
     preferred = (preferred_browser or "").strip().lower()
-    builders = _remote_driver_builders(preferred_browser=preferred_browser)
+    builders = _remote_driver_builders(preferred_browser=preferred_browser, logger=logger)
     local_builders = [("Chrome", _build_chrome_driver), ("Edge", _build_edge_driver)]
     if preferred:
         local_builders.sort(key=lambda item: 0 if item[0].lower() == preferred else 1)
@@ -283,6 +413,8 @@ def create_selenium_driver(
                 return driver
             except Exception as exc:
                 error_detail = describe_webdriver_error(exc)
+                if is_remote_builder and not str(error_detail or "").strip():
+                    error_detail = "Remote Selenium khong tra ve thong tin loi"
                 recoverable = is_remote_builder and is_recoverable_webdriver_error(error_detail)
                 if recoverable and attempt < max_attempts:
                     delay_seconds = REMOTE_DRIVER_RETRY_DELAY_SECONDS * attempt
