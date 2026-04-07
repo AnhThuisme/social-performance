@@ -20,6 +20,10 @@ DEFAULT_READY_POLL_SECONDS = max(0.05, float(os.getenv("SELENIUM_READY_POLL_SECO
 DEFAULT_READY_TIMEOUT_SECONDS = max(0.5, float(os.getenv("SELENIUM_READY_TIMEOUT_SECONDS", "2.4") or "2.4"))
 REMOTE_DRIVER_RETRY_ATTEMPTS = max(1, int(os.getenv("SELENIUM_REMOTE_RETRY_ATTEMPTS", "3") or "3"))
 REMOTE_DRIVER_RETRY_DELAY_SECONDS = max(0.5, float(os.getenv("SELENIUM_REMOTE_RETRY_DELAY_SECONDS", "2") or "2"))
+REMOTE_PAGE_LOAD_TIMEOUT_SECONDS = max(
+    DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
+    float(os.getenv("SELENIUM_REMOTE_PAGE_LOAD_TIMEOUT_SECONDS", "30") or "30"),
+)
 REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS = max(
     3.0,
     float(os.getenv("SELENIUM_REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS", "8") or "8"),
@@ -297,7 +301,7 @@ def _build_remote_driver(
             f"Remote Selenium URL khong dung dinh dang: {remote_url}. "
             "Hay dung URL server, khong dung trang /status."
         ) from exc
-    driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+    driver.set_page_load_timeout(REMOTE_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
     REMOTE_READY_CACHE[remote_url] = time.time()
     return driver
@@ -536,6 +540,12 @@ def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None
         driver.get(url)
     except TimeoutException:
         _emit(logger, f"Timeout khi tải trang: {url[:90]}")
+    except WebDriverException as exc:
+        error_detail = describe_webdriver_error(exc)
+        if "timeout receiving message from renderer" in error_detail.lower():
+            _emit(logger, f"Trang phan hoi cham, van thu doc du lieu: {url[:90]}")
+        else:
+            raise
     _wait_until_ready(driver)
     time.sleep(DEFAULT_SETTLE_SECONDS)
     try:
@@ -962,6 +972,13 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
             return None
         payload = extractor(bundle)
         if platform == "tiktok" and _should_retry_tiktok_visually(bundle, payload):
+            if own_driver and has_remote_selenium_url():
+                _emit(
+                    logger,
+                    "TikTok/headless bi chan tren remote, dong session hien tai va thu lai bang Chrome thuong 1 lan",
+                )
+                close_selenium_driver(driver)
+                driver = None
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
             if retry_payload:
                 payload = retry_payload

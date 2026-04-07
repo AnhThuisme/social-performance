@@ -3475,6 +3475,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
     processed_count = 0
     success_count = 0
     failed_count = 0
+    remote_selenium_mode = has_remote_selenium_url()
     try:
         normalized_targets = normalize_schedule_targets(targets or [])
         use_target_mode = len(normalized_targets) > 0
@@ -3554,41 +3555,53 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                 if platform == "YouTube":
                     stats = get_youtube_stats(url)
                 else:
-                    if social_driver is None and not social_driver_failed:
+                    if remote_selenium_mode:
                         try:
-                            social_driver = create_selenium_driver(logger=add_log)
-                        except Exception as driver_error:
-                            add_log(str(driver_error))
-                            if has_remote_selenium_url():
-                                social_driver = None
-                            else:
-                                social_driver_failed = True
-                    if social_driver_failed:
-                        stats = None
-                    else:
-                        try:
-                            stats = get_social_stats(url, platform, driver=social_driver)
-                        except RecoverableSeleniumError as driver_runtime_error:
+                            stats = get_social_stats(url, platform, driver=None)
+                        except RecoverableSeleniumError:
                             add_log(
-                                f"Selenium {platform} bị ngắt giữa chừng, đang mở lại browser và thử lại dòng {i}..."
+                                f"Selenium {platform} bị ngắt giữa chừng trên remote, đang thử lại dòng {i}..."
                             )
-                            close_selenium_driver(social_driver)
-                            social_driver = None
+                            try:
+                                stats = get_social_stats(url, platform, driver=None)
+                            except RecoverableSeleniumError:
+                                add_log(
+                                    f"Selenium {platform} vẫn chưa ổn sau khi thử lại remote. Bỏ qua dòng {i}."
+                                )
+                                stats = None
+                    else:
+                        if social_driver is None and not social_driver_failed:
                             try:
                                 social_driver = create_selenium_driver(logger=add_log)
-                            except Exception as reopen_error:
-                                add_log(f"Không mở lại được Selenium: {str(reopen_error)[:180]}")
-                                stats = None
-                            else:
+                            except Exception as driver_error:
+                                add_log(str(driver_error))
+                                social_driver_failed = True
+                        if social_driver_failed:
+                            stats = None
+                        else:
+                            try:
+                                stats = get_social_stats(url, platform, driver=social_driver)
+                            except RecoverableSeleniumError:
+                                add_log(
+                                    f"Selenium {platform} bị ngắt giữa chừng, đang mở lại browser và thử lại dòng {i}..."
+                                )
+                                close_selenium_driver(social_driver)
+                                social_driver = None
                                 try:
-                                    stats = get_social_stats(url, platform, driver=social_driver)
-                                except RecoverableSeleniumError:
-                                    add_log(
-                                        f"Selenium {platform} vẫn chưa ổn sau khi mở lại browser. Bỏ qua dòng {i}."
-                                    )
-                                    close_selenium_driver(social_driver)
-                                    social_driver = None
+                                    social_driver = create_selenium_driver(logger=add_log)
+                                except Exception as reopen_error:
+                                    add_log(f"Không mở lại được Selenium: {str(reopen_error)[:180]}")
                                     stats = None
+                                else:
+                                    try:
+                                        stats = get_social_stats(url, platform, driver=social_driver)
+                                    except RecoverableSeleniumError:
+                                        add_log(
+                                            f"Selenium {platform} vẫn chưa ổn sau khi mở lại browser. Bỏ qua dòng {i}."
+                                        )
+                                        close_selenium_driver(social_driver)
+                                        social_driver = None
+                                        stats = None
                 if stats and is_running:
                     scan_timestamp = now_local().strftime("%d/%m/%Y %H:%M")
                     row_updates = build_row_updates(col_map, platform, scan_timestamp, stats)
