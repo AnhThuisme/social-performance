@@ -2723,10 +2723,10 @@ def build_posts_panel_html(sheet=None):
         </section>
         """
 
-    active_sheet_title = "Chưa chọn tab"
-    active_total_posts = 0
+    active_sheet_title = "Chưa chọn"
     schedule_selected_count = len(normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID))
     spreadsheet_snapshot_url = build_snapshot_url(ACTIVE_SHEET_ID, ACTIVE_SHEET_GID)
+    spreadsheet_title = (str(getattr(spreadsheet, "title", "") or "").strip() or "Spreadsheet hiện tại")
 
     summary_cards_html = []
     detail_panels_html = []
@@ -2837,12 +2837,12 @@ def build_posts_panel_html(sheet=None):
                 <div>
                     <div class="posts-page-kicker">Bài đăng</div>
                     <h2 class="posts-page-title">Bài đăng</h2>
-                    <p class="posts-page-subtitle">Xem tổng theo từng tab trong spreadsheet hiện tại, rồi bấm vào tab muốn xem để mở toàn bộ link và thông tin chi tiết. Đang xem: <span id="posts-active-tab-label" class="text-slate-200 font-bold">{html.escape(active_sheet_title)}</span>.</p>
+                    <p class="posts-page-subtitle">Tab này lưu các sheet đã nhận từ spreadsheet hiện tại. Bấm vào từng sheet bên dưới để mở bảng chi tiết bài đăng. Đang xem: <span id="posts-active-tab-label" class="text-slate-200 font-bold">{html.escape(active_sheet_title)}</span>.</p>
                 </div>
                 <div class="posts-page-actions">
                     <div class="posts-counter-pill">
                         <div class="posts-counter-label">Đang hiển thị</div>
-                        <div class="posts-counter-value" id="posts-visible-count">{active_total_posts} bài</div>
+                        <div class="posts-counter-value" id="posts-visible-count">0 bài</div>
                     </div>
                     <div class="posts-counter-pill">
                         <div class="posts-counter-label">Đang chọn cho lịch</div>
@@ -2861,7 +2861,7 @@ def build_posts_panel_html(sheet=None):
                 <div class="posts-sheet-summary-head">
                     <div>
                         <div class="posts-sheet-summary-kicker">Spreadsheet hiện tại</div>
-                        <div class="posts-sheet-summary-title">{html.escape(ACTIVE_SHEET_NAME or active_sheet_title)}</div>
+                        <div class="posts-sheet-summary-title">{html.escape(spreadsheet_title)}</div>
                         <div class="posts-sheet-summary-sub">{html.escape(ACTIVE_SHEET_ID)}</div>
                     </div>
                     <a href="{html.escape(spreadsheet_snapshot_url, quote=True)}" target="_blank" rel="noreferrer" class="posts-toolbar-btn">
@@ -2874,12 +2874,10 @@ def build_posts_panel_html(sheet=None):
             </div>
 
             <div class="posts-tab-panels">
-                <div id="posts-detail-placeholder" class="posts-detail-placeholder">
-                    <div class="posts-empty-card rounded-[1.5rem] p-8 text-center">
-                        <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Chi tiết bài đăng</div>
-                        <div class="mt-3 text-2xl font-black text-slate-100">Chọn một tab sheet để xem chi tiết</div>
-                        <p class="mt-2 text-sm text-slate-400">Bấm vào từng card sheet phía trên để mở bảng bài đăng, lọc dữ liệu và chọn bài cho lịch tự động.</p>
-                    </div>
+                <div id="posts-detail-placeholder" class="posts-detail-placeholder posts-empty-card rounded-[1.5rem] p-8 text-center">
+                    <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Chưa chọn tab</div>
+                    <div class="mt-3 text-2xl font-black text-slate-100">Bấm vào một sheet để xem chi tiết</div>
+                    <p class="mt-2 text-sm text-slate-400">Danh sách sheet đã được lưu phía trên. Khi bạn bấm vào từng sheet, bảng bài đăng chi tiết sẽ hiện ở đây.</p>
                 </div>
                 {"".join(detail_panels_html)}
             </div>
@@ -4470,10 +4468,9 @@ def home(request: Request):
                 gap: 16px;
             }}
             .posts-detail-placeholder {{
-                display: block;
-            }}
-            .posts-detail-placeholder.hidden {{
-                display: none;
+                display: grid;
+                place-items: center;
+                min-height: 220px;
             }}
             .posts-tab-panel {{
                 display: none;
@@ -5544,6 +5541,7 @@ def home(request: Request):
             html[data-theme="light"] .employee-summary-pill,
             html[data-theme="light"] .posts-sheet-card,
             html[data-theme="light"] .posts-sheet-card-stat,
+            html[data-theme="light"] .posts-detail-placeholder,
             html[data-theme="light"] .posts-empty-card,
             html[data-theme="light"] .posts-toolbar,
             html[data-theme="light"] .posts-table-shell,
@@ -6386,21 +6384,20 @@ def home(request: Request):
                 const sidebarStatusTask = document.getElementById("sidebar-status-task");
                 let postsVisibleCount = document.getElementById("posts-visible-count");
                 let postsActiveTabLabel = document.getElementById("posts-active-tab-label");
+                let postsDetailPlaceholder = document.getElementById("posts-detail-placeholder");
                 let postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
                 let postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
-                let postsDetailPlaceholder = document.getElementById("posts-detail-placeholder");
                 const sidebarLinks = Array.from(document.querySelectorAll("[data-nav-link]"));
                 const dashboardSections = Array.from(document.querySelectorAll("[data-dashboard-section]"));
                 let refreshInFlight = false;
-                let activePostsTabSlug = "";
 
                 const showNotice = (_message = "", _level = "info") => {{}};
                 const syncPostsDomRefs = () => {{
                     postsVisibleCount = document.getElementById("posts-visible-count");
                     postsActiveTabLabel = document.getElementById("posts-active-tab-label");
+                    postsDetailPlaceholder = document.getElementById("posts-detail-placeholder");
                     postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
                     postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
-                    postsDetailPlaceholder = document.getElementById("posts-detail-placeholder");
                     postsScheduleCount = document.getElementById("schedule-selected-count");
                     saveScheduleTargetsBtn = document.getElementById("save-schedule-targets-btn");
                     clearScheduleTargetsBtn = document.getElementById("clear-schedule-targets-btn");
@@ -6955,9 +6952,6 @@ def home(request: Request):
                         if (postsVisibleCount) {{
                             postsVisibleCount.textContent = "0 bài";
                         }}
-                        if (postsActiveTabLabel) {{
-                            postsActiveTabLabel.textContent = "Chưa chọn tab";
-                        }}
                         return;
                     }}
                     const searchInput = panel.querySelector(".posts-search-field");
@@ -6992,10 +6986,10 @@ def home(request: Request):
                 }};
 
                 const setActivePostsTab = (tabSlug) => {{
-                    const safeSlug = postsTabCards.some((card) => card.dataset.postsTabTrigger === tabSlug)
-                        ? tabSlug
+                    const requestedSlug = String(tabSlug || "").trim();
+                    const safeSlug = postsTabCards.some((card) => card.dataset.postsTabTrigger === requestedSlug)
+                        ? requestedSlug
                         : "";
-                    activePostsTabSlug = safeSlug;
                     postsTabCards.forEach((card) => {{
                         card.classList.toggle("is-active", card.dataset.postsTabTrigger === safeSlug);
                     }});
@@ -7087,13 +7081,10 @@ def home(request: Request):
                     }}
 
                     if (postsTabCards.length) {{
-                        const initialPostsTab = postsTabCards.some((card) => card.dataset.postsTabTrigger === activePostsTabSlug)
-                            ? activePostsTabSlug
-                            : "";
-                        setActivePostsTab(initialPostsTab);
+                        setActivePostsTab("");
                     }} else {{
                         if (postsVisibleCount) postsVisibleCount.textContent = "0 bài";
-                        if (postsActiveTabLabel) postsActiveTabLabel.textContent = "Chưa chọn tab";
+                        if (postsActiveTabLabel) postsActiveTabLabel.textContent = "Chưa chọn";
                     }}
                     syncPostsSelectionState();
                     applySavedScheduleTargetsToPosts(true);

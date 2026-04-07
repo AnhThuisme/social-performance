@@ -35,6 +35,23 @@ Key mac dinh:
 
 Chi can ket noi Redis tren Vercel Marketplace / Upstash, them cap env phu hop, roi redeploy. Sau do cac thay doi o tab Nhan vien, access policy va mail config se khong bi mat sau reload.
 
+## Selenium tren Vercel
+
+Neu thay log kieu:
+
+`Khong mo duoc Selenium browser` hoac `Unable to obtain driver for chrome`
+
+thi do runtime Vercel khong co `Chrome` va `chromedriver` local de mo Selenium browser.
+
+App nay ho tro 2 huong:
+
+- Khuyen dung: deploy phan quet Selenium bang Docker tren Render, Railway, Fly.io, VPS...
+- Hoac cung cap browser tu xa qua:
+  - `SELENIUM_REMOTE_URL`
+  - `SELENIUM_REMOTE_BROWSER=chrome`
+
+Neu da co remote WebDriver/Grid thi app se uu tien dung browser tu xa. Neu khong co remote URL, Selenium tren Vercel se khong mo duoc browser local.
+
 ## Deploy bang Docker
 
 Repo nay phu hop hon voi host ho tro Docker nhu Render, Railway, Fly.io, VPS, hoac bat ky noi nao chay container duoc.

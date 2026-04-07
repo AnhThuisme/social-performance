@@ -20,6 +20,7 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+IS_VERCEL_RUNTIME = bool(str(os.getenv("VERCEL", "") or "").strip())
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -68,6 +69,58 @@ def _apply_stealth(driver):
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script})
     except Exception:
         pass
+
+
+def _remote_url() -> str:
+    return _first_env("SELENIUM_REMOTE_URL", "REMOTE_WEBDRIVER_URL")
+
+
+def _build_remote_driver(headless: bool = True, browser_name: str = "chrome"):
+    remote_url = _remote_url()
+    if not remote_url:
+        raise RuntimeError("Missing SELENIUM_REMOTE_URL or REMOTE_WEBDRIVER_URL")
+
+    browser_key = (browser_name or "chrome").strip().lower()
+    if browser_key == "edge":
+        options = EdgeOptions()
+    else:
+        browser_key = "chrome"
+        options = ChromeOptions()
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+    _add_common_browser_args(options, headless=headless)
+    driver = webdriver.Remote(command_executor=remote_url, options=options)
+    driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+    _apply_stealth(driver)
+    return driver
+
+
+def _remote_driver_builders(preferred_browser: str = ""):
+    remote_url = _remote_url()
+    if not remote_url:
+        return []
+
+    requested = (
+        _first_env("SELENIUM_REMOTE_BROWSER")
+        or (preferred_browser or "").strip().lower()
+        or "chrome"
+    )
+    browser_order = ["chrome", "edge"]
+    if requested in browser_order:
+        browser_order.remove(requested)
+        browser_order.insert(0, requested)
+
+    return [
+        (
+            f"Remote {browser_name.capitalize()}",
+            lambda headless, browser_name=browser_name: _build_remote_driver(
+                headless=headless,
+                browser_name=browser_name,
+            ),
+        )
+        for browser_name in browser_order
+    ]
 
 
 def _build_chrome_driver(headless: bool = True):
@@ -119,6 +172,38 @@ def create_selenium_driver(
         except Exception as exc:
             errors.append(f"{browser_name}: {str(exc)[:180]}")
     raise RuntimeError("Không mở được Selenium browser. " + " | ".join(errors))
+
+
+def create_selenium_driver(
+    logger: Optional[Callable[[str], None]] = None,
+    headless: bool = True,
+    preferred_browser: str = "",
+):
+    errors = []
+    preferred = (preferred_browser or "").strip().lower()
+    builders = _remote_driver_builders(preferred_browser=preferred_browser)
+    local_builders = [("Chrome", _build_chrome_driver), ("Edge", _build_edge_driver)]
+    if preferred:
+        local_builders.sort(key=lambda item: 0 if item[0].lower() == preferred else 1)
+    builders.extend(local_builders)
+
+    for browser_name, builder in builders:
+        try:
+            driver = builder(headless=headless)
+            mode = "headless" if headless else "normal"
+            _emit(logger, f"Selenium dang dung {browser_name} {mode}")
+            return driver
+        except Exception as exc:
+            errors.append(f"{browser_name}: {str(exc)[:180]}")
+
+    message = "Khong mo duoc Selenium browser. " + " | ".join(errors)
+    if IS_VERCEL_RUNTIME and not _remote_url():
+        message += (
+            " Vercel runtime khong co Chrome/chromedriver local. "
+            "Hay deploy phan quet Selenium bang Docker (Render/Railway/Fly) "
+            "hoac cung cap SELENIUM_REMOTE_URL."
+        )
+    raise RuntimeError(message)
 
 
 def close_selenium_driver(driver):
