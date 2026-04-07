@@ -871,37 +871,245 @@ def _extract_instagram(bundle):
     }
 
 
+def _extract_facebook_target_ids(url: str):
+    patterns = [
+        r"/reel/(\d+)",
+        r"/videos/(?:[^/]+/)?(\d+)",
+        r"[?&]v=(\d+)",
+        r"[?&]multi_permalinks=(\d+)",
+        r"/groups/[^/?#]+/(?:posts|permalink)/(\d+)",
+        r"/posts/(\d+)",
+        r"/permalink/(\d+)",
+    ]
+    seen = set()
+    target_ids = []
+    for pattern in patterns:
+        for match in re.findall(pattern, url or "", re.IGNORECASE):
+            value = str(match or "").strip()
+            if value and value not in seen:
+                seen.add(value)
+                target_ids.append(value)
+    return target_ids
+
+
+def _collect_target_context(text: str, identifiers, before: int = 1800, after: int = 9000, max_chunks: int = 8):
+    if not text:
+        return ""
+    if not identifiers:
+        return text
+    chunks = []
+    seen_spans = set()
+    for identifier in identifiers:
+        start_at = 0
+        while len(chunks) < max_chunks:
+            idx = text.find(identifier, start_at)
+            if idx < 0:
+                break
+            span_start = max(0, idx - before)
+            span_end = min(len(text), idx + after)
+            span_key = (span_start, span_end)
+            if span_key not in seen_spans:
+                seen_spans.add(span_key)
+                chunks.append(text[span_start:span_end])
+            start_at = idx + len(identifier)
+    return "\n".join(chunks) if chunks else text
+
+
+def _extract_facebook_metric_from_meta(metas, patterns) -> Optional[int]:
+    meta_candidates = [
+        str((metas or {}).get("og:title") or ""),
+        str((metas or {}).get("og:description") or ""),
+        str((metas or {}).get("og:image:alt") or ""),
+    ]
+    for candidate in meta_candidates:
+        parsed = _extract_number(candidate, patterns)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_scoped_number(text: str, target_ids, scoped_patterns) -> Optional[int]:
+    if not text:
+        return None
+    for target_id in target_ids:
+        escaped_id = re.escape(str(target_id or "").strip())
+        if not escaped_id:
+            continue
+        patterns = [pattern.format(id=escaped_id) for pattern in scoped_patterns]
+        parsed = _extract_number(text, patterns)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_facebook_reel_text_counts(text: str):
+    if not text:
+        return {}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return {}
+    reel_idx = -1
+    for idx, line in enumerate(lines):
+        line_lower = line.lower()
+        if line_lower == "reels" or line_lower.startswith("reels "):
+            reel_idx = idx
+            break
+    if reel_idx < 0:
+        return {}
+    numeric_lines = []
+    for line in lines[max(0, reel_idx - 12):reel_idx]:
+        parsed = _parse_compact_number(line)
+        if parsed is not None:
+            numeric_lines.append(parsed)
+    if len(numeric_lines) < 2:
+        return {}
+    return {
+        "c": numeric_lines[-2],
+        "s": numeric_lines[-1],
+    }
+
+
 def _extract_facebook(bundle):
     source = bundle["source"]
     text = bundle["text"]
     metas = bundle["metas"]
-    return {
-        "v": _extract_number(source, [r'"view_count"\s*:\s*("?[\d.,KMB]+"?)', r'"play_count"\s*:\s*("?[\d.,KMB]+"?)']) or 0,
-        "l": _extract_number(
+    target_ids = _extract_facebook_target_ids(bundle.get("url", ""))
+    scoped_source = _collect_target_context(source, target_ids)
+
+    payload = {
+        "cap": metas.get("og:description", "")
+        or _extract_string(
+            scoped_source,
+            [
+                r'"message"\s*:\s*\{[^}]{0,400}"text"\s*:\s*"((?:\\.|[^"\\])*)"',
+                r'"seo_title"\s*:\s*"((?:\\.|[^"\\])*)"',
+            ],
+        )
+        or metas.get("og:title", ""),
+    }
+
+    view_value = (
+        _extract_number(
+            scoped_source,
+            [
+                r'"view_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"play_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"video_view_count"\s*:\s*("?[\d.,KMB]+"?)',
+            ],
+        )
+        or _extract_facebook_metric_from_meta(
+            metas,
+            [
+                r'([\d.,]+(?:[KMB])?)\s*views?\b',
+            ],
+        )
+    )
+    if view_value is not None:
+        payload["v"] = view_value
+
+    reaction_value = (
+        _extract_scoped_number(
             source,
+            target_ids,
+            [
+                r'"subscription_target_id":"{id}".{{0,8000}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
+                r'"share_fbid":"{id}".{{0,8000}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
+                r'"subscription_target_id":"{id}".{{0,8000}}?"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
+                r'"share_fbid":"{id}".{{0,8000}}?"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
+            ],
+        )
+        or _extract_scoped_number(
+            source,
+            target_ids,
+            [
+                r'"top_level_post_id":"{id}".{{0,2200}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
+            ],
+        )
+        or
+        _extract_number(
+            scoped_source,
             [
                 r'"reaction_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)',
                 r'"reaction_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
             ],
-        ) or _extract_text_metric(text, ["reactions", "reaction", "likes", "like"]) or 0,
-        "s": _extract_number(
-            source,
+        )
+        or _extract_facebook_metric_from_meta(
+            metas,
             [
+                r'([\d.,]+(?:[KMB])?)\s*reactions?\b',
+                r'([\d.,]+(?:[KMB])?)\s*likes?\b',
+            ],
+        )
+        or _extract_text_metric(text, ["reactions", "reaction", "likes", "like"])
+    )
+    if reaction_value is not None:
+        payload["l"] = reaction_value
+
+    share_value = (
+        _extract_scoped_number(
+            source,
+            target_ids,
+            [
+                r'"top_level_post_id":"{id}".{{0,2200}}?"share_count_reduced"\s*:\s*"([\d.,KMB]+)"',
+                r'"subscription_target_id":"{id}".{{0,8000}}?"share_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
+                r'"share_fbid":"{id}".{{0,8000}}?"share_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
+                r'"subscription_target_id":"{id}".{{0,8000}}?"i18n_share_count"\s*:\s*"([\d.,KMB]+)"',
+                r'"share_fbid":"{id}".{{0,8000}}?"i18n_share_count"\s*:\s*"([\d.,KMB]+)"',
+            ],
+        )
+        or
+        _extract_number(
+            scoped_source,
+            [
+                r'"share_count_reduced"\s*:\s*"?(?:\\)?([\d.,KMB]+)"?',
                 r'"share_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)',
                 r'"share_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"i18n_share_count"\s*:\s*"([\d.,KMB]+)"',
             ],
-        ) or _extract_text_metric(text, ["shares", "share"]) or 0,
-        "c": _extract_number(
+        )
+        or _extract_text_metric(text, ["shares", "share"])
+    )
+    if share_value is not None:
+        payload["s"] = share_value
+
+    comment_value = (
+        _extract_scoped_number(
             source,
+            target_ids,
             [
+                r'"top_level_post_id":"{id}".{{0,2200}}?"total_comment_count"\s*:\s*(\d+)',
+                r'"subscription_target_id":"{id}".{{0,9000}}?"comments"\s*:\s*\{{[^}}]{{0,220}}"total_count"\s*:\s*(\d+)',
+                r'"share_fbid":"{id}".{{0,9000}}?"comments"\s*:\s*\{{[^}}]{{0,220}}"total_count"\s*:\s*(\d+)',
+                r'"subscription_target_id":"{id}".{{0,9000}}?"comments_count_summary_renderer".{{0,1600}}?"total_count"\s*:\s*(\d+)',
+                r'"share_fbid":"{id}".{{0,9000}}?"comments_count_summary_renderer".{{0,1600}}?"total_count"\s*:\s*(\d+)',
+            ],
+        )
+        or
+        _extract_number(
+            scoped_source,
+            [
+                r'"total_comment_count"\s*:\s*"?(?:\\)?([\d.,KMB]+)"?',
                 r'"comment_count"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
                 r'"comment_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"comments"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
+                r'"comment_rendering_instance"\s*:\s*\{.{0,1600}?"comments"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
+                r'"i18n_comment_count"\s*:\s*"([\d.,KMB]+)"',
             ],
-        ) or _extract_text_metric(text, ["comments", "comment"]) or 0,
-        "cap": metas.get("og:description", "")
-        or _extract_string(source, [r'"message"\s*:\s*\{[^}]{0,400}"text"\s*:\s*"((?:\\.|[^"\\])*)"'])
-        or metas.get("og:title", ""),
-    }
+        )
+        or _extract_text_metric(text, ["comments", "comment"])
+    )
+    if comment_value is not None:
+        payload["c"] = comment_value
+
+    if "/reel/" in str(bundle.get("url") or "").lower():
+        reel_text_counts = _extract_facebook_reel_text_counts(text)
+        if "c" not in payload and reel_text_counts.get("c") is not None:
+            payload["c"] = reel_text_counts["c"]
+        if "s" not in payload and reel_text_counts.get("s") is not None:
+            payload["s"] = reel_text_counts["s"]
+
+    return payload
 
 
 def _should_retry_tiktok_visually(bundle, payload) -> bool:

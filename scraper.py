@@ -90,7 +90,7 @@ is_finished = False
 current_task = "Đang chờ lệnh"
 logs = []
 pending_updates = []
-COLUMN_OVERRIDES = {"link": None, "campaign": None, "view": None, "like": None, "share": None, "comment": None, "save": None}
+COLUMN_OVERRIDES = {"link": None, "view": None, "like": None, "share": None, "comment": None, "save": None}
 COLUMN_CONFIG_APPROVAL = {
     "approved": False,
     "sheet_id": "",
@@ -162,6 +162,29 @@ except Exception:
 
 def normalize_email_address(value: str) -> str:
     return (value or "").strip().lower()
+
+
+def normalize_saved_sheet_entries(raw_items):
+    entries = []
+    seen = set()
+    for item in raw_items if isinstance(raw_items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        sheet_id = str(item.get("sheet_id", "") or "").strip()
+        sheet_name = str(item.get("sheet_name", "") or "").strip()
+        if not sheet_id or not sheet_name:
+            continue
+        key = f"{sheet_id}::{sheet_name}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({
+            "sheet_id": sheet_id,
+            "sheet_name": sheet_name,
+            "sheet_gid": str(item.get("sheet_gid", "") or "0").strip() or "0",
+            "saved_at_text": str(item.get("saved_at_text", "") or "").strip(),
+        })
+    return entries
 
 FORCED_ADMIN_EMAILS = {
     normalize_email_address("thu.phannguyenanh@fanscom.vn"),
@@ -306,6 +329,7 @@ def build_default_auth_settings():
         "session_ttl_seconds": 86400,
         "users": [],
         "user_meta": {},
+        "saved_sheets": [],
         "mail": {
             "smtp_host": "",
             "smtp_port": 587,
@@ -352,6 +376,7 @@ def normalize_auth_settings(data):
         key=lambda item: (0 if item["role"] == "admin" else 1, item["email"]),
     )
     settings["user_meta"] = normalize_user_meta_map((data or {}).get("user_meta", {}) if isinstance(data, dict) else {}, settings["users"])
+    settings["saved_sheets"] = normalize_saved_sheet_entries((data or {}).get("saved_sheets", []) if isinstance(data, dict) else [])
 
     try:
         settings["otp_ttl_seconds"] = max(60, int(settings.get("otp_ttl_seconds", 300)))
@@ -861,6 +886,48 @@ def persist_auth_settings(settings):
 
 def get_auth_settings():
     return AUTH_SETTINGS
+
+
+def get_saved_sheet_entries(settings=None):
+    auth_settings = settings or get_auth_settings()
+    return [dict(item) for item in normalize_saved_sheet_entries(auth_settings.get("saved_sheets", []))]
+
+
+def save_sheet_entry(sheet_id: str, sheet_name: str, sheet_gid: str = "0"):
+    normalized_sheet_id = str(sheet_id or "").strip()
+    normalized_sheet_name = str(sheet_name or "").strip()
+    if not normalized_sheet_id or not normalized_sheet_name:
+        return []
+    settings = get_auth_settings().copy()
+    existing_entries = get_saved_sheet_entries(settings)
+    entry_key = f"{normalized_sheet_id}::{normalized_sheet_name}".lower()
+    saved_at_text = datetime.now().strftime("%d/%m/%Y %H:%M")
+    next_entries = [
+        {
+            "sheet_id": normalized_sheet_id,
+            "sheet_name": normalized_sheet_name,
+            "sheet_gid": str(sheet_gid or "0").strip() or "0",
+            "saved_at_text": saved_at_text,
+        }
+    ]
+    next_entries.extend(
+        item
+        for item in existing_entries
+        if f"{str(item.get('sheet_id', '')).strip()}::{str(item.get('sheet_name', '')).strip()}".lower() != entry_key
+    )
+    settings["saved_sheets"] = next_entries[:50]
+    persist_auth_settings(settings)
+    return get_saved_sheet_entries(settings)
+
+def build_sheet_binding_key(sheet_id: str, sheet_name: str) -> str:
+    return f"{str(sheet_id or '').strip()}::{str(sheet_name or '').strip()}"
+
+def parse_sheet_binding_key(raw_value: str):
+    raw_text = str(raw_value or "").strip()
+    if "::" not in raw_text:
+        return "", ""
+    sheet_id, sheet_name = raw_text.split("::", 1)
+    return sheet_id.strip(), sheet_name.strip()
 
 def mask_email(email: str) -> str:
     normalized = normalize_email_address(email)
@@ -1816,6 +1883,7 @@ def build_pending_html():
     """
 
 def build_status_payload():
+    config_locked = (not is_running) and current_task == "Đã dừng thủ công"
     status_badge_class = "py-4 px-8 rounded-full text-lg font-black uppercase tracking-[0.16em] bg-slate-700/60 text-slate-200 border border-slate-500/20"
     status_badge_text = "Sẵn sàng"
     if is_running:
@@ -1840,6 +1908,8 @@ def build_status_payload():
         "current_task": current_task,
         "progress_width": "100%" if is_finished else ("50%" if is_running else "0%"),
         "primary_action_html": primary_action_html,
+        "config_locked": config_locked,
+        "config_lock_message": "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập hoặc lưu sheet." if config_locked else "",
     }
 
 def build_snapshot_url(sheet_id: Optional[str] = None, sheet_gid: Optional[str] = None):
@@ -1850,7 +1920,7 @@ def build_snapshot_url(sheet_id: Optional[str] = None, sheet_gid: Optional[str] 
     return f"https://docs.google.com/spreadsheets/d/{resolved_sheet_id}/edit#gid={resolved_sheet_gid or '0'}"
 
 def build_column_config_payload(sheet=None):
-    metric_cols = {"link": "-", "campaign": "-", "view": "-", "like": "-", "share": "-", "comment": "-", "save": "-"}
+    metric_cols = {"link": "-", "view": "-", "like": "-", "share": "-", "comment": "-", "save": "-"}
     detected_text = "Chưa có sheet để tự nhận cột."
     header_row = 1
     effective_start_row = START_ROW
@@ -2186,6 +2256,59 @@ def get_schedule_sheet_binding(use_active_fallback: bool = True):
         "is_saved": False,
     }
 
+def get_schedule_sheet_choices(include_active_fallback: bool = True):
+    choices = []
+    seen_keys = set()
+    for entry in get_saved_sheet_entries():
+        sheet_id = str(entry.get("sheet_id", "") or "").strip()
+        sheet_name = str(entry.get("sheet_name", "") or "").strip()
+        sheet_gid = str(entry.get("sheet_gid", "") or "0").strip() or "0"
+        if not sheet_id or not sheet_name:
+            continue
+        binding_key = build_sheet_binding_key(sheet_id, sheet_name)
+        if binding_key in seen_keys:
+            continue
+        seen_keys.add(binding_key)
+        choices.append(
+            {
+                "key": binding_key,
+                "sheet_id": sheet_id,
+                "sheet_name": sheet_name,
+                "sheet_gid": sheet_gid,
+                "label": sheet_name,
+                "is_saved": True,
+            }
+        )
+
+    if include_active_fallback and ACTIVE_SHEET_ID and ACTIVE_SHEET_NAME:
+        active_key = build_sheet_binding_key(ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME)
+        if active_key not in seen_keys:
+            choices.insert(
+                0,
+                {
+                    "key": active_key,
+                    "sheet_id": ACTIVE_SHEET_ID,
+                    "sheet_name": ACTIVE_SHEET_NAME,
+                    "sheet_gid": ACTIVE_SHEET_GID or "0",
+                    "label": f"{ACTIVE_SHEET_NAME} (đang mở)",
+                    "is_saved": False,
+                },
+            )
+    return choices
+
+def build_schedule_sheet_options_html():
+    current_binding = get_schedule_sheet_binding()
+    selected_key = build_sheet_binding_key(current_binding["sheet_id"], current_binding["sheet_name"])
+    choices = get_schedule_sheet_choices()
+    if not choices:
+        return '<option value="">Chưa có sheet nào để chọn</option>'
+    option_parts = []
+    for choice in choices:
+        option_parts.append(
+            f'<option value="{html.escape(choice["key"], quote=True)}" {"selected" if choice["key"] == selected_key else ""}>{html.escape(choice["label"])}</option>'
+        )
+    return "".join(option_parts)
+
 def build_schedule_scope_text():
     binding = get_schedule_sheet_binding()
     normalized_targets = normalize_schedule_targets(schedule_targets, binding["sheet_id"] or ACTIVE_SHEET_ID)
@@ -2197,11 +2320,27 @@ def build_schedule_scope_text():
             return f"Lịch đang nhớ {len(normalized_targets)} bài đã chọn và sẽ chỉ quét đúng các bài này khi đến giờ."
         return f"Lịch sẽ dùng {len(normalized_targets)} bài đã chọn nếu bạn bấm Lưu lịch ngay bây giờ."
     sheet_name = binding["sheet_name"]
+    target_count = len(schedule_targets or [])
     if not sheet_name:
         return "Hãy chọn sheet ở phần Cấu hình trước, rồi bấm Lưu lịch để lịch tự động nhớ tab cần chạy."
+    if target_count:
+        target_text = "1 bài đã chọn" if target_count == 1 else f"{target_count} bài đã chọn"
+        if binding["is_saved"]:
+            return f"Lịch đang nhớ tab '{sheet_name}' và sẽ chỉ tự quét lại {target_text} khi đến giờ."
+        return f"Lịch sẽ dùng tab '{sheet_name}' và chỉ quét {target_text} nếu bạn bấm Lưu lịch ngay bây giờ."
     if binding["is_saved"]:
         return f"Lịch đang nhớ tab '{sheet_name}' và sẽ tự quét lại tab này khi đến giờ, không cần bấm tay."
     return f"Lịch sẽ dùng tab '{sheet_name}' nếu bạn bấm Lưu lịch ngay bây giờ."
+
+def build_schedule_target_summary_text():
+    target_count = len(schedule_targets or [])
+    binding = get_schedule_sheet_binding()
+    sheet_name = binding["sheet_name"] or "tab hiện tại"
+    if target_count <= 0:
+        return f"Lịch hiện đang chạy toàn bộ link trong '{sheet_name}'."
+    if target_count == 1:
+        return f"Lịch hiện chỉ chạy 1 bài đã chọn trong '{sheet_name}'."
+    return f"Lịch hiện chỉ chạy {target_count} bài đã chọn trong '{sheet_name}'."
 
 def build_schedule_config_payload():
     binding = get_schedule_sheet_binding()
@@ -2211,6 +2350,10 @@ def build_schedule_config_payload():
         "sheet_name_text": binding["sheet_name"] or "Chưa chốt tab nào",
         "sheet_id_text": binding["sheet_id"] or "Chưa có Spreadsheet ID",
         "is_saved": binding["is_saved"],
+        "sheet_binding_key": build_sheet_binding_key(binding["sheet_id"], binding["sheet_name"]) if binding["sheet_id"] and binding["sheet_name"] else "",
+        "sheet_options_html": build_schedule_sheet_options_html(),
+        "target_count": len(schedule_targets or []),
+        "target_summary_text": build_schedule_target_summary_text(),
         "scope_text": build_schedule_scope_text(),
         "snapshot_url": build_snapshot_url(binding["sheet_id"], binding["sheet_gid"]) if binding["sheet_id"] else "",
         "target_count": len(normalized_targets),
@@ -2441,7 +2584,7 @@ def set_active_sheet(sheet_name, sheet_id: Optional[str] = None):
     ACTIVE_SHEET_ID = target_sheet_id
     ACTIVE_SHEET_NAME = sheet_name
     ACTIVE_SHEET_GID = str(ws.id)
-    add_log(f"Đã lưu sheet: {sheet_name} | Spreadsheet ID: {ACTIVE_SHEET_ID}")
+    add_log(f"Đã chọn sheet: {sheet_name} | Spreadsheet ID: {ACTIVE_SHEET_ID}")
 
 def retry_with_backoff(func, max_retries=3, base_delay=2):
     """Retry a function with exponential backoff on connection errors"""
@@ -2514,6 +2657,23 @@ def detect_platform(url):
     if "youtube.com" in url_lower or "youtu.be" in url_lower: return "YouTube"
     if "instagram.com" in url_lower: return "Instagram"
     return "Khác"
+
+
+def is_optional_view_metric(url: str, platform: str = "") -> bool:
+    url_lower = str(url or "").strip().lower()
+    platform_key = str(platform or "").strip().lower()
+    if not url_lower:
+        return False
+    if platform_key == "tiktok" and "/photo/" in url_lower:
+        return True
+    if platform_key == "instagram" and "/p/" in url_lower and "/reel/" not in url_lower and "/tv/" not in url_lower:
+        return True
+    if platform_key == "facebook":
+        if any(marker in url_lower for marker in ["/reel/", "/videos/", "fb.watch"]):
+            return False
+        if any(marker in url_lower for marker in ["/groups/", "/posts/", "/permalink/", "/photo", "/photos/", "/share/p/"]):
+            return True
+    return False
 
 def normalize_header(text: str) -> str:
     value = unicodedata.normalize("NFD", (text or "").strip().lower())
@@ -2602,42 +2762,49 @@ def detect_sheet_columns(sheet):
     return detect_sheet_layout(sheet).get("columns", {})
 
 def make_unique_sheet_headers(headers):
-    unique_headers = []
     seen = {}
-    for idx, header in enumerate(headers or [], start=1):
-        base_header = str(header or "").strip() or f"Column {idx}"
-        duplicate_count = seen.get(base_header, 0) + 1
-        seen[base_header] = duplicate_count
-        if duplicate_count == 1:
-            unique_headers.append(base_header)
+    unique_headers = []
+    for idx, raw_header in enumerate(headers or [], start=1):
+        header = str(raw_header or "").strip() or f"Column {idx}"
+        count = seen.get(header, 0) + 1
+        seen[header] = count
+        if count > 1:
+            unique_headers.append(f"{header}__dup{count}")
         else:
-            unique_headers.append(f"{base_header}__{duplicate_count}")
+            unique_headers.append(header)
     return unique_headers
 
-def get_sheet_records(sheet, layout=None):
+
+def get_sheet_records(sheet, layout=None, include_row_values: bool = False):
     resolved_layout = layout or detect_sheet_layout(sheet)
     header_row = max(1, int(resolved_layout.get("header_row") or 1))
     spreadsheet_id, sheet_title, sheet_gid = build_worksheet_cache_key(sheet)
-    cache_key = ("records", spreadsheet_id, sheet_title, sheet_gid, header_row)
+    cache_key = ("records", spreadsheet_id, sheet_title, sheet_gid, header_row, bool(include_row_values))
     cached = get_sheet_cache(cache_key)
     if cached is not None:
         return cached
 
-    all_rows = sheet.get_all_values()
+    all_values = sheet.get_all_values()
     raw_headers = list(resolved_layout.get("headers") or [])
-    if (not raw_headers) and len(all_rows) >= header_row:
-        raw_headers = list(all_rows[header_row - 1] or [])
+    if (not raw_headers) and len(all_values) >= header_row:
+        raw_headers = list(all_values[header_row - 1] or [])
     elif not raw_headers:
         raw_headers = list(sheet.row_values(header_row) or [])
-    headers = make_unique_sheet_headers(raw_headers)
-    data_rows = all_rows[header_row:] if len(all_rows) >= header_row else []
+
+    unique_headers = make_unique_sheet_headers(raw_headers)
+    data_rows = all_values[header_row:] if len(all_values) >= header_row else []
+    max_width = max(len(unique_headers), max((len(row) for row in data_rows), default=0))
+    if len(unique_headers) < max_width:
+        unique_headers.extend([f"__extra_{idx}" for idx in range(len(unique_headers) + 1, max_width + 1)])
+
     records = []
     for row in data_rows:
-        padded_row = list(row[: len(headers)])
-        if len(padded_row) < len(headers):
-            padded_row.extend([""] * (len(headers) - len(padded_row)))
-        records.append(dict(zip(headers, padded_row)))
-    return set_sheet_cache(cache_key, (records, header_row, headers))
+        padded_row = list(row or []) + [""] * max(0, max_width - len(row or []))
+        record = {unique_headers[idx]: padded_row[idx] for idx in range(max_width)}
+        if include_row_values:
+            record["__row_values__"] = padded_row
+        records.append(record)
+    return set_sheet_cache(cache_key, (records, header_row, raw_headers))
 
 def resolve_effective_start_row(header_row: int) -> int:
     return max(2, START_ROW, int(header_row or 1) + 1)
@@ -2646,7 +2813,7 @@ def format_detected_columns_text(layout) -> str:
     if not layout:
         return ""
     col_map = apply_column_overrides(layout.get("columns") or {})
-    ordered_fields = ["link", "campaign", "view", "like", "share", "comment", "save"]
+    ordered_fields = ["link", "view", "like", "share", "comment", "save"]
     parts = []
     for field in ordered_fields:
         col_idx = col_map.get(field)
@@ -2699,6 +2866,21 @@ def read_record_value_from_header(record, normalized_record, header_name: str):
             continue
         return value
     return ""
+
+
+def read_record_value_from_column(record, col_idx: Optional[int]):
+    if not record or not col_idx or col_idx <= 0:
+        return ""
+    row_values = record.get("__row_values__") if isinstance(record, dict) else None
+    if not isinstance(row_values, list) or col_idx > len(row_values):
+        return ""
+    value = row_values[col_idx - 1]
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return value if str(value).strip() else ""
 
 def parse_metric_number(value) -> int:
     if value is None:
@@ -2801,9 +2983,10 @@ def build_dom_slug(value: str, fallback: str = "item") -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", normalize_header(str(value or ""))).strip("-")
     return slug or fallback
 
-def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
+def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0, sheet_id: Optional[str] = None, sheet_slug: str = ""):
     sheet_title = str(getattr(ws, "title", "") or f"Sheet {tab_index + 1}")
-    sheet_slug = f"{build_dom_slug(sheet_title, 'sheet')}-{tab_index}"
+    resolved_sheet_id = str(sheet_id or ACTIVE_SHEET_ID or "").strip()
+    resolved_sheet_slug = sheet_slug or f"{build_dom_slug(sheet_title, 'sheet')}-{tab_index}"
     platform_counts = {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0}
     selected_target_keys = {
         build_schedule_target_key(item.get("sheet_id"), item.get("sheet_name"), item.get("row_idx"), item.get("link"))
@@ -2820,14 +3003,16 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
     try:
         layout = detect_sheet_layout(ws)
         col_map = apply_column_overrides(layout.get("columns"))
-        records, header_row, headers = get_sheet_records(ws, layout)
+        records, header_row, headers = get_sheet_records(ws, layout, include_row_values=True)
+        link_header = resolve_header_from_column(headers, col_map.get("link"))
         campaign_header = resolve_header_from_column(headers, col_map.get("campaign"))
         start_row = resolve_effective_start_row(header_row)
     except Exception as exc:
         error = str(exc)
         return {
             "sheet_title": sheet_title,
-            "sheet_slug": sheet_slug,
+            "sheet_slug": resolved_sheet_slug,
+            "sheet_id": resolved_sheet_id,
             "sheet_gid": str(getattr(ws, "id", "") or "0"),
             "total_posts": 0,
             "total_views": 0,
@@ -2844,7 +3029,12 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
             continue
 
         normalized_record = {normalize_header(str(key)): value for key, value in (record or {}).items()}
-        link = str(first_nonempty_value(normalized_record, "link", "url", "posturl")).strip()
+        link = str(
+            read_record_value_from_column(record, col_map.get("link"))
+            or
+            read_record_value_from_header(record, normalized_record, link_header)
+            or first_nonempty_value(normalized_record, "link", "url", "posturl", "linkpost")
+        ).strip()
         if not link:
             continue
 
@@ -2865,11 +3055,11 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
             first_nonempty_value(normalized_record, "caption", "title", "content", "noidung", "post", "mota")
         ).strip() or infer_post_title(link, platform)
         date_text = str(first_nonempty_value(normalized_record, "date", "time", "timestamp", "ngay", "thoigian")).strip() or "-"
-        view = parse_metric_number(first_nonempty_value(normalized_record, "view", "views", "luotxem"))
-        reaction = parse_metric_number(first_nonempty_value(normalized_record, "like", "likes", "reaction", "reactions"))
-        share = parse_metric_number(first_nonempty_value(normalized_record, "share", "shares"))
-        comment = parse_metric_number(first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
-        save = parse_metric_number(first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
+        view = parse_metric_number(read_record_value_from_column(record, col_map.get("view")) or first_nonempty_value(normalized_record, "view", "views", "luotxem"))
+        reaction = parse_metric_number(read_record_value_from_column(record, col_map.get("like")) or first_nonempty_value(normalized_record, "like", "likes", "reaction", "reactions"))
+        share = parse_metric_number(read_record_value_from_column(record, col_map.get("share")) or first_nonempty_value(normalized_record, "share", "shares"))
+        comment = parse_metric_number(read_record_value_from_column(record, col_map.get("comment")) or first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
+        save = parse_metric_number(read_record_value_from_column(record, col_map.get("save")) or first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
         engagement = reaction + share + comment + save
         status_label = "Đã quét" if any([view, reaction, share, comment, save]) or date_text != "-" else "Chờ quét"
         status_class = "posts-status-done" if status_label == "Đã quét" else "posts-status-pending"
@@ -2904,7 +3094,8 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
                         type="checkbox"
                         class="posts-table-check post-select-check"
                         data-post-select
-                        data-sheet-id="{html.escape(ACTIVE_SHEET_ID or '', quote=True)}"
+                        data-sheet-id="{html.escape(resolved_sheet_id, quote=True)}"
+                        data-sheet-gid="{html.escape(str(getattr(ws, 'id', '') or '0'), quote=True)}"
                         data-sheet-name="{safe_sheet_name_attr}"
                         data-row-idx="{row_idx}"
                         data-link="{safe_link}"
@@ -2956,7 +3147,8 @@ def collect_posts_dataset_for_worksheet(ws, tab_index: int = 0):
 
     return {
         "sheet_title": sheet_title,
-        "sheet_slug": sheet_slug,
+        "sheet_slug": resolved_sheet_slug,
+        "sheet_id": resolved_sheet_id,
         "sheet_gid": str(getattr(ws, "id", "") or "0"),
         "total_posts": total_posts,
         "total_views": total_views,
@@ -2990,7 +3182,8 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             ws = sheet or get_worksheet(ACTIVE_SHEET_NAME)
             layout = detect_sheet_layout(ws)
             col_map = apply_column_overrides(layout.get("columns"))
-            records, header_row, headers = get_sheet_records(ws, layout)
+            records, header_row, headers = get_sheet_records(ws, layout, include_row_values=True)
+            link_header = resolve_header_from_column(headers, col_map.get("link"))
             campaign_header = resolve_header_from_column(headers, col_map.get("campaign"))
             start_row = resolve_effective_start_row(header_row)
         except Exception as exc:
@@ -3006,7 +3199,12 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
         if row_idx < start_row:
             continue
         normalized_record = {normalize_header(str(key)): value for key, value in (record or {}).items()}
-        link = str(first_nonempty_value(normalized_record, "link", "url", "posturl")).strip()
+        link = str(
+            read_record_value_from_column(record, col_map.get("link"))
+            or
+            read_record_value_from_header(record, normalized_record, link_header)
+            or first_nonempty_value(normalized_record, "link", "url", "posturl", "linkpost")
+        ).strip()
         if not link:
             continue
 
@@ -3018,11 +3216,11 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             read_record_value_from_header(record, normalized_record, campaign_header)
             or first_nonempty_value(normalized_record, "campaign", "chiendich", "camp")
         ).strip() or (ACTIVE_SHEET_NAME or "Campaign hiện tại")
-        view = parse_metric_number(first_nonempty_value(normalized_record, "view", "views", "luotxem"))
-        reaction = parse_metric_number(first_nonempty_value(normalized_record, "like", "likes", "reaction", "reactions"))
-        share = parse_metric_number(first_nonempty_value(normalized_record, "share", "shares"))
-        comment = parse_metric_number(first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
-        save = parse_metric_number(first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
+        view = parse_metric_number(read_record_value_from_column(record, col_map.get("view")) or first_nonempty_value(normalized_record, "view", "views", "luotxem"))
+        reaction = parse_metric_number(read_record_value_from_column(record, col_map.get("like")) or first_nonempty_value(normalized_record, "like", "likes", "reaction", "reactions"))
+        share = parse_metric_number(read_record_value_from_column(record, col_map.get("share")) or first_nonempty_value(normalized_record, "share", "shares"))
+        comment = parse_metric_number(read_record_value_from_column(record, col_map.get("comment")) or first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
+        save = parse_metric_number(read_record_value_from_column(record, col_map.get("save")) or first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
         engagement = reaction + share + comment + save
         scanned_at = parse_dashboard_date(first_nonempty_value(normalized_record, "date", "time", "timestamp", "ngay", "thoigian"))
 
@@ -3168,82 +3366,113 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
     </section>
     """
 
+
+def format_saved_sheet_error(error: str) -> str:
+    raw = str(error or "").strip()
+    if not raw:
+        return ""
+    raw_lower = raw.lower()
+    normalized = normalize_header(raw)
+    if "429" in raw_lower or "quota" in raw_lower or "readrequests" in normalized:
+        return "Google Sheet đang chạm giới hạn đọc dữ liệu. Thử lại sau ít phút."
+    if "permission" in raw_lower or "forbidden" in raw_lower or "insufficientpermissions" in normalized:
+        return "Sheet này chưa cấp đủ quyền đọc cho hệ thống."
+    if "notfound" in normalized or "khongtimthay" in normalized:
+        return "Không tìm thấy sheet này hoặc tab đã bị đổi tên."
+    return shorten_text(raw, 84)
+
+
 def build_posts_panel_html(sheet=None):
-    if not ACTIVE_SHEET_ID:
+    saved_entries = get_saved_sheet_entries()
+    if not saved_entries:
         return """
         <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
             <div class="posts-empty-card rounded-[1.5rem] p-8 text-center">
                 <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Bài đăng</div>
-                <div class="mt-3 text-2xl font-black text-slate-100">Chưa có dữ liệu để hiển thị</div>
-                <p class="mt-2 text-sm text-slate-400">Hãy chọn Google Sheet hợp lệ rồi tải lại trang để xem danh sách bài đăng.</p>
+                <div class="mt-3 text-2xl font-black text-slate-100">Chưa có sheet nào được lưu</div>
+                <p class="mt-2 text-sm text-slate-400">Hãy nhập sheet ở phần Cấu hình rồi bấm <b>Lưu Sheet</b> để đưa sheet đó vào đây.</p>
             </div>
         </section>
         """
 
-    cache_key = ("posts-panel", ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME or "")
+    cache_key = (
+        "posts-panel",
+        ACTIVE_SHEET_ID or "",
+        ACTIVE_SHEET_NAME or "",
+        tuple(
+            f"{str(item.get('sheet_id', '') or '').strip()}::{str(item.get('sheet_name', '') or '').strip()}::{str(item.get('saved_at_text', '') or '').strip()}"
+            for item in saved_entries
+        ),
+    )
     cached = get_sheet_cache(cache_key)
     if cached is not None:
         return cached
 
-    try:
-        spreadsheet = get_spreadsheet(ACTIVE_SHEET_ID)
-        worksheets = get_spreadsheet_worksheets(spreadsheet, ACTIVE_SHEET_ID)
-    except Exception as exc:
-        html_output = f"""
-        <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
-            <div class="posts-empty-card rounded-[1.5rem] p-8 text-center">
-                <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Bài đăng</div>
-                <div class="mt-3 text-2xl font-black text-slate-100">Không tải được danh sách bài đăng</div>
-                <p class="mt-2 text-sm text-slate-400">{html.escape(describe_google_sheet_error(exc))}</p>
-            </div>
-        </section>
-        """
-        return set_sheet_cache(cache_key, html_output, ttl=15)
-
     datasets = []
-    for tab_index, ws in enumerate(worksheets):
-        dataset = collect_posts_dataset_for_worksheet(sheet if sheet is not None and ws.title == ACTIVE_SHEET_NAME else ws, tab_index)
+    for entry_index, entry in enumerate(saved_entries):
+        entry_sheet_id = str(entry.get("sheet_id", "") or "").strip()
+        entry_sheet_name = str(entry.get("sheet_name", "") or "").strip()
+        entry_sheet_gid = str(entry.get("sheet_gid", "") or "0").strip() or "0"
+        entry_saved_at_text = str(entry.get("saved_at_text", "") or "").strip()
+        entry_slug = f"{build_dom_slug(entry_sheet_name, 'sheet')}-{entry_index}"
+        try:
+            ws = sheet if (
+                sheet is not None
+                and entry_sheet_id == (ACTIVE_SHEET_ID or "")
+                and entry_sheet_name == (ACTIVE_SHEET_NAME or "")
+            ) else get_worksheet(entry_sheet_name, entry_sheet_id)
+            dataset = collect_posts_dataset_for_worksheet(ws, entry_index, sheet_id=entry_sheet_id, sheet_slug=entry_slug)
+            dataset["saved_at_text"] = entry_saved_at_text
+            dataset["sheet_id"] = entry_sheet_id
+            dataset["sheet_gid"] = entry_sheet_gid or dataset.get("sheet_gid", "0")
+        except Exception as exc:
+            dataset = {
+                "sheet_title": entry_sheet_name or f"Sheet {entry_index + 1}",
+                "sheet_slug": entry_slug,
+                "sheet_id": entry_sheet_id,
+                "sheet_gid": entry_sheet_gid,
+                "total_posts": 0,
+                "total_views": 0,
+                "total_engagement": 0,
+                "creator_count": 0,
+                "campaign_count": 0,
+                "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
+                "rows_html": "",
+                "error": str(exc),
+                "saved_at_text": entry_saved_at_text,
+            }
         datasets.append(dataset)
-
-    if not datasets:
-        html_output = """
-        <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
-            <div class="posts-empty-card rounded-[1.5rem] p-8 text-center">
-                <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Bài đăng</div>
-                <div class="mt-3 text-2xl font-black text-slate-100">Spreadsheet chưa có tab nào để hiển thị</div>
-            </div>
-        </section>
-        """
-        return set_sheet_cache(cache_key, html_output)
-
-    active_sheet_title = "Chưa chọn"
-    schedule_selected_count = len(normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID))
-    spreadsheet_snapshot_url = build_snapshot_url(ACTIVE_SHEET_ID, ACTIVE_SHEET_GID)
-    spreadsheet_title = (str(getattr(spreadsheet, "title", "") or "").strip() or "Spreadsheet hiện tại")
 
     summary_cards_html = []
     detail_panels_html = []
     for dataset in datasets:
         safe_sheet_title = html.escape(dataset["sheet_title"])
+        saved_at_text = html.escape(dataset.get("saved_at_text", "") or "Chưa có thời gian lưu")
+        saved_meta_text = html.escape(
+            f"{format_metric_number(dataset['creator_count'])} creator • {format_metric_number(dataset['campaign_count'])} campaign"
+        )
         error_html = (
-            f'<div class="posts-sheet-card-error">{html.escape(shorten_text(dataset["error"], 88))}</div>'
+            f'<div class="posts-sheet-card-error"><i class="fa-solid fa-circle-exclamation"></i><span>{html.escape(format_saved_sheet_error(dataset["error"]))}</span></div>'
             if dataset["error"] else ""
         )
         summary_cards_html.append(
             f"""
             <button type="button" class="posts-sheet-card" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}">
-                <div class="posts-sheet-card-head">
-                    <div>
-                        <div class="posts-sheet-card-kicker">Tab sheet</div>
-                        <div class="posts-sheet-card-title">{safe_sheet_title}</div>
-                        <div class="posts-sheet-card-meta">{format_metric_number(dataset["creator_count"])} creator • {format_metric_number(dataset["campaign_count"])} campaign</div>
+                <div class="posts-sheet-card-row">
+                    <div class="posts-sheet-card-main">
+                        <div class="posts-sheet-card-kicker">Sheet đã lưu</div>
+                        <div class="posts-sheet-card-title-line">
+                            <div class="posts-sheet-card-title">{safe_sheet_title}</div>
+                            <div class="posts-sheet-card-meta">{saved_at_text}</div>
+                        </div>
+                        <div class="posts-sheet-card-submeta">{saved_meta_text}</div>
                     </div>
-                    <div class="posts-sheet-card-badge">{format_metric_number(dataset["total_posts"])} bài</div>
-                </div>
-                <div class="posts-sheet-card-stats">
-                    <div class="posts-sheet-card-stat"><span>View</span><strong>{format_compact_metric(dataset["total_views"])}</strong></div>
-                    <div class="posts-sheet-card-stat"><span>Engage</span><strong>{format_compact_metric(dataset["total_engagement"])}</strong></div>
-                    <div class="posts-sheet-card-stat"><span>TikTok</span><strong>{format_metric_number(dataset["platform_counts"]["tiktok"])}</strong></div>
+                    <div class="posts-sheet-card-inline">
+                        <span class="posts-sheet-mini-chip posts-sheet-mini-chip-count">{format_metric_number(dataset["total_posts"])} bài</span>
+                        <span class="posts-sheet-mini-chip"><strong>{format_compact_metric(dataset["total_views"])}</strong> view</span>
+                        <span class="posts-sheet-mini-chip"><strong>{format_compact_metric(dataset["total_engagement"])}</strong> engage</span>
+                        <span class="posts-sheet-mini-chip"><strong>{format_metric_number(dataset["platform_counts"]["tiktok"])}</strong> TikTok</span>
+                    </div>
                 </div>
                 {error_html}
             </button>
@@ -3270,12 +3499,12 @@ def build_posts_panel_html(sheet=None):
             <div class="posts-tab-panel" data-posts-tab-panel="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-platform="all">
                 <div class="posts-tab-panel-head">
                     <div>
-                        <div class="posts-tab-panel-kicker">Đang xem tab</div>
+                        <div class="posts-tab-panel-kicker">Đang xem sheet</div>
                         <div class="posts-tab-panel-title">{safe_sheet_title}</div>
-                        <div class="posts-tab-panel-sub">Bấm các card phía trên để chuyển nhanh giữa các trang trong spreadsheet hiện tại.</div>
+                        <div class="posts-tab-panel-sub">Sheet ID: {html.escape(dataset.get("sheet_id", ""))}</div>
                     </div>
-                    <a href="{html.escape(build_snapshot_url(ACTIVE_SHEET_ID, dataset["sheet_gid"]), quote=True)}" target="_blank" rel="noreferrer" class="posts-toolbar-btn">
-                        <i class="fa-solid fa-up-right-from-square"></i> Mở tab này
+                    <a href="{html.escape(build_snapshot_url(dataset.get("sheet_id", ""), dataset["sheet_gid"]), quote=True)}" target="_blank" rel="noreferrer" class="posts-toolbar-btn">
+                        <i class="fa-solid fa-up-right-from-square"></i> Mở sheet này
                     </a>
                 </div>
                 <div class="posts-toolbar rounded-[1.5rem] p-4 md:p-5">
@@ -3285,6 +3514,13 @@ def build_posts_panel_html(sheet=None):
                             <input type="text" placeholder="Tìm kiếm bài đăng, creator hoặc chiến dịch..." class="posts-search-input posts-search-field" />
                         </label>
                         <div class="posts-toolbar-actions">
+                            <div class="text-xs text-slate-400 font-bold px-3 py-2 rounded-xl border border-white/10 bg-slate-900/60" data-posts-selection-count>0 bài đã chọn</div>
+                            <button type="button" class="posts-toolbar-btn" data-use-posts-for-schedule>
+                                <i class="fa-regular fa-calendar-check"></i> Dùng bài đã chọn cho lịch
+                            </button>
+                            <button type="button" class="posts-toolbar-btn" data-clear-posts-schedule>
+                                <i class="fa-solid fa-layer-group"></i> Chạy cả sheet
+                            </button>
                             <button type="button" class="posts-toolbar-btn posts-reset-btn"><i class="fa-solid fa-rotate-left"></i> Đặt lại</button>
                         </div>
                     </div>
@@ -3311,7 +3547,7 @@ def build_posts_panel_html(sheet=None):
                                 </tr>
                             </thead>
                             <tbody>
-                                {dataset["rows_html"] if dataset["rows_html"] else '<tr><td colspan="11" class="posts-empty-state">Tab này chưa có link nào hợp lệ để hiển thị.</td></tr>'}
+                                {dataset["rows_html"] if dataset["rows_html"] else '<tr><td colspan="11" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'}
                             </tbody>
                         </table>
                     </div>
@@ -3323,6 +3559,7 @@ def build_posts_panel_html(sheet=None):
             """
         )
 
+    saved_count = len(datasets)
     html_output = f"""
     <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
         <div class="flex flex-col gap-5">
@@ -3330,54 +3567,48 @@ def build_posts_panel_html(sheet=None):
                 <div>
                     <div class="posts-page-kicker">Bài đăng</div>
                     <h2 class="posts-page-title">Bài đăng</h2>
-                    <p class="posts-page-subtitle">Tab này lưu các sheet đã nhận từ spreadsheet hiện tại. Bấm vào từng sheet bên dưới để mở bảng chi tiết bài đăng. Đang xem: <span id="posts-active-tab-label" class="text-slate-200 font-bold">{html.escape(active_sheet_title)}</span>.</p>
+                    <p class="posts-page-subtitle">Chọn một sheet đã lưu ở bên dưới để mở bảng chi tiết. Đang xem: <span id="posts-active-tab-label" class="text-slate-200 font-bold">Chưa chọn</span>.</p>
                 </div>
-                <div class="posts-page-actions">
-                    <div class="posts-counter-pill">
-                        <div class="posts-counter-label">Đang hiển thị</div>
-                        <div class="posts-counter-value" id="posts-visible-count">0 bài</div>
-                    </div>
-                    <div class="posts-counter-pill">
-                        <div class="posts-counter-label">Đang chọn cho lịch</div>
-                        <div class="posts-counter-value" id="schedule-selected-count">{schedule_selected_count} bài</div>
-                    </div>
-                    <button type="button" id="save-schedule-targets-btn" class="posts-toolbar-btn">
-                        <i class="fa-regular fa-calendar-check"></i> Lưu bài cho lịch
-                    </button>
-                    <button type="button" id="clear-schedule-targets-btn" class="posts-toolbar-btn">
-                        <i class="fa-solid fa-eraser"></i> Xóa bài lịch
-                    </button>
+                <div class="posts-counter-pill">
+                    <div class="posts-counter-label">Đang hiển thị</div>
+                    <div class="posts-counter-value" id="posts-visible-count">0 bài</div>
                 </div>
             </div>
 
-            <div class="posts-sheet-summary-shell">
-                <div class="posts-sheet-summary-head">
-                    <div>
-                        <div class="posts-sheet-summary-kicker">Spreadsheet hiện tại</div>
-                        <div class="posts-sheet-summary-title">{html.escape(spreadsheet_title)}</div>
-                        <div class="posts-sheet-summary-sub">{html.escape(ACTIVE_SHEET_ID)}</div>
+            <div id="posts-master-view" class="posts-master-view">
+                <div class="posts-sheet-summary-shell">
+                    <div class="posts-sheet-summary-head">
+                        <div>
+                            <div class="posts-sheet-summary-kicker">Sheet đã lưu</div>
+                            <div class="posts-sheet-summary-title">{saved_count} sheet</div>
+                            <div class="posts-sheet-summary-sub">Các sheet được lưu từ phần Cấu hình sẽ xuất hiện tại đây.</div>
+                        </div>
                     </div>
-                    <a href="{html.escape(spreadsheet_snapshot_url, quote=True)}" target="_blank" rel="noreferrer" class="posts-toolbar-btn">
-                        <i class="fa-solid fa-sheet-plastic"></i> Mở Google Sheet
-                    </a>
-                </div>
-                <div class="posts-sheet-summary-grid">
-                    {"".join(summary_cards_html)}
+                    <div class="posts-sheet-summary-grid">
+                        {"".join(summary_cards_html)}
+                    </div>
                 </div>
             </div>
 
-            <div class="posts-tab-panels">
-                <div id="posts-detail-placeholder" class="posts-detail-placeholder posts-empty-card rounded-[1.5rem] p-8 text-center">
-                    <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Chưa chọn tab</div>
-                    <div class="mt-3 text-2xl font-black text-slate-100">Bấm vào một sheet để xem chi tiết</div>
-                    <p class="mt-2 text-sm text-slate-400">Danh sách sheet đã được lưu phía trên. Khi bạn bấm vào từng sheet, bảng bài đăng chi tiết sẽ hiện ở đây.</p>
+            <div id="posts-detail-view" class="posts-detail-view hidden">
+                <div class="posts-detail-topbar">
+                    <button type="button" id="posts-back-button" class="posts-toolbar-btn">
+                        <i class="fa-solid fa-arrow-left"></i> Quay lại danh sách sheet
+                    </button>
                 </div>
-                {"".join(detail_panels_html)}
+                <div class="posts-tab-panels">
+                    <div id="posts-selection-placeholder" class="posts-empty-card rounded-[1.5rem] p-8 text-center">
+                        <div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Chi tiết</div>
+                        <div class="mt-3 text-2xl font-black text-slate-100">Chọn một sheet đã lưu để xem bài đăng</div>
+                        <p class="mt-2 text-sm text-slate-400">Bấm vào card sheet phía trên, lúc đó bảng chi tiết sẽ hiện ra như bạn muốn.</p>
+                    </div>
+                    {"".join(detail_panels_html)}
+                </div>
             </div>
         </div>
     </section>
     """
-    return set_sheet_cache(cache_key, html_output)
+    return set_sheet_cache(cache_key, html_output, ttl=15)
 
 def build_row_updates(col_map, platform, now, stats):
     row_updates = []
@@ -3385,16 +3616,19 @@ def build_row_updates(col_map, platform, now, stats):
         row_updates.append(("date", col_map["date"], now))
     if col_map.get("caption"):
         row_updates.append(("caption", col_map["caption"], str(stats.get("cap", ""))))
-    if col_map.get("view"):
-        row_updates.append(("view", col_map["view"], int(stats.get("v", 0))))
-    if col_map.get("like"):
-        row_updates.append(("like", col_map["like"], int(stats.get("l", 0))))
-    if col_map.get("share"):
-        row_updates.append(("share", col_map["share"], int(stats.get("s", 0))))
-    if col_map.get("comment"):
-        row_updates.append(("comment", col_map["comment"], int(stats.get("c", 0))))
-    if col_map.get("save") and "save" in stats:
-        row_updates.append(("save", col_map["save"], int(stats.get("save", 0))))
+    metric_keys = {
+        "view": "v",
+        "like": "l",
+        "share": "s",
+        "comment": "c",
+        "save": "save",
+    }
+    for field, stat_key in metric_keys.items():
+        if not col_map.get(field):
+            continue
+        if stat_key not in stats or stats.get(stat_key) is None:
+            continue
+        row_updates.append((field, col_map[field], int(stats.get(stat_key, 0))))
     return row_updates
 
 def normalize_cell_value(field, value):
@@ -3421,6 +3655,56 @@ def write_sheet_row_updates(sheet, row_idx: int, row_updates):
 
     for field, col_idx, value in normalized_updates:
         sheet.update_cell(row_idx, col_idx, value)
+
+def get_missing_metric_fields(col_map, stats):
+    metric_keys = {
+        "view": "v",
+        "like": "l",
+        "share": "s",
+        "comment": "c",
+        "save": "save",
+    }
+    missing_fields = []
+    for field, stat_key in metric_keys.items():
+        if not col_map.get(field):
+            continue
+        if not stats or stat_key not in stats or stats.get(stat_key) is None:
+            missing_fields.append(field)
+    return missing_fields
+
+
+def update_metric_highlights(sheet, row_idx: int, col_map, missing_fields):
+    if not sheet or not row_idx or not col_map:
+        return
+    metric_fields = ["view", "like", "share", "comment", "save"]
+    requests = []
+    missing_set = set(missing_fields or [])
+    for field in metric_fields:
+        col_idx = col_map.get(field)
+        if not col_idx:
+            continue
+        background = (
+            {"red": 0.97, "green": 0.82, "blue": 0.82}
+            if field in missing_set
+            else {"red": 1.0, "green": 1.0, "blue": 1.0}
+        )
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": sheet.id,
+                        "startRowIndex": row_idx - 1,
+                        "endRowIndex": row_idx,
+                        "startColumnIndex": col_idx - 1,
+                        "endColumnIndex": col_idx,
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": background}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            }
+        )
+    if requests:
+        sheet.spreadsheet.batch_update({"requests": requests})
 
 
 # --- Xá»­ lÃ½ YouTube ---
@@ -3602,14 +3886,24 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                                         close_selenium_driver(social_driver)
                                         social_driver = None
                                         stats = None
+                if stats and "v" not in stats and is_optional_view_metric(url, platform):
+                    stats = dict(stats)
+                    stats["v"] = 0
                 if stats and is_running:
                     scan_timestamp = now_local().strftime("%d/%m/%Y %H:%M")
                     row_updates = build_row_updates(col_map, platform, scan_timestamp, stats)
                     set_pending_updates(i, row_updates)
                     write_sheet_row_updates(sheet, i, row_updates)
+                    missing_fields = get_missing_metric_fields(col_map, stats)
+                    update_metric_highlights(sheet, i, col_map, missing_fields)
+                    if missing_fields:
+                        add_log(
+                            f"Dòng {i}: Thiếu {', '.join(field.upper() for field in missing_fields)} nên đã tô đỏ ô tương ứng"
+                        )
                     add_log(f"Dòng {i}: Cập nhật thành công")
                     success_count += 1
                 elif is_running:
+                    update_metric_highlights(sheet, i, col_map, get_missing_metric_fields(col_map, None))
                     add_log(f"Dòng {i}: Không lấy được số liệu")
                     failed_count += 1
                 time.sleep(max(0.0, ROW_SCAN_DELAY_SECONDS))
@@ -3906,6 +4200,14 @@ def set_sheet(request: Request, sheet_name: str = "", sheet_url: str = ""):
     if auth_response:
         return auth_response
     global is_running
+    if (not is_running) and current_task == "Đã dừng thủ công":
+        if is_fetch_request(request):
+            return build_ui_json_response(
+                "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập sheet.",
+                level="warning",
+                ok=False,
+            )
+        return HTMLResponse("<html><script>window.location.href='/?sheet_error=2';</script></html>")
     requested_sheet = sheet_name.strip()
     if is_running:
         add_log("Không thể nhập sheet khi hệ thống đang chạy")
@@ -3954,7 +4256,7 @@ async def set_schedule_targets(request: Request):
     current_user, auth_response = require_authenticated_user(request)
     if auth_response:
         return auth_response
-    global schedule_targets
+    global schedule_targets, schedule_sheet_id, schedule_sheet_name, schedule_sheet_gid
     try:
         payload = await request.json()
     except Exception:
@@ -3962,10 +4264,21 @@ async def set_schedule_targets(request: Request):
 
     raw_targets = payload.get("targets", []) if isinstance(payload, dict) else []
     fallback_sheet_id = payload.get("sheet_id") if isinstance(payload, dict) else None
+    fallback_sheet_gid = str(payload.get("sheet_gid") or "0").strip() if isinstance(payload, dict) else "0"
     schedule_targets = normalize_schedule_targets(raw_targets, fallback_sheet_id)
     ensure_scheduler_thread()
 
     if schedule_targets:
+        primary_sheet_id = schedule_targets[0]["sheet_id"]
+        primary_sheet_name = schedule_targets[0]["sheet_name"]
+        schedule_targets = [
+            item
+            for item in schedule_targets
+            if item["sheet_id"] == primary_sheet_id and item["sheet_name"].strip().lower() == primary_sheet_name.strip().lower()
+        ]
+        schedule_sheet_id = primary_sheet_id
+        schedule_sheet_name = primary_sheet_name
+        schedule_sheet_gid = fallback_sheet_gid or schedule_sheet_gid or "0"
         add_log(f"Đã lưu {len(schedule_targets)} bài cho lịch tự động")
         return build_ui_json_response(
             f"Đã áp dụng {len(schedule_targets)} bài cho lịch tự động.",
@@ -3981,7 +4294,7 @@ async def set_schedule_targets(request: Request):
     )
 
 @app.get("/set-schedule")
-def set_schedule(request: Request, mode: str = "off", at: str = "09:00", weekday: int = 0, monthday: int = 1, monthdate: str = "", enddate: str = ""):
+def set_schedule(request: Request, mode: str = "off", at: str = "09:00", weekday: int = 0, monthday: int = 1, monthdate: str = "", enddate: str = "", sheet_binding: str = ""):
     current_user, auth_response = require_authenticated_user(request)
     if auth_response:
         return auth_response
@@ -3993,9 +4306,26 @@ def set_schedule(request: Request, mode: str = "off", at: str = "09:00", weekday
             return build_ui_json_response("Chế độ lịch không hợp lệ.", level="error", ok=False)
         return HTMLResponse("<html><script>window.location.href='/?schedule_error=1';</script></html>")
 
-    if not ACTIVE_SHEET_ID or not ACTIVE_SHEET_NAME:
+    selected_sheet_id, selected_sheet_name = parse_sheet_binding_key(sheet_binding)
+    selected_binding = None
+    if selected_sheet_id and selected_sheet_name:
+        for choice in get_schedule_sheet_choices():
+            if choice["sheet_id"] == selected_sheet_id and choice["sheet_name"].strip().lower() == selected_sheet_name.strip().lower():
+                selected_binding = choice
+                break
+    if not selected_binding:
+        fallback_binding = get_schedule_sheet_binding(use_active_fallback=True)
+        if fallback_binding["sheet_id"] and fallback_binding["sheet_name"]:
+            selected_binding = {
+                "sheet_id": fallback_binding["sheet_id"],
+                "sheet_name": fallback_binding["sheet_name"],
+                "sheet_gid": fallback_binding["sheet_gid"],
+                "is_saved": fallback_binding["is_saved"],
+            }
+
+    if not selected_binding or not selected_binding.get("sheet_id") or not selected_binding.get("sheet_name"):
         if is_fetch_request(request):
-            return build_ui_json_response("Hãy chọn sheet/tab ở phần Cấu hình trước khi lưu lịch tự động.", level="warning", ok=False)
+            return build_ui_json_response("Hãy chọn sheet muốn áp dụng cho lịch trước khi lưu.", level="warning", ok=False)
         return HTMLResponse("<html><script>window.location.href='/?schedule_error=1';</script></html>")
 
     hour, minute = parse_schedule_time(at)
@@ -4023,14 +4353,17 @@ def set_schedule(request: Request, mode: str = "off", at: str = "09:00", weekday
     schedule_weekday = safe_weekday
     schedule_monthday = safe_monthday
     schedule_end_date = safe_end_date
-    schedule_sheet_id = ACTIVE_SHEET_ID
-    schedule_sheet_name = ACTIVE_SHEET_NAME
-    schedule_sheet_gid = ACTIVE_SHEET_GID or "0"
+    schedule_sheet_id = str(selected_binding.get("sheet_id", "") or "").strip()
+    schedule_sheet_name = str(selected_binding.get("sheet_name", "") or "").strip()
+    schedule_sheet_gid = str(selected_binding.get("sheet_gid", "") or "0").strip() or "0"
+    normalized_existing_targets = normalize_schedule_targets(schedule_targets, schedule_sheet_id)
     schedule_targets = [
         item
-        for item in normalize_schedule_targets(schedule_targets, ACTIVE_SHEET_ID)
-        if (item.get("sheet_id") or "") == (ACTIVE_SHEET_ID or "")
+        for item in normalized_existing_targets
+        if item["sheet_id"] == schedule_sheet_id and item["sheet_name"].strip().lower() == schedule_sheet_name.strip().lower()
     ]
+    if normalized_existing_targets and not schedule_targets:
+        add_log("Đã bỏ chọn lọc bài cũ vì bạn vừa đổi sang tab lịch khác.")
     last_schedule_run_key = ""
     ensure_scheduler_thread()
     target_suffix = f" • {len(schedule_targets)} bài đã chọn" if schedule_targets else " • chạy toàn tab"
@@ -4044,17 +4377,25 @@ def set_schedule(request: Request, mode: str = "off", at: str = "09:00", weekday
     return HTMLResponse("<html><script>window.location.href='/?schedule_ok=1';</script></html>")
 
 @app.get("/set-columns")
-def set_columns(request: Request, link: str = "", campaign: str = "", view: str = "", like: str = "", share: str = "", comment: str = "", save: str = "", start_row: Optional[str] = None):
+def set_columns(request: Request, link: str = "", view: str = "", like: str = "", share: str = "", comment: str = "", save: str = "", start_row: Optional[str] = None):
     current_user, auth_response = require_authenticated_user(request)
     if auth_response:
         return auth_response
     global COLUMN_OVERRIDES, START_ROW
+    if (not is_running) and current_task == "Đã dừng thủ công":
+        if is_fetch_request(request):
+            return build_ui_json_response(
+                "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy lưu sheet.",
+                level="warning",
+                ok=False,
+            )
+        return HTMLResponse("<html><script>window.location.href='/?sheet_error=2';</script></html>")
     if is_running:
         if is_fetch_request(request):
             return build_ui_json_response("Đang quét dữ liệu nên chưa lưu cấu hình được.", level="warning", ok=False)
         return HTMLResponse("<html><script>window.location.href='/?sheet_error=2';</script></html>")
 
-    candidates = {"link": link, "campaign": campaign, "view": view, "like": like, "share": share, "comment": comment, "save": save}
+    candidates = {"link": link, "view": view, "like": like, "share": share, "comment": comment, "save": save}
     parsed = {}
     for field, val in candidates.items():
         if (val or "").strip() == "":
@@ -4076,17 +4417,25 @@ def set_columns(request: Request, link: str = "", campaign: str = "", view: str 
         START_ROW = parsed_start_row
 
     COLUMN_OVERRIDES = parsed
+    if not ACTIVE_SHEET_ID or not ACTIVE_SHEET_NAME:
+        if is_fetch_request(request):
+            return build_ui_json_response("Hãy nhập sheet trước khi lưu sheet.", level="warning", ok=False)
+        return HTMLResponse("<html><script>window.location.href='/?sheet_error=3';</script></html>")
+    save_sheet_entry(ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME, ACTIVE_SHEET_GID)
     clear_sheet_runtime_cache(ACTIVE_SHEET_ID, ACTIVE_SHEET_NAME)
     add_log(
-        "Cập nhật cấu hình nhập liệu: "
+        f"Đã lưu sheet vào Bài đăng: {ACTIVE_SHEET_NAME} | "
         + ", ".join([f"{k.upper()}={col_to_a1(v) if v else 'AUTO'}" for k, v in COLUMN_OVERRIDES.items()])
         + f", START_ROW={START_ROW}"
     )
     if is_fetch_request(request):
         return build_ui_json_response(
-            "Đã lưu cấu hình nhập liệu thành công.",
+            "Đã lưu sheet thành công.",
             level="success",
-            extra={"column_config": build_column_config_payload()},
+            extra={
+                "column_config": build_column_config_payload(),
+                "posts_html": build_posts_panel_html(),
+            },
         )
     return HTMLResponse("<html><script>window.location.href='/?col_ok=1';</script></html>")
 
@@ -4286,14 +4635,6 @@ def home(request: Request):
                 </div>
                 <div>
                     <div class="flex items-center justify-between gap-3 mb-2">
-                        <label class="block text-xs text-slate-400 uppercase tracking-wider">Cột Chiến dịch</label>
-                        <span class="text-[11px] text-slate-500 font-black uppercase tracking-[0.18em]" data-column-source="campaign">{metric_input_sources["campaign"]}</span>
-                    </div>
-                    <input name="campaign" form="set-columns-form" data-column-input="campaign" data-detected-value="{metric_detected_inputs['campaign']}" data-manual-value="{metric_manual_inputs['campaign']}" value="{metric_input_values['campaign']}" placeholder="VD: C hoặc 3" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
-                    <p class="mt-1 text-[11px] text-slate-500">Chỉ đọc để phân loại trên web, không ghi vào sheet khi quét.</p>
-                </div>
-                <div>
-                    <div class="flex items-center justify-between gap-3 mb-2">
                         <label class="block text-xs text-slate-400 uppercase tracking-wider">Cột View</label>
                         <span class="text-[11px] text-slate-500 font-black uppercase tracking-[0.18em]" data-column-source="view">{metric_input_sources["view"]}</span>
                     </div>
@@ -4335,8 +4676,14 @@ def home(request: Request):
                     <input name="start_row" form="set-columns-form" value="{START_ROW}" inputmode="numeric" placeholder="VD: 2" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
                 </div>
             </div>
+            <div class="text-xs text-emerald-200/85 bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2 mb-3" data-column-detected-text>
+                {html.escape(column_config["detected_text"])}
+            </div>
+            <div class="text-xs text-cyan-200/80 bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2 mb-3">
+                Các ô đã tự hiện cột đang nhận. Bạn sửa trực tiếp ngay trong đó nếu cần. Xóa trống ô nào thì ô đó quay về AUTO theo header của sheet. Dòng bắt đầu nhận số từ 2 trở lên.
+            </div>
             <form id="set-columns-form" action="/set-columns" method="get" class="mb-4">
-                <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu cấu hình nhập liệu</button>
+                <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu Sheet</button>
             </form>
             <div class="bg-slate-900/55 rounded-2xl p-4 border border-white/10">
                 <div class="flex justify-between items-center mb-2 text-xs font-bold text-slate-500 uppercase">
@@ -4928,15 +5275,35 @@ def home(request: Request):
                 word-break: break-all;
             }}
             .posts-sheet-summary-grid {{
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }}
+            .posts-master-view {{
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-                gap: 14px;
+                gap: 16px;
+            }}
+            .posts-master-view.hidden {{
+                display: none;
+            }}
+            .posts-detail-view {{
+                display: grid;
+                gap: 16px;
+            }}
+            .posts-detail-view.hidden {{
+                display: none;
+            }}
+            .posts-detail-topbar {{
+                display: flex;
+                align-items: center;
+                justify-content: flex-start;
             }}
             .posts-sheet-card {{
                 width: 100%;
+                max-width: none;
                 text-align: left;
-                padding: 18px;
-                border-radius: 20px;
+                padding: 14px 16px;
+                border-radius: 18px;
                 background: linear-gradient(180deg, rgba(23, 31, 48, 0.9), rgba(28, 37, 58, 0.88));
                 border: 1px solid rgba(148, 163, 184, 0.12);
                 box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
@@ -4952,11 +5319,17 @@ def home(request: Request):
                 background: linear-gradient(180deg, rgba(51, 65, 85, 0.88), rgba(30, 41, 59, 0.9));
                 box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.12), 0 16px 32px rgba(15, 23, 42, 0.18);
             }}
-            .posts-sheet-card-head {{
+            .posts-sheet-card-row {{
                 display: flex;
-                align-items: flex-start;
+                align-items: center;
                 justify-content: space-between;
                 gap: 14px;
+                flex-wrap: wrap;
+            }}
+            .posts-sheet-card-main {{
+                min-width: 0;
+                display: grid;
+                gap: 6px;
             }}
             .posts-sheet-card-kicker {{
                 font-size: 11px;
@@ -4965,58 +5338,78 @@ def home(request: Request):
                 text-transform: uppercase;
                 color: #64748b;
             }}
+            .posts-sheet-card-title-line {{
+                display: flex;
+                align-items: baseline;
+                gap: 12px;
+                flex-wrap: wrap;
+            }}
             .posts-sheet-card-title {{
-                margin-top: 8px;
-                font-size: 18px;
+                margin-top: 0;
+                font-size: 16px;
                 font-weight: 900;
                 color: #f8fafc;
+                line-height: 1.3;
             }}
             .posts-sheet-card-meta {{
-                margin-top: 6px;
+                font-size: 12px;
+                color: #94a3b8;
+                margin-top: 0;
+            }}
+            .posts-sheet-card-submeta {{
                 font-size: 12px;
                 color: #94a3b8;
             }}
-            .posts-sheet-card-badge {{
+            .posts-sheet-card-inline {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex-wrap: wrap;
+                justify-content: flex-end;
+            }}
+            .posts-sheet-mini-chip {{
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
                 padding: 8px 11px;
                 border-radius: 999px;
-                background: rgba(148, 163, 184, 0.12);
+                background: rgba(30, 41, 59, 0.72);
                 color: #e2e8f0;
                 font-size: 12px;
                 font-weight: 900;
                 white-space: nowrap;
             }}
-            .posts-sheet-card-stats {{
-                display: grid;
-                grid-template-columns: repeat(3, minmax(0, 1fr));
-                gap: 10px;
-                margin-top: 16px;
-            }}
-            .posts-sheet-card-stat {{
-                padding: 10px 12px;
-                border-radius: 14px;
-                background: rgba(30, 41, 59, 0.56);
-                border: 1px solid rgba(148, 163, 184, 0.08);
-            }}
-            .posts-sheet-card-stat span {{
-                display: block;
-                font-size: 11px;
-                color: #94a3b8;
-                letter-spacing: 0.08em;
-                text-transform: uppercase;
-                font-weight: 800;
-            }}
-            .posts-sheet-card-stat strong {{
-                display: block;
-                margin-top: 8px;
-                font-size: 15px;
+            .posts-sheet-mini-chip strong {{
                 color: #f8fafc;
                 font-weight: 900;
             }}
-            .posts-sheet-card-error {{
+            .posts-sheet-mini-chip-count {{
+                background: rgba(96, 165, 250, 0.16);
+                color: #dbeafe;
+            }}
+            .posts-sheet-card > .posts-sheet-card-error {{
                 margin-top: 12px;
+            }}
+            .posts-sheet-card-error {{
+                display: flex;
+                align-items: flex-start;
+                gap: 8px;
+                margin-top: 12px;
+                padding: 10px 12px;
+                border-radius: 12px;
+                background: rgba(127, 29, 29, 0.14);
+                border: 1px solid rgba(248, 113, 113, 0.18);
                 font-size: 12px;
                 color: #fca5a5;
                 line-height: 1.5;
+            }}
+            @media (max-width: 960px) {{
+                .posts-sheet-card-row {{
+                    align-items: flex-start;
+                }}
+                .posts-sheet-card-inline {{
+                    justify-content: flex-start;
+                }}
             }}
             .posts-tab-panels {{
                 display: grid;
@@ -6325,10 +6718,13 @@ def home(request: Request):
                 const sheetNameInput = document.getElementById("sheet-name-input");
                 const setSheetForm = document.querySelector("form[action='/set-sheet']");
                 const setColumnsForm = document.getElementById("set-columns-form");
+                const setSheetSubmitBtn = setSheetForm?.querySelector("button[type='submit']");
+                const setColumnsSubmitBtn = setColumnsForm?.querySelector("button[type='submit']");
                 const sheetTabsState = document.getElementById("sheet-tabs-state");
                 const sheetTabsList = document.getElementById("sheet-tabs-list");
                 const sheetNameOptions = document.getElementById("sheet-name-options");
                 const scheduleForm = document.querySelector("form[action='/set-schedule']");
+                const scheduleSheetSelect = document.getElementById("schedule-sheet-select");
                 const scheduleModeSelect = document.getElementById("schedule-mode-select");
                 const weekdaySelect = document.getElementById("schedule-weekday-select");
                 const monthDateInput = document.getElementById("schedule-monthdate-input");
@@ -6394,13 +6790,13 @@ def home(request: Request):
                 const configModeEls = Array.from(document.querySelectorAll("[data-config-mode]"));
                 const columnDetectedTextEls = Array.from(document.querySelectorAll("[data-column-detected-text]"));
                 const columnInputEls = Object.fromEntries(
-                    ["link", "campaign", "view", "like", "share", "comment", "save"].map((field) => [
+                    ["link", "view", "like", "share", "comment", "save"].map((field) => [
                         field,
                         document.querySelector(`[data-column-input="${{field}}"]`),
                     ])
                 );
                 const columnSourceEls = Object.fromEntries(
-                    ["link", "campaign", "view", "like", "share", "comment", "save"].map((field) => [
+                    ["link", "view", "like", "share", "comment", "save"].map((field) => [
                         field,
                         document.querySelector(`[data-column-source="${{field}}"]`),
                     ])
@@ -6418,6 +6814,7 @@ def home(request: Request):
                 let clearScheduleTargetsBtn = document.getElementById("clear-schedule-targets-btn");
                 let savedScheduleTargets = {json.dumps(schedule_config["targets"], ensure_ascii=False)};
                 let scheduleSelectionDirty = false;
+                let configLocked = false;
 
                 const applyTheme = (theme) => {{
                     const normalizedTheme = theme === "light" ? "light" : "dark";
@@ -6654,45 +7051,79 @@ def home(request: Request):
                     fetchSheetTabs(sheetUrlInput.value, true);
                 }}
 
+                const applyConfigLockState = (locked, message = "") => {{
+                    configLocked = Boolean(locked);
+                    [setSheetSubmitBtn, setColumnsSubmitBtn].forEach((btn) => {{
+                        if (!btn) return;
+                        btn.disabled = configLocked;
+                        btn.classList.toggle("opacity-50", configLocked);
+                        btn.classList.toggle("cursor-not-allowed", configLocked);
+                        if (configLocked && message) {{
+                            btn.setAttribute("title", message);
+                        }} else {{
+                            btn.removeAttribute("title");
+                        }}
+                    }});
+                }};
+
+                const submitSheetFormInline = async () => {{
+                    if (!setSheetForm) return null;
+                    if (configLocked) {{
+                        const message = "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập sheet.";
+                        showNotice(message, "warning");
+                        return {{ ok: false, message }};
+                    }}
+                    const params = new URLSearchParams(new FormData(setSheetForm));
+                    try {{
+                        const response = await fetch(`/set-sheet?${{params.toString()}}`, {{
+                            headers: {{ "X-Requested-With": "fetch" }},
+                            cache: "no-store",
+                        }});
+                        const data = await response.json();
+                        if (data.ok) {{
+                            sessionStorage.removeItem("draft_sheet_url");
+                            sessionStorage.removeItem("draft_sheet_name");
+                            applyActiveSheetMeta(data, true);
+                            applyColumnConfigState(data);
+                            applyScheduleConfigState(data);
+                            applyScheduleTrackingState(data);
+                            if (typeof data.posts_html === "string") {{
+                                replacePostsPanelHtml(data.posts_html);
+                            }}
+                            if (sheetUrlInput?.value) {{
+                                fetchSheetTabs(sheetUrlInput.value, true);
+                            }}
+                        }}
+                        applyStatusState(data);
+                        showNotice(
+                            data.message || (data.ok ? "Đã nhập sheet thành công." : "Không nhập được sheet."),
+                            data.level || (data.ok ? "success" : "error")
+                        );
+                        return data;
+                    }} catch (_) {{
+                        showNotice("Không nhập được sheet. Vui lòng thử lại.", "error");
+                        return null;
+                    }}
+                }};
+
                 if (setSheetForm) {{
                     setSheetForm.addEventListener("submit", async (event) => {{
                         event.preventDefault();
-                        const params = new URLSearchParams(new FormData(setSheetForm));
-                        try {{
-                            const response = await fetch(`/set-sheet?${{params.toString()}}`, {{
-                                headers: {{ "X-Requested-With": "fetch" }},
-                                cache: "no-store",
-                            }});
-                            const data = await response.json();
-                            if (data.ok) {{
-                                sessionStorage.removeItem("draft_sheet_url");
-                                sessionStorage.removeItem("draft_sheet_name");
-                                applyActiveSheetMeta(data, true);
-                                applyColumnConfigState(data);
-                                applyScheduleConfigState(data);
-                                applyScheduleTrackingState(data);
-                                if (typeof data.posts_html === "string") {{
-                                    replacePostsPanelHtml(data.posts_html);
-                                    setActivePanel("bai-dang");
-                                }}
-                                if (sheetUrlInput?.value) {{
-                                    fetchSheetTabs(sheetUrlInput.value, true);
-                                }}
-                            }}
-                            applyStatusState(data);
-                            showNotice(
-                                data.message || (data.ok ? "Đã nhập sheet thành công." : "Không nhập được sheet."),
-                                data.level || (data.ok ? "success" : "error")
-                            );
-                        }} catch (_) {{
-                            showNotice("Không nhập được sheet. Vui lòng thử lại.", "error");
-                        }}
+                        await submitSheetFormInline();
                     }});
                 }}
 
                 if (setColumnsForm) {{
                     setColumnsForm.addEventListener("submit", async (event) => {{
                         event.preventDefault();
+                        if (configLocked) {{
+                            showNotice("Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy lưu sheet.", "warning");
+                            return;
+                        }}
+                        const sheetData = await submitSheetFormInline();
+                        if (!sheetData || !sheetData.ok) {{
+                            return;
+                        }}
                         const params = new URLSearchParams();
                         document.querySelectorAll("[form='set-columns-form'][name]").forEach((field) => {{
                             const rawValue = (field.value || "").trim();
@@ -6722,13 +7153,16 @@ def home(request: Request):
                             applyScheduleTrackingState(data);
                             if (data.ok) {{
                                 applyColumnConfigState(data);
+                                if (typeof data.posts_html === "string") {{
+                                    replacePostsPanelHtml(data.posts_html);
+                                }}
                             }}
                             showNotice(
-                                data.message || (data.ok ? "Đã lưu cấu hình nhập liệu thành công." : "Không lưu được cấu hình nhập liệu."),
+                                data.message || (data.ok ? "Đã lưu sheet thành công." : "Không lưu được sheet."),
                                 data.level || (data.ok ? "success" : "error")
                             );
                         }} catch (_) {{
-                            showNotice("Không lưu được cấu hình nhập liệu. Vui lòng thử lại.", "error");
+                            showNotice("Không lưu được sheet. Vui lòng thử lại.", "error");
                         }}
                     }});
                 }}
@@ -7001,6 +7435,10 @@ def home(request: Request):
                 let postsDetailPlaceholder = document.getElementById("posts-detail-placeholder");
                 let postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
                 let postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
+                let postsSelectionPlaceholder = document.getElementById("posts-selection-placeholder");
+                let postsMasterView = document.getElementById("posts-master-view");
+                let postsDetailView = document.getElementById("posts-detail-view");
+                let postsBackButton = document.getElementById("posts-back-button");
                 const sidebarLinks = Array.from(document.querySelectorAll("[data-nav-link]"));
                 const dashboardSections = Array.from(document.querySelectorAll("[data-dashboard-section]"));
                 let refreshInFlight = false;
@@ -7015,6 +7453,10 @@ def home(request: Request):
                     postsScheduleCount = document.getElementById("schedule-selected-count");
                     saveScheduleTargetsBtn = document.getElementById("save-schedule-targets-btn");
                     clearScheduleTargetsBtn = document.getElementById("clear-schedule-targets-btn");
+                    postsSelectionPlaceholder = document.getElementById("posts-selection-placeholder");
+                    postsMasterView = document.getElementById("posts-master-view");
+                    postsDetailView = document.getElementById("posts-detail-view");
+                    postsBackButton = document.getElementById("posts-back-button");
                 }};
 
                 const normalizeScheduleKeyPart = (value) => String(value || "")
@@ -7403,6 +7845,12 @@ def home(request: Request):
                     scheduleLabelEls.forEach((el) => {{
                         el.textContent = label;
                     }});
+                    if (scheduleSheetSelect && typeof scheduleConfig.sheet_options_html === "string" && scheduleConfig.sheet_options_html.trim()) {{
+                        scheduleSheetSelect.innerHTML = scheduleConfig.sheet_options_html;
+                    }}
+                    if (scheduleSheetSelect && typeof scheduleConfig.sheet_binding_key === "string") {{
+                        scheduleSheetSelect.value = scheduleConfig.sheet_binding_key;
+                    }}
                     if (scheduleBoundSheetName) {{
                         scheduleBoundSheetName.textContent = scheduleConfig.sheet_name_text || "Chưa chốt tab nào";
                     }}
@@ -7412,13 +7860,16 @@ def home(request: Request):
                     if (scheduleBoundScope) {{
                         scheduleBoundScope.textContent = scheduleConfig.scope_text || "";
                     }}
+                    if (scheduleTargetSummary) {{
+                        scheduleTargetSummary.textContent =
+                            scheduleConfig.targets_summary_text
+                            || scheduleConfig.target_summary_text
+                            || "Chưa chọn bài nào. Lịch sẽ chạy toàn bộ tab đã lưu.";
+                    }}
                     if (scheduleBoundLink) {{
                         const hasLink = Boolean(scheduleConfig.snapshot_url);
                         scheduleBoundLink.classList.toggle("hidden", !hasLink);
                         scheduleBoundLink.href = hasLink ? scheduleConfig.snapshot_url : "#";
-                    }}
-                    if (scheduleTargetSummary) {{
-                        scheduleTargetSummary.textContent = scheduleConfig.targets_summary_text || "Chưa chọn bài nào. Lịch sẽ chạy toàn bộ tab đã lưu.";
                     }}
                     if (scheduleTargetList && typeof scheduleConfig.targets_html === "string") {{
                         scheduleTargetList.innerHTML = scheduleConfig.targets_html;
@@ -7491,7 +7942,12 @@ def home(request: Request):
                     if (primaryAction && typeof data.primary_action_html === "string") {{
                         primaryAction.innerHTML = data.primary_action_html;
                     }}
+                    applyConfigLockState(Boolean(data.config_locked), data.config_lock_message || "");
                 }};
+                applyConfigLockState(
+                    (statusBadge?.textContent || "").trim() === "Đã dừng" && (currentTaskLabel?.textContent || "").trim() === "Đã dừng thủ công",
+                    "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập hoặc lưu sheet."
+                );
 
                 const refreshDashboard = async () => {{
                     if (document.hidden || refreshInFlight) return;
@@ -7522,11 +7978,17 @@ def home(request: Request):
                 const updatePanelSelectAllState = (panel) => {{
                     if (!panel) return;
                     const selectAll = panel.querySelector("[data-select-all-posts]");
+                    const selectionCountEl = panel.querySelector("[data-posts-selection-count]");
+                    const allRowChecks = Array.from(panel.querySelectorAll("[data-post-select]"));
+                    const checkedCount = allRowChecks.filter((item) => item.checked).length;
+                    if (selectionCountEl) {{
+                        selectionCountEl.textContent = `${{checkedCount}} bài đã chọn`;
+                    }}
                     if (!selectAll) return;
                     const rowChecks = getVisibleRowChecks(panel);
-                    const checkedCount = rowChecks.filter((item) => item.checked).length;
-                    selectAll.checked = rowChecks.length > 0 && checkedCount === rowChecks.length;
-                    selectAll.indeterminate = checkedCount > 0 && checkedCount < rowChecks.length;
+                    const visibleCheckedCount = rowChecks.filter((item) => item.checked).length;
+                    selectAll.checked = rowChecks.length > 0 && visibleCheckedCount === rowChecks.length;
+                    selectAll.indeterminate = visibleCheckedCount > 0 && visibleCheckedCount < rowChecks.length;
                 }};
 
                 const syncPostsSelectionState = () => {{
@@ -7561,10 +8023,59 @@ def home(request: Request):
 
                 const getActivePostsPanel = () => postsTabPanels.find((panel) => panel.classList.contains("is-active")) || null;
 
+                const collectScheduleTargetsFromPanel = (panel) => {{
+                    if (!panel) return [];
+                    return Array.from(panel.querySelectorAll("[data-post-select]:checked"))
+                        .map((checkbox) => ({{
+                            sheet_id: checkbox.dataset.sheetId || "",
+                            sheet_gid: checkbox.dataset.sheetGid || "0",
+                            sheet_name: checkbox.dataset.sheetName || "",
+                            row_idx: checkbox.dataset.rowIdx || "",
+                            link: checkbox.dataset.link || "",
+                            title: checkbox.dataset.title || "",
+                            platform: checkbox.dataset.platformName || "",
+                            campaign: checkbox.dataset.campaignName || "",
+                        }}))
+                        .filter((item) => item.sheet_id && item.sheet_name && item.row_idx);
+                }};
+
+                const submitScheduleTargets = async (targets = [], panel = null) => {{
+                    const fallbackCheckbox = (panel || getActivePostsPanel())?.querySelector("[data-post-select]");
+                    const fallbackSheetId = fallbackCheckbox?.dataset.sheetId || "";
+                    const fallbackSheetGid = fallbackCheckbox?.dataset.sheetGid || "0";
+                    try {{
+                        const response = await fetch("/set-schedule-targets", {{
+                            method: "POST",
+                            headers: {{
+                                "Content-Type": "application/json",
+                                "X-Requested-With": "fetch",
+                            }},
+                            body: JSON.stringify({{
+                                targets,
+                                sheet_id: fallbackSheetId,
+                                sheet_gid: fallbackSheetGid,
+                            }}),
+                        }});
+                        const data = await response.json();
+                        applyScheduleConfigState(data);
+                        showNotice(
+                            data.message || (data.ok ? "Đã cập nhật danh sách bài cho lịch." : "Không cập nhật được danh sách bài cho lịch."),
+                            data.level || (data.ok ? "success" : "error")
+                        );
+                        return data;
+                    }} catch (_) {{
+                        showNotice("Không cập nhật được danh sách bài cho lịch. Vui lòng thử lại.", "error");
+                        return null;
+                    }}
+                }};
+
                 const applyPostFilters = (panel = getActivePostsPanel()) => {{
                     if (!panel) {{
                         if (postsVisibleCount) {{
                             postsVisibleCount.textContent = "0 bài";
+                        }}
+                        if (postsActiveTabLabel) {{
+                            postsActiveTabLabel.textContent = "Chưa chọn";
                         }}
                         return;
                     }}
@@ -7604,16 +8115,25 @@ def home(request: Request):
                     const safeSlug = postsTabCards.some((card) => card.dataset.postsTabTrigger === requestedSlug)
                         ? requestedSlug
                         : "";
+                    if (postsMasterView) {{
+                        postsMasterView.classList.toggle("hidden", !!safeSlug);
+                    }}
+                    if (postsDetailView) {{
+                        postsDetailView.classList.toggle("hidden", !safeSlug);
+                    }}
                     postsTabCards.forEach((card) => {{
-                        card.classList.toggle("is-active", card.dataset.postsTabTrigger === safeSlug);
+                        card.classList.toggle("is-active", !!safeSlug && card.dataset.postsTabTrigger === safeSlug);
                     }});
                     postsTabPanels.forEach((panel) => {{
-                        panel.classList.toggle("is-active", panel.dataset.postsTabPanel === safeSlug);
+                        panel.classList.toggle("is-active", !!safeSlug && panel.dataset.postsTabPanel === safeSlug);
                     }});
                     if (postsDetailPlaceholder) {{
                         postsDetailPlaceholder.classList.toggle("hidden", Boolean(safeSlug));
                     }}
-                    applyPostFilters(getActivePostsPanel());
+                    if (postsSelectionPlaceholder) {{
+                        postsSelectionPlaceholder.classList.toggle("hidden", !!safeSlug);
+                    }}
+                    applyPostFilters(safeSlug ? getActivePostsPanel() : null);
                 }};
 
                 const initializePostsPanel = () => {{
@@ -7623,9 +8143,17 @@ def home(request: Request):
                         }});
                     }});
 
+                    if (postsBackButton) {{
+                        postsBackButton.addEventListener("click", () => {{
+                            setActivePostsTab("");
+                        }});
+                    }}
+
                     postsTabPanels.forEach((panel) => {{
                         const searchField = panel.querySelector(".posts-search-field");
                         const resetButton = panel.querySelector(".posts-reset-btn");
+                        const useForScheduleButton = panel.querySelector("[data-use-posts-for-schedule]");
+                        const clearScheduleButton = panel.querySelector("[data-clear-posts-schedule]");
                         const chips = Array.from(panel.querySelectorAll(".posts-chip"));
                         const selectAll = panel.querySelector("[data-select-all-posts]");
                         const rowChecks = Array.from(panel.querySelectorAll("[data-post-select]"));
@@ -7650,6 +8178,23 @@ def home(request: Request):
                                 }}
                                 chips.forEach((chip) => chip.classList.toggle("is-active", (chip.dataset.platform || "all") === "all"));
                                 applyPostFilters(panel);
+                            }});
+                        }}
+
+                        if (useForScheduleButton) {{
+                            useForScheduleButton.addEventListener("click", async () => {{
+                                const targets = collectScheduleTargetsFromPanel(panel);
+                                if (!targets.length) {{
+                                    showNotice("Hãy tick ít nhất 1 bài trong sheet này trước khi áp dụng cho lịch.", "warning");
+                                    return;
+                                }}
+                                await submitScheduleTargets(targets, panel);
+                            }});
+                        }}
+
+                        if (clearScheduleButton) {{
+                            clearScheduleButton.addEventListener("click", async () => {{
+                                await submitScheduleTargets([], panel);
                             }});
                         }}
 
@@ -7695,7 +8240,8 @@ def home(request: Request):
                     }}
 
                     if (postsTabCards.length) {{
-                        setActivePostsTab("");
+                        const initialPostsTab = postsTabCards.find((card) => card.classList.contains("is-active"))?.dataset.postsTabTrigger || "";
+                        setActivePostsTab(initialPostsTab);
                     }} else {{
                         if (postsVisibleCount) postsVisibleCount.textContent = "0 bài";
                         if (postsActiveTabLabel) postsActiveTabLabel.textContent = "Chưa chọn";
@@ -7784,7 +8330,7 @@ def home(request: Request):
                     <a href="#bai-dang" class="sidebar-link" data-nav-link="bai-dang"><span class="sidebar-link-icon"><i class="fa-regular fa-newspaper"></i></span><span>Bài đăng</span></a>
                     {employee_sidebar_link}
                     <a href="#lich-tu-dong" class="sidebar-link" data-nav-link="lich-tu-dong"><span class="sidebar-link-icon"><i class="fa-regular fa-calendar-days"></i></span><span>Lịch tự động</span></a>
-                    <a href="#theo-doi-lan-chay" class="sidebar-link" data-nav-link="theo-doi-lan-chay"><span class="sidebar-link-icon"><i class="fa-solid fa-clock-rotate-left"></i></span><span>Theo dõi lần chạy</span></a>
+                    <a href="#theo-doi-lan-chay" class="sidebar-link" data-nav-link="theo-doi-lan-chay"><span class="sidebar-link-icon"><i class="fa-solid fa-wave-square"></i></span><span>Theo dõi lần chạy</span></a>
                 </nav>
             </aside>
 
@@ -7828,6 +8374,13 @@ def home(request: Request):
                                 <span>Lịch tự động</span><span class="text-cyan-300 font-black text-lg" data-schedule-label>{schedule_text}</span>
                             </div>
                             <form action="/set-schedule" method="get" class="flex flex-col gap-3">
+                                <div>
+                                    <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Sheet áp dụng cho lịch</label>
+                                    <select id="schedule-sheet-select" name="sheet_binding" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400">
+                                        {schedule_config["sheet_options_html"]}
+                                    </select>
+                                    <p class="mt-1 text-[11px] text-slate-500">Chọn sheet đã lưu mà bạn muốn lịch tự chạy.</p>
+                                </div>
                                 <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                                     <div>
                                         <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Chế độ chạy</label>
