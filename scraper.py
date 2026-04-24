@@ -59,6 +59,7 @@ ACTIVE_SHEET_ID = DEFAULT_SHEET_ID
 DEFAULT_SHEET_NAME = os.getenv("DEFAULT_SHEET_NAME", "").strip()
 ACTIVE_SHEET_NAME = DEFAULT_SHEET_NAME
 ACTIVE_SHEET_GID = "0"
+ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE = os.getenv("ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE", "false").strip().lower() in {"1", "true", "yes", "on"}
 def save_sheet_tabs_cache(cache_data):
     try:
         with open(SHEET_TABS_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -5923,8 +5924,9 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                             logger(f"[{tab_name}] Dòng {i}: Cập nhật thành công")
                             shared["success"] += 1
                     elif runtime_state["is_running"]:
-                        red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
-                        update_metric_highlights(ws, i, col_map, red_fields)
+                        if ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE:
+                            red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
+                            update_metric_highlights(ws, i, col_map, red_fields)
                         locked_log(f"[{tab_name}] Dòng {i}: Không lấy được số liệu")
                         with state_lock:
                             shared["failed"] += 1
