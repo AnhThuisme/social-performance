@@ -1,9 +1,12 @@
 {
-  "redirects": [
+  "version": 2,
+  "routes": [
     {
-      "source": "/:path*",
-      "destination": "https://social-performance.onrender.com/:path*",
-      "permanent": false
+      "src": "/(.*)",
+      "status": 307,
+      "headers": {
+        "Location": "https://social-performance.onrender.com/$1"
+      }
     }
   ]
 }
