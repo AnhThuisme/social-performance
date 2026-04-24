@@ -16,6 +16,7 @@ import unicodedata
 import requests
 import pandas as pd
 import urllib.parse
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from typing import Optional
@@ -27,7 +28,14 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_scheduler_thread()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 DASHBOARD_SECTION_IDS = {
     "tong-quan",
@@ -51,10 +59,64 @@ ACTIVE_SHEET_ID = DEFAULT_SHEET_ID
 DEFAULT_SHEET_NAME = os.getenv("DEFAULT_SHEET_NAME", "").strip()
 ACTIVE_SHEET_NAME = DEFAULT_SHEET_NAME
 ACTIVE_SHEET_GID = "0"
-SHEET_TABS_CACHE = {}
-SHEET_TABS_CACHE_TTL_SECONDS = 60
+def save_sheet_tabs_cache(cache_data):
+    try:
+        with open(SHEET_TABS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_sheet_tabs_cache():
+    if os.path.exists(SHEET_TABS_CACHE_FILE):
+        try:
+            with open(SHEET_TABS_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_sheet_data_cache(cache_data):
+    try:
+        with open(SHEET_DATA_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_sheet_data_cache():
+    if os.path.exists(SHEET_DATA_CACHE_FILE):
+        try:
+            with open(SHEET_DATA_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_dashboard_cache(cache_data):
+    try:
+        with open(DASHBOARD_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_dashboard_cache():
+    if os.path.exists(DASHBOARD_CACHE_FILE):
+        try:
+            with open(DASHBOARD_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+SHEET_TABS_CACHE_FILE = "sheet_tabs_cache.json"
+SHEET_TABS_CACHE = load_sheet_tabs_cache()
+SHEET_TABS_CACHE_TTL_SECONDS = 600  # Increased to 10 minutes
+SHEET_DATA_CACHE_FILE = "sheet_data_cache.json"
+SHEET_DATA_CACHE = load_sheet_data_cache()  # Persistence for sheet.get_all_values()
+SHEET_DATA_CACHE_TTL_SECONDS = 300  # 5 minutes
+SHEET_LAYOUT_CACHE = {}  # {sheet_id:sheet_name -> {"updated_at": iso, "layout": {...}}}
+SHEET_LAYOUT_CACHE_TTL_SECONDS = 300
 DASHBOARD_CACHE_FILE = "dashboard_cache.json"
-DASHBOARD_CACHE = {}  # Memory cache mirrored by file
+DASHBOARD_CACHE = load_dashboard_cache()  # Memory cache mirrored by file
 DASHBOARD_CACHE_TTL_SECONDS = 300
 SHEET_TABS_REQUEST_LIMITER = {}  # {sheet_id: last_request_time}
 SHEET_TABS_MIN_INTERVAL_SECONDS = 5  # Minimum interval between requests for same sheet
@@ -85,7 +147,7 @@ is_finished = False
 current_task = "Đang chờ lệnh"
 logs = []
 pending_updates = []
-COLUMN_OVERRIDES = {"date": None, "air_date": None, "link": None, "view": None, "like": None, "share": None, "comment": None, "save": None}
+COLUMN_OVERRIDES = {"date": None, "air_date": None, "link": None, "view": None, "like": None, "share": None, "comment": None, "buzz": None, "save": None}
 COLUMN_CONFIG_APPROVAL = {
     "approved": False,
     "sheet_id": "",
@@ -96,19 +158,40 @@ DASHBOARD_DATE_KEYS = ("date", "time", "timestamp", "ngay", "ngayquet", "thoigia
 HEADER_ALIASES = {
     "date": {
         "date", "time", "timestamp", "ngay", "ngayquet", "thoigian", "thoigianquet",
-        "scanat", "scandate", "updatedat", "lastupdated", "lastscan"
+        "scanat", "scandate", "updatedat", "lastupdated", "lastscan",
+        "publishdate", "createdat", "ngaydangtai", "ngaytao"
     },
-    "air_date": {"air", "aired", "airdate", "aireddate", "ngayair", "ngaydang", "ngayairbai", "ngaydangbai"},
-    "link": {"link", "url", "posturl", "postlink", "linkpost", "videolink", "contentlink"},
+    "air_date": {
+        "air", "aired", "airdate", "aireddate", "ngayair", "ngaydang", "ngayairbai", "ngaydangbai",
+        "postingdate", "publish", "publishedat", "ngaydangbai"
+    },
+    "link": {
+        "link", "url", "posturl", "postlink", "linkpost", "videolink", "contentlink",
+        "urlpost", "linkbaidang", "duonglink", "urlvideo"
+    },
     "campaign": {
         "campaign", "chiendich", "camp", "tenchiendich", "campaignname",
         "tencampaign", "project", "bookingitem"
     },
-    "view": {"view", "views", "viewcount", "luotxem", "luotview"},
-    "like": {"like", "likes", "reaction", "reactions", "react", "reacts"},
-    "share": {"share", "shares", "sharecount"},
-    "comment": {"comment", "comments", "commentcount", "cmt", "reply", "replies"},
-    "save": {"save", "saves", "saved", "bookmark", "bookmarks", "luu", "collect", "collectcount"},
+    "view": {
+        "view", "views", "viewcount", "luotxem", "luotview", "xem",
+        "play", "plays", "reach", "impression", "impressions"
+    },
+    "like": {
+        "like", "likes", "reaction", "reactions", "react", "reacts",
+        "thich", "tim", "thatim", "tym", "love", "likecount"
+    },
+    "share": {"share", "shares", "sharecount", "chiase", "luotchiase"},
+    "comment": {"comment", "comments", "commentcount", "cmt", "reply", "replies", "binhluan", "luotbinhluan"},
+    "buzz": {
+        "buzz", "buzzcount", "totalbuzz", "tongbuzz", "commentshare", "sharecomment",
+        "commentshares", "sharecomments", "binhluanchiase", "chiasebinhluan",
+        "binhluanvachiase", "chiasevabinhluan"
+    },
+    "save": {
+        "save", "saves", "saved", "bookmark", "bookmarks", "luu", "collect", "collectcount",
+        "favorite", "favourite", "luotluu"
+    },
     "platform": {"platform", "nentang"},
     "caption": {"caption", "title", "mota", "noidung"},
     "plan": {"plan", "nam", "period", "fiscalyear"},
@@ -200,6 +283,8 @@ def build_default_runtime_state(owner_email: str = ""):
         "run_progress_total": 0,
         "run_progress_phase": "idle",
         "tab_progress": {},
+        "selected_tabs": [],
+        "tab_config_active_key": "",
         "_schedule_hydrated": False,
     }
 
@@ -535,22 +620,6 @@ def persist_auth_settings(settings):
     save_auth_settings(AUTH_SETTINGS)
     return AUTH_SETTINGS
 
-def save_dashboard_cache(cache_data):
-    try:
-        with open(DASHBOARD_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache_data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-def load_dashboard_cache():
-    if os.path.exists(DASHBOARD_CACHE_FILE):
-        try:
-            with open(DASHBOARD_CACHE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
 def background_refresh_dashboard_data(user_email, section_type):
     """
     section_type: 'overview', 'posts', 'config', or 'schedule'
@@ -567,6 +636,7 @@ def background_refresh_dashboard_data(user_email, section_type):
         active_ws = None
         if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
             try:
+                time.sleep(0.5)  # Stagger API calls to stay within Google Sheets quota
                 active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
             except Exception:
                 pass
@@ -593,33 +663,31 @@ def background_refresh_dashboard_data(user_email, section_type):
                     <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1.16fr)_minmax(380px,0.84fr)] gap-4 items-start">
                         <div class="space-y-4">
                             <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10 mb-5">
-                                <div class="flex flex-col xl:flex-row xl:items-start xl:justify-between gap-4 mb-4">
-                                    <div>
-                                        <div class="text-base font-black text-slate-100">Sheet và cấu hình quét</div>
-                                        <div class="text-sm text-slate-400 mt-1">Nhập sheet, hệ thống sẽ tự điền cột vào ngay các ô bên dưới để bạn sửa trực tiếp. Nút chạy nằm phía dưới, ngay trên phần nhật ký.</div>
-                                    </div>
-                                    <div id="status-badge" class="{status_payload['status_badge_class']}">{status_payload['status_badge_text']}</div>
-                                </div>
                                 <div class="space-y-4">
-                                    <div>
-                                        <div class="text-sm text-slate-300 mb-2">Sheet đang dùng: <span class="text-emerald-400 font-bold" data-active-sheet-name>{runtime_state['active_sheet_name'] or 'Chưa cài đặt'}</span></div>
-                                        <div class="text-xs text-slate-400">Spreadsheet ID: <span class="text-blue-300" data-active-sheet-id>{runtime_state['active_sheet_id'] or 'Chưa cài đặt'}</span></div>
-                                        <div class="text-[11px] text-slate-500 mt-2">Lưu sheet trước để nhận diện cột. Sau đó bạn kéo xuống dưới, xem tiến trình và bấm chạy ngay phía trên phần nhật ký.</div>
-                                    </div>
                                     <form action="/set-sheet" method="get" class="flex flex-col gap-3">
-                                        <input id="sheet-url-input" name="sheet_url" value="{snapshot_url}" placeholder="Nhập link Google Sheet hoặc Sheet ID" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-blue-400" />
-                                        <div class="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_220px] gap-3">
-                                            <input id="sheet-name-input" name="sheet_name" value="{runtime_state['active_sheet_name']}" list="sheet-name-options" autocomplete="off" placeholder="Nhập tên tab sheet" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-blue-400" />
-                                            <button type="submit" class="w-full px-6 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu Sheet</button>
+                                        <label class="text-xs font-black uppercase tracking-[0.16em] text-slate-400">Nhập link sheet</label>
+                                        <div class="flex flex-col md:flex-row gap-2 md:items-center">
+                                            <input id="sheet-url-input" name="sheet_url" value="{snapshot_url}" placeholder="Nhập link Google Sheet hoặc Sheet ID" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-blue-400" />
+                                            <button type="submit" class="w-full md:w-auto md:shrink-0 px-4 py-3 rounded-xl border border-emerald-400/30 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 text-xs font-black tracking-[0.12em] uppercase transition-all">
+                                                Lưu sheet
+                                            </button>
                                         </div>
+                                        <input id="sheet-name-input" name="sheet_name" value="{runtime_state['active_sheet_name']}" list="sheet-name-options" autocomplete="off" class="hidden" />
                                         <datalist id="sheet-name-options"></datalist>
                                         <div id="sheet-tabs-state" class="text-xs text-slate-500">Dán link Google Sheet để hiện danh sách tab có trong file.</div>
                                         <div id="sheet-tabs-list" class="sheet-tabs-list hidden"></div>
                                     </form>
                                 </div>
                             </div>
-                            <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
-                                <span>Cột nhập liệu</span><span class="text-cyan-300 font-black text-lg" data-config-mode>{column_config['manual_mode']}</span>
+                            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2 mb-3 text-sm font-bold text-slate-500 uppercase">
+                                <span>Cột nhập liệu</span>
+                                <div class="flex items-center gap-3">
+                                    <button id="auto-fill-columns-btn" type="button" class="px-4 py-1.5 rounded-lg border border-cyan-400/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 text-xs font-black tracking-wider transition-all normal-case">AUTO</button>
+                                </div>
+                            </div>
+                            <div id="col-config-tab-bar" class="hidden flex-wrap gap-1 mb-0"></div>
+                            <div id="col-config-apply-note" class="text-xs text-cyan-200/80 bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2 mb-3">
+                                Chọn nhiều tab ở danh sách phía trên để cấu hình từng tab riêng.
                             </div>
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
                                 {''.join([
@@ -627,8 +695,10 @@ def background_refresh_dashboard_data(user_email, section_type):
                                     <div>
                                         <div class="flex items-center justify-between gap-3 mb-2">
                                             <label class="block text-xs text-slate-400 uppercase tracking-wider">{
+                                                "Cột ngày quét" if field == "date" else
+                                                "Cột ngày air bài" if field == "air_date" else
                                                 "Cột Link" if field == "link" else
-                                                "Cột Chiến dịch" if field == "campaign" else
+                                                "Cột Buzz (Buzz = Comment + Share)" if field == "buzz" else
                                                 "Cột View" if field == "view" else
                                                 "Cột Like" if field == "like" else
                                                 "Cột Share" if field == "share" else
@@ -639,8 +709,10 @@ def background_refresh_dashboard_data(user_email, section_type):
                                             <span class="text-[11px] text-slate-500 font-black uppercase tracking-[0.18em]" data-column-source="{field}">{column_config["input_sources"].get(field, "CHƯA THẤY")}</span>
                                         </div>
                                         <input name="{field}" form="set-columns-form" data-column-input="{field}" data-detected-value="{column_config["detected_inputs"].get(field, '')}" data-manual-value="{column_config["manual_inputs"].get(field, '')}" value="{column_config["input_values"].get(field, '')}" placeholder="{
+                                            "VD: A hoặc 1" if field == "date" else
+                                            "VD: B hoặc 2" if field == "air_date" else
                                             "VD: D hoặc 4" if field == "link" else
-                                            "VD: C hoặc 3" if field == "campaign" else
+                                            "VD: C hoặc 3" if field == "buzz" else
                                             "VD: E hoặc 5" if field == "view" else
                                             "VD: F hoặc 6" if field == "like" else
                                             "VD: G hoặc 7" if field == "share" else
@@ -648,9 +720,8 @@ def background_refresh_dashboard_data(user_email, section_type):
                                             "VD: I hoặc 9" if field == "save" else
                                             "VD: 2"
                                         }" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
-                                        {f'<p class="mt-1 text-[11px] text-slate-500">Chỉ đọc để phân loại trên web, không ghi vào sheet khi quét.</p>' if field == 'campaign' else ''}
                                     </div>
-                                    ''' for field in ["link", "campaign", "view", "like", "share", "comment", "save"]
+                                    ''' for field in ["date", "air_date", "link", "buzz", "view", "like", "share", "comment", "save"]
                                 ])}
                                 <div>
                                     <div class="flex items-center justify-between gap-3 mb-2">
@@ -664,13 +735,14 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 {column_config['detected_text']}
                             </div>
                             <div class="text-xs text-cyan-200/80 bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2 mb-3">
-                                Các ô đã tự hiện cột đang nhận. Bạn sửa trực tiếp ngay trong đó nếu cần. Xóa trống ô nào thì ô đó quay về AUTO theo header của sheet. Cột Chiến dịch chỉ dùng để gom nhóm trên web. Dòng bắt đầu nhận số từ 2 trở lên.
+                                Các ô đã tự hiện cột đang nhận. Bạn sửa trực tiếp ngay trong đó nếu cần. Xóa trống ô nào thì ô đó quay về AUTO theo header của sheet. Buzz được tính bằng Comment + Share. Dòng bắt đầu nhận số từ 2 trở lên.
                             </div>
                             <form id="set-columns-form" action="/set-columns" method="get" class="mb-4">
+                                <input id="col-config-active-tab-input" type="hidden" name="tab_name" value="" />
                                 <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu cấu hình nhập liệu</button>
                             </form>
                         </div>
-                        <div>
+                        <div class="xl:sticky xl:top-6">
                             <div class="bg-slate-900/55 rounded-2xl p-4 border border-white/10 mb-4">
                                 <div class="flex justify-between items-center mb-2 text-xs font-bold text-slate-500 uppercase">
                                     <span>Quét dữ liệu</span><span class="text-blue-300">Thao tác nhanh</span>
@@ -680,14 +752,19 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 <div class="w-full bg-slate-800/80 rounded-full h-3 overflow-hidden mt-4 mb-4">
                                     <div id="progress-bar" class="bg-blue-500 h-full transition-all duration-1000" style="width: {status_payload['progress_width']}"></div>
                                 </div>
+                                <div class="flex items-center justify-between gap-3 mt-4 mb-3">
+                                    <div class="text-xs uppercase tracking-[0.22em] font-black text-sky-300">Tiến trình từng tab</div>
+                                    <div id="progress-text" class="text-xs text-slate-400 font-bold">{status_payload.get('progress_text', '')}</div>
+                                </div>
+                                <div id="tab-progress-section" class="hidden space-y-3 mb-4"></div>
                                 <div id="primary-action">{status_payload['primary_action_html']}</div>
                             </div>
                             <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10">
                                 <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
                                     <span>Nhật ký hệ thống</span><span class="text-slate-400">Cập nhật realtime</span>
                                 </div>
-                                <div id="log-section" class="bg-black/40 rounded-2xl p-5 h-72 overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
-                                    <p class="text-center text-slate-700 text-xl mt-24 uppercase font-black">Đang chờ lệnh...</p>
+                                <div id="log-section" class="bg-black/40 rounded-2xl p-4 h-[42vh] min-h-[320px] max-h-[560px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
+                                    {build_log_html(runtime_state)}
                                 </div>
                             </div>
                         </div>
@@ -856,7 +933,11 @@ def get_saved_sheet_entries(settings=None, owner_email: Optional[str] = None):
     saved_by_user = auth_settings.get("saved_sheets_by_user", {}) if isinstance(auth_settings, dict) else {}
     if normalized_owner:
         scoped_entries = saved_by_user.get(normalized_owner, []) if isinstance(saved_by_user, dict) else []
-        return [dict(item) for item in normalize_saved_sheet_entries(scoped_entries)]
+        normalized_scoped_entries = normalize_saved_sheet_entries(scoped_entries)
+        if normalized_scoped_entries:
+            return [dict(item) for item in normalized_scoped_entries]
+        # Backward compatibility: older data may still live in shared `saved_sheets`.
+        return [dict(item) for item in normalize_saved_sheet_entries(auth_settings.get("saved_sheets", []))]
     return [dict(item) for item in normalize_saved_sheet_entries(auth_settings.get("saved_sheets", []))]
 
 
@@ -1072,32 +1153,49 @@ def update_saved_sheet_metadata(
     settings = get_auth_settings().copy()
     existing_entries = get_saved_sheet_entries(settings, owner_email=normalized_owner)
     
-    next_entries = []
-    found = False
-    for item in existing_entries:
+    def build_updated_entry(item):
         curr_id = str(item.get("sheet_id", "") or "").strip()
         curr_name = str(item.get("sheet_name", "") or "").strip()
-        
+        return {
+            "sheet_id": curr_id,
+            "sheet_name": (new_sheet_name or curr_name).strip(),
+            "sheet_gid": str(item.get("sheet_gid", "") or "0").strip() or "0",
+            "saved_at_text": str(item.get("saved_at_text", "") or "").strip(),
+            "campaign_label": str(campaign_label or "").strip(),
+            "brand_label": str(brand_label or "").strip(),
+            "industry_label": str(industry_label or "").strip(),
+            "campaign_description": str(item.get("campaign_description", "") or "").strip(),
+        }
+
+    target_index = -1
+    normalized_target_name = unicodedata.normalize('NFC', normalized_sheet_name).casefold()
+
+    # Pass 1: match chặt theo ID + tên cũ (đúng hành vi cũ)
+    for idx, item in enumerate(existing_entries):
+        curr_id = str(item.get("sheet_id", "") or "").strip()
+        curr_name = str(item.get("sheet_name", "") or "").strip()
         norm_curr = unicodedata.normalize('NFC', curr_name).casefold()
-        norm_target = unicodedata.normalize('NFC', normalized_sheet_name).casefold()
-        
-        if curr_id == normalized_sheet_id and norm_curr == norm_target:
-            found = True
-            next_entries.append({
-                "sheet_id": curr_id,
-                "sheet_name": (new_sheet_name or curr_name).strip(),
-                "sheet_gid": str(item.get("sheet_gid", "") or "0").strip() or "0",
-                "saved_at_text": str(item.get("saved_at_text", "") or "").strip(),
-                "campaign_label": str(campaign_label or "").strip(),
-                "brand_label": str(brand_label or "").strip(),
-                "industry_label": str(industry_label or "").strip(),
-                "campaign_description": str(item.get("campaign_description", "") or "").strip(),
-            })
+        if curr_id == normalized_sheet_id and norm_curr == normalized_target_name:
+            target_index = idx
+            break
+
+    # Pass 2: fallback theo ID (trường hợp tên hiển thị đã lệch)
+    if target_index < 0:
+        for idx, item in enumerate(existing_entries):
+            curr_id = str(item.get("sheet_id", "") or "").strip()
+            if curr_id == normalized_sheet_id:
+                target_index = idx
+                break
+
+    if target_index < 0:
+        return []
+
+    next_entries = []
+    for idx, item in enumerate(existing_entries):
+        if idx == target_index:
+            next_entries.append(build_updated_entry(item))
         else:
             next_entries.append(dict(item))
-            
-    if not found:
-        return []
         
     if normalized_owner:
         saved_by_user = dict(settings.get("saved_sheets_by_user", {}) or {})
@@ -2418,18 +2516,7 @@ def build_employee_settings_content_html(current_user):
 def build_settings_panel_html(current_user, state=None):
     is_admin = bool(current_user and current_user.get("role") == "admin")
     current_prefs = get_user_notification_preferences(current_user)
-    runtime_state = resolve_runtime_state(state)
-    campaign_content_html = build_campaign_panel_html(runtime_state, embedded=True)
     employee_content_html = build_employee_settings_content_html(current_user) if is_admin else ""
-    campaign_nav_html = """
-                            <button type="button" class="settings-nav-item" data-settings-tab-trigger="campaigns">
-                                <span class="settings-nav-item-icon"><i class="fa-solid fa-bullseye"></i></span>
-                                <span class="settings-nav-item-copy">
-                                    <strong>Chiến dịch</strong>
-                                    <span>Quản lý chiến dịch</span>
-                                </span>
-                            </button>
-    """
     admin_nav_html = (
         """
                             <button type="button" class="settings-nav-item" data-settings-tab-trigger="employees">
@@ -2443,13 +2530,6 @@ def build_settings_panel_html(current_user, state=None):
         if is_admin
         else ""
     )
-    campaign_pane_html = f"""
-                        <div class="settings-tab-pane hidden" data-settings-tab-pane="campaigns">
-                            <div class="settings-pane-shell">
-                                {campaign_content_html}
-                            </div>
-                        </div>
-    """
     admin_pane_html = (
         f"""
                         <div class="settings-tab-pane hidden" data-settings-tab-pane="employees">
@@ -2474,7 +2554,6 @@ def build_settings_panel_html(current_user, state=None):
                             <span>Cấu hình thông báo</span>
                         </span>
                     </button>
-                    {campaign_nav_html}
                     {admin_nav_html}
                 </div>
             </aside>
@@ -2513,7 +2592,6 @@ def build_settings_panel_html(current_user, state=None):
                         </div>
                     </div>
                 </div>
-                {campaign_pane_html}
                 {admin_pane_html}
             </div>
         </div>
@@ -2538,10 +2616,16 @@ def build_log_html(state=None):
         timestamp_part, separator, message_part = raw_text.partition("] ")
         timestamp_text = timestamp_part[1:] if separator and timestamp_part.startswith("[") else ""
         message_text = message_part if separator else raw_text
+        tab_html = ""
+        tab_match = re.match(r"^\[([^\]]+)\]\s*(.*)$", message_text)
+        if tab_match:
+            tab_name = tab_match.group(1)
+            message_text = tab_match.group(2)
+            tab_html = f'<span class="system-log-tab">[{html.escape(tab_name)}]</span>'
         parts.append(
             f'<div class="system-log-line">'
             f'<span class="system-log-time">[{html.escape(timestamp_text)}]</span>'
-            f'<span class="system-log-message">{html.escape(message_text)}</span>'
+            f'{tab_html}<span class="system-log-message">{html.escape(message_text)}</span>'
             f"</div>"
         )
     return "".join(parts)
@@ -2676,7 +2760,7 @@ def build_snapshot_url(sheet_id: Optional[str] = None, sheet_gid: Optional[str] 
 
 def build_column_config_payload(sheet=None, state=None):
     runtime_state = resolve_runtime_state(state)
-    metric_cols = {"date": "-", "air_date": "-", "link": "-", "view": "-", "like": "-", "share": "-", "comment": "-", "save": "-"}
+    metric_cols = {"date": "-", "air_date": "-", "link": "-", "view": "-", "like": "-", "share": "-", "comment": "-", "buzz": "-", "save": "-"}
     detected_text = "Chưa có sheet để tự nhận cột."
     header_row = 1
     effective_start_row = runtime_state["start_row"]
@@ -3053,8 +3137,11 @@ def build_schedule_sheet_options_html(state=None):
         return '<option value="">Chưa có sheet nào để chọn</option>'
     option_parts = []
     for choice in choices:
+        option_gid = str(choice.get("sheet_gid", "") or "0").strip() or "0"
+        option_sheet_id = str(choice.get("sheet_id", "") or "").strip()
+        option_sheet_name = str(choice.get("sheet_name", "") or "").strip()
         option_parts.append(
-            f'<option value="{html.escape(choice["key"], quote=True)}" {"selected" if choice["key"] == selected_key else ""}>{html.escape(choice["label"])}</option>'
+            f'<option value="{html.escape(choice["key"], quote=True)}" data-sheet-id="{html.escape(option_sheet_id, quote=True)}" data-sheet-name="{html.escape(option_sheet_name, quote=True)}" data-sheet-gid="{html.escape(option_gid, quote=True)}" {"selected" if choice["key"] == selected_key else ""}>{html.escape(choice["label"])}</option>'
         )
     return "".join(option_parts)
 
@@ -3540,10 +3627,17 @@ def list_spreadsheet_tabs(sheet_input: str):
     sheet_id = extract_sheet_id(sheet_input or "")
     if not sheet_id:
         raise ValueError("Link/ID spreadsheet không hợp lệ.")
+    
+    global SHEET_TABS_CACHE
     now = datetime.now()
     cache_entry = SHEET_TABS_CACHE.get(sheet_id)
-    if cache_entry and (now - cache_entry["updated_at"]).total_seconds() < SHEET_TABS_CACHE_TTL_SECONDS:
-        return cache_entry["tabs"]
+    if cache_entry:
+        try:
+            updated_at = datetime.fromisoformat(cache_entry["updated_at"])
+            if (now - updated_at).total_seconds() < SHEET_TABS_CACHE_TTL_SECONDS:
+                return cache_entry["tabs"]
+        except Exception:
+            pass
     
     def _fetch_tabs():
         gc = get_gspread_client()
@@ -3557,7 +3651,8 @@ def list_spreadsheet_tabs(sheet_input: str):
         ]
     
     tabs = retry_with_backoff(_fetch_tabs, max_retries=4, base_delay=2, handle_quota=True)
-    SHEET_TABS_CACHE[sheet_id] = {"updated_at": now, "tabs": tabs}
+    SHEET_TABS_CACHE[sheet_id] = {"updated_at": now.isoformat(), "tabs": tabs}
+    save_sheet_tabs_cache(SHEET_TABS_CACHE)
     return tabs
 
 def set_active_sheet(sheet_name, sheet_id: Optional[str] = None, state=None):
@@ -3570,10 +3665,21 @@ def set_active_sheet(sheet_name, sheet_id: Optional[str] = None, state=None):
     ):
         return
     ws = get_worksheet(sheet_name, target_sheet_id, runtime_state)
+    if not ws:
+        raise ValueError(f"Không thể truy cập tab: {sheet_name}")
     runtime_state["active_sheet_id"] = target_sheet_id
     runtime_state["active_sheet_name"] = sheet_name
-    runtime_state["active_sheet_gid"] = str(ws.id)
+    runtime_state["active_sheet_gid"] = str(ws.id) if hasattr(ws, 'id') else "0"
     add_log(f"Đã chọn sheet: {sheet_name} | Spreadsheet ID: {runtime_state['active_sheet_id']}", runtime_state)
+
+def is_quota_or_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "quota exceeded" in msg
+        or "rate limit" in msg
+        or "too many requests" in msg
+        or "429" in msg
+    )
 
 def retry_with_backoff(func, max_retries=3, base_delay=2, handle_quota=True):
     """Retry a function with exponential backoff on connection errors and quota errors"""
@@ -3674,19 +3780,30 @@ def normalize_header(text: str) -> str:
     value = re.sub(r"[^a-z0-9]+", "", value)
     return value
 
-def header_matches_alias(key: str, aliases) -> bool:
+def header_matches_alias(key: str, aliases, allow_partial: bool = True) -> bool:
     if not key:
         return False
     if key in aliases:
         return True
+    if not allow_partial:
+        return False
     for alias in aliases:
         if not alias:
             continue
-        if key.startswith(alias) or key.endswith(alias) or alias in key:
+        alias_len = len(alias)
+        if alias_len < 3:
+            continue
+        if alias_len <= 4:
+            if (key.startswith(alias) or key.endswith(alias)) and abs(len(key) - alias_len) <= 2:
+                return True
+            continue
+        if key.startswith(alias) or key.endswith(alias):
+            return True
+        if alias_len >= 6 and alias in key:
             return True
     return False
 
-def detect_columns_from_headers(headers):
+def detect_columns_from_headers(headers, allow_partial: bool = True):
     columns = {}
     # Map each header index to its normalized key
     header_keys = []
@@ -3708,19 +3825,34 @@ def detect_columns_from_headers(headers):
                 break
 
     # Pass 2: substring / partial matches for remaining headers
-    for idx, key in header_keys:
-        if not key or idx in matched_indices:
-            continue
-        for field, names in HEADER_ALIASES.items():
-            if field in columns:
+    if allow_partial:
+        for idx, key in header_keys:
+            if not key or idx in matched_indices:
                 continue
-            if header_matches_alias(key, names):
-                columns[field] = idx
-                matched_indices.add(idx)
-                break
+            for field, names in HEADER_ALIASES.items():
+                if field in columns:
+                    continue
+                if header_matches_alias(key, names, allow_partial=True):
+                    columns[field] = idx
+                    matched_indices.add(idx)
+                    break
     return columns
 
-def detect_sheet_layout(sheet, sample_rows: int = 5):
+def detect_sheet_layout(sheet, sample_rows: int = 30, use_cache: bool = True):
+    global SHEET_LAYOUT_CACHE
+    sheet_id = getattr(getattr(sheet, "spreadsheet", None), "id", "") or ""
+    sheet_name = getattr(sheet, "title", "") or ""
+    cache_key = f"{sheet_id}:{sheet_name}"
+    now = datetime.now()
+    cached_layout_entry = SHEET_LAYOUT_CACHE.get(cache_key)
+    if use_cache and cached_layout_entry:
+        try:
+            updated_at = datetime.fromisoformat(cached_layout_entry.get("updated_at", ""))
+            if (now - updated_at).total_seconds() < SHEET_LAYOUT_CACHE_TTL_SECONDS:
+                return dict(cached_layout_entry.get("layout") or {})
+        except Exception:
+            pass
+
     best_row = 1
     best_headers = []
     best_columns = {}
@@ -3731,7 +3863,9 @@ def detect_sheet_layout(sheet, sample_rows: int = 5):
     try:
         range_notation = f"1:{max_rows}"
         batch_rows = sheet.get(range_notation) or []
-    except Exception:
+    except Exception as exc:
+        if cached_layout_entry and is_quota_or_rate_limit_error(exc):
+            return dict(cached_layout_entry.get("layout") or {})
         # Fallback: single call for row 1
         try:
             batch_rows = [sheet.row_values(1)]
@@ -3741,12 +3875,28 @@ def detect_sheet_layout(sheet, sample_rows: int = 5):
     for row_idx, headers in enumerate(batch_rows, start=1):
         if not any(str(cell or "").strip() for cell in headers):
             continue
-        columns = detect_columns_from_headers(headers)
-        score = len(columns)
-        if "link" in columns:
-            score += 3
-        if any(metric in columns for metric in ("view", "like", "share", "comment", "save")):
+        strict_columns = detect_columns_from_headers(headers, allow_partial=False)
+        relaxed_columns = detect_columns_from_headers(headers, allow_partial=True)
+        columns = dict(strict_columns)
+        for field, col_idx in relaxed_columns.items():
+            columns.setdefault(field, col_idx)
+
+        populated_cells = sum(1 for cell in headers if str(cell or "").strip())
+        if populated_cells < 3 and len(columns) < 2:
+            continue
+
+        score = (len(strict_columns) * 5) + (len(columns) * 2)
+        if "link" in strict_columns:
+            score += 8
+        elif "link" in columns:
+            score += 4
+        if any(metric in strict_columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
+            score += 4
+        elif any(metric in columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
             score += 2
+        if "date" in strict_columns or "air_date" in strict_columns:
+            score += 2
+
         if score > best_score:
             best_row = row_idx
             best_headers = headers
@@ -3757,11 +3907,16 @@ def detect_sheet_layout(sheet, sample_rows: int = 5):
         best_headers = batch_rows[0]
         best_columns = detect_columns_from_headers(best_headers)
 
-    return {
+    layout_result = {
         "header_row": best_row,
         "headers": best_headers,
         "columns": best_columns,
     }
+    SHEET_LAYOUT_CACHE[cache_key] = {
+        "updated_at": now.isoformat(),
+        "layout": layout_result,
+    }
+    return layout_result
 
 def detect_sheet_columns(sheet):
     return detect_sheet_layout(sheet).get("columns", {})
@@ -3784,7 +3939,41 @@ def get_sheet_records(sheet, layout=None, include_row_values: bool = False):
     resolved_layout = layout or detect_sheet_layout(sheet)
     header_row = max(1, int(resolved_layout.get("header_row") or 1))
     headers = list(resolved_layout.get("headers") or [])
-    all_values = sheet.get_all_values()
+    
+    # Cache logic for all_values
+    global SHEET_DATA_CACHE
+    sheet_id = getattr(sheet.spreadsheet, "id", "")
+    sheet_name = getattr(sheet, "title", "")
+    cache_key = f"{sheet_id}:{sheet_name}"
+    
+    now = datetime.now()
+    all_values = None
+    cache_entry = SHEET_DATA_CACHE.get(cache_key)
+    if cache_entry:
+        try:
+            updated_at = datetime.fromisoformat(cache_entry["updated_at"])
+            if (now - updated_at).total_seconds() < SHEET_DATA_CACHE_TTL_SECONDS:
+                all_values = cache_entry["data"]
+        except Exception:
+            pass
+    
+    if all_values is None:
+        stale_values = None
+        if cache_entry:
+            stale_values = cache_entry.get("data")
+        try:
+            all_values = sheet.get_all_values()
+            SHEET_DATA_CACHE[cache_key] = {
+                "updated_at": now.isoformat(),
+                "data": all_values
+            }
+            save_sheet_data_cache(SHEET_DATA_CACHE)
+        except Exception as exc:
+            if stale_values and is_quota_or_rate_limit_error(exc):
+                all_values = stale_values
+            else:
+                raise
+        
     if not headers and len(all_values) >= header_row:
         headers = list(all_values[header_row - 1] or [])
     unique_headers = build_unique_headers(headers)
@@ -3809,7 +3998,7 @@ def format_detected_columns_text(layout, state=None) -> str:
     if not layout:
         return ""
     col_map = apply_column_overrides(layout.get("columns") or {}, state=state)
-    ordered_fields = ["date", "air_date", "link", "view", "like", "share", "comment", "save"]
+    ordered_fields = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"]
     parts = []
     for field in ordered_fields:
         col_idx = col_map.get(field)
@@ -3827,6 +4016,14 @@ def apply_column_overrides(columns, overrides=None, state=None):
         if col_idx:
             merged[field] = col_idx
     return merged
+
+def apply_column_overrides_for_tab(columns, tab_name: str, state=None):
+    runtime_state = resolve_runtime_state(state)
+    resolved_tab = str(tab_name or "").strip()
+    tab_overrides = (runtime_state.get("column_overrides_by_tab") or {}).get(resolved_tab)
+    if tab_overrides:
+        return apply_column_overrides(columns, overrides=tab_overrides)
+    return apply_column_overrides(columns, state=runtime_state)
 
 def first_nonempty_value(record, *keys):
     for key in keys:
@@ -4099,15 +4296,15 @@ def collect_posts_dataset_for_worksheet(
     total_reaction = 0
     total_share = 0
     total_comment = 0
-    total_engagement = 0
+    total_buzz = 0
     creators = set()
     campaigns = set()
     brand_counts = {}
     error = ""
 
     try:
-        layout = detect_sheet_layout(ws)
-        col_map = apply_column_overrides(layout.get("columns"), state=runtime_state)
+        layout = detect_sheet_layout(ws, sample_rows=40, use_cache=False)
+        col_map = apply_column_overrides_for_tab(layout.get("columns"), sheet_title, state=runtime_state)
         records, header_row, headers = get_sheet_records(ws, layout, include_row_values=True)
         link_header = resolve_header_from_column(headers, col_map.get("link"))
         campaign_header = resolve_header_from_column(headers, col_map.get("campaign"))
@@ -4124,7 +4321,7 @@ def collect_posts_dataset_for_worksheet(
             "total_reaction": 0,
             "total_share": 0,
             "total_comment": 0,
-            "total_engagement": 0,
+            "total_buzz": 0,
             "creator_count": 0,
             "campaign_count": 0,
             "brand_label": "",
@@ -4166,7 +4363,7 @@ def collect_posts_dataset_for_worksheet(
         title = str(
             first_nonempty_value(normalized_record, "caption", "title", "content", "noidung", "post", "mota")
         ).strip() or infer_post_title(link, platform)
-        raw_date_text = resolve_dashboard_date_value(record, normalized_record, col_map)
+        raw_date_text = resolve_dashboard_air_date_value(record, normalized_record, col_map) or resolve_dashboard_date_value(record, normalized_record, col_map)
         date_text = format_dashboard_date_text(raw_date_text) if raw_date_text else "-"
         date_title = format_dashboard_date_text(raw_date_text, include_time=True) if raw_date_text else "-"
         view = parse_metric_number(read_record_value_from_column(record, col_map.get("view")) or first_nonempty_value(normalized_record, "view", "views", "luotxem"))
@@ -4174,10 +4371,14 @@ def collect_posts_dataset_for_worksheet(
         share = parse_metric_number(read_record_value_from_column(record, col_map.get("share")) or first_nonempty_value(normalized_record, "share", "shares"))
         comment = parse_metric_number(read_record_value_from_column(record, col_map.get("comment")) or first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
         save = parse_metric_number(read_record_value_from_column(record, col_map.get("save")) or first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
+        buzz_raw = (
+            read_record_value_from_column(record, col_map.get("buzz"))
+            or first_nonempty_value(normalized_record, "buzz", "buzzcount", "totalbuzz", "tongbuzz")
+        )
+        buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else (share + comment)
         plan = str(first_nonempty_value(normalized_record, "plan", "nam", "period", "fiscalyear") or "-").strip()
         line_product = str(first_nonempty_value(normalized_record, "line_product", "lineproduct", "sanpham", "nhanhang", "line", "product") or "-").strip()
         kol_tier = str(first_nonempty_value(normalized_record, "kol_tier", "koltier", "tier", "phanloaikol", "kolevel") or "-").strip()
-        engagement = reaction + share + comment + save
         status_label = "Đã quét" if any([view, reaction, share, comment, save]) or date_text != "-" else "Chờ quét"
         status_class = "posts-status-done" if status_label == "Đã quét" else "posts-status-pending"
         avatar = html.escape((creator or platform)[:1].upper())
@@ -4219,17 +4420,16 @@ def collect_posts_dataset_for_worksheet(
                         data-link="{safe_link}"
                         data-title="{safe_title_attr}"
                         data-platform-name="{safe_platform_attr}"
-                        data-campaign-name="{safe_campaign_attr}"
                         aria-label="Chọn dòng {row_idx}"
                     />
                 </td>
-                <td class="posts-cell posts-cell-content">
+                <td class="posts-cell posts-cell-content" data-post-col="content">
                     <div class="post-content-wrap">
                         <a href="{safe_link}" target="_blank" rel="noreferrer" class="post-title-link">{safe_title}</a>
                         <a href="{safe_link}" target="_blank" rel="noreferrer" class="post-content-meta">{safe_content_meta}</a>
                     </div>
                 </td>
-                <td class="posts-cell">
+                <td class="posts-cell" data-post-col="creator">
                     <div class="flex items-center gap-3">
                         <div class="post-avatar post-avatar-{platform_key}">{avatar}</div>
                         <div>
@@ -4238,24 +4438,18 @@ def collect_posts_dataset_for_worksheet(
                         </div>
                     </div>
                 </td>
-                <td class="posts-cell"><span class="post-status-pill {status_class}">{status_label}</span></td>
-                <td class="posts-cell text-xs font-bold text-slate-400">{safe_plan}</td>
-                <td class="posts-cell text-xs font-bold text-slate-400">{safe_line}</td>
-                <td class="posts-cell">
+                <td class="posts-cell" data-post-col="status"><span class="post-status-pill {status_class}">{status_label}</span></td>
+                <td class="posts-cell text-xs font-bold text-slate-400" data-post-col="plan">{safe_plan}</td>
+                <td class="posts-cell text-xs font-bold text-slate-400" data-post-col="line">{safe_line}</td>
+                <td class="posts-cell" data-post-col="tier">
                     {f'<span class="px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-500 text-[10px] font-black border border-amber-500/20">{safe_tier}</span>' if safe_tier and safe_tier != "-" else "-"}
                 </td>
-                <td class="posts-cell posts-cell-date" title="{safe_date_title}">{safe_date}</td>
-                <td class="posts-cell posts-cell-metric">{format_table_metric(view)}</td>
-                <td class="posts-cell posts-cell-metric">{format_table_metric(reaction)}</td>
-                <td class="posts-cell posts-cell-metric">{format_table_metric(share)}</td>
-                <td class="posts-cell posts-cell-metric">{format_table_metric(comment)}</td>
-                <td class="posts-cell posts-cell-metric posts-cell-metric-strong">{format_table_metric(engagement)}</td>
-                <td class="posts-cell posts-cell-campaign">
-                    <div class="posts-campaign-main">
-                        <i class="fa-regular fa-flag"></i>
-                        <span>{safe_campaign}</span>
-                    </div>
-                </td>
+                <td class="posts-cell posts-cell-date" data-post-col="date" title="{safe_date_title}">{safe_date}</td>
+                <td class="posts-cell posts-cell-metric" data-post-col="view">{format_table_metric(view)}</td>
+                <td class="posts-cell posts-cell-metric" data-post-col="reaction">{format_table_metric(reaction)}</td>
+                <td class="posts-cell posts-cell-metric" data-post-col="share">{format_table_metric(share)}</td>
+                <td class="posts-cell posts-cell-metric" data-post-col="comment">{format_table_metric(comment)}</td>
+                <td class="posts-cell posts-cell-metric" data-post-col="buzz">{format_table_metric(buzz)}</td>
             </tr>
             """
         )
@@ -4265,7 +4459,7 @@ def collect_posts_dataset_for_worksheet(
         total_reaction += reaction
         total_share += share
         total_comment += comment
-        total_engagement += engagement
+        total_buzz += buzz
         if creator:
             creators.add(creator)
         if campaign:
@@ -4290,7 +4484,7 @@ def collect_posts_dataset_for_worksheet(
         "total_reaction": total_reaction,
         "total_share": total_share,
         "total_comment": total_comment,
-        "total_engagement": total_engagement,
+        "total_buzz": total_buzz,
         "creator_count": len(creators),
         "campaign_count": len(campaigns),
         "brand_label": primary_brand_label,
@@ -4315,6 +4509,9 @@ def parse_dashboard_date(value):
         "%d/%m/%Y %H:%M:%S",
         "%d/%m/%Y %H:%M",
         "%d/%m/%Y",
+        "%d-%m-%Y %H:%M:%S",
+        "%d-%m-%Y %H:%M",
+        "%d-%m-%Y",
         "%m/%d/%Y %H:%M:%S",
         "%m/%d/%Y %H:%M",
         "%m/%d/%Y",
@@ -4329,7 +4526,17 @@ def parse_dashboard_date(value):
     try:
         return datetime.fromisoformat(normalized_raw)
     except Exception:
-        return None
+        pass
+    short_day_month = re.fullmatch(r"([0-3]?\d)\s*[-/.]\s*([01]?\d)", normalized_raw)
+    if short_day_month:
+        day_token = int(short_day_month.group(1))
+        month_token = int(short_day_month.group(2))
+        current_year = datetime.now().year
+        try:
+            return datetime(current_year, month_token, day_token)
+        except Exception:
+            return None
+    return None
 
 
 def resolve_dashboard_date_value(record, normalized_record, col_map) -> str:
@@ -4337,6 +4544,24 @@ def resolve_dashboard_date_value(record, normalized_record, col_map) -> str:
     return str(
         read_record_value_from_column(record, col_map.get("date"))
         or first_nonempty_value(normalized_record, *DASHBOARD_DATE_KEYS)
+        or ""
+    ).strip()
+
+def resolve_dashboard_air_date_value(record, normalized_record, col_map) -> str:
+    normalized_record = normalized_record if isinstance(normalized_record, dict) else {}
+    return str(
+        read_record_value_from_column(record, col_map.get("air_date"))
+        or first_nonempty_value(
+            normalized_record,
+            "airdate",
+            "aireddate",
+            "ngayair",
+            "ngaydang",
+            "ngayairbai",
+            "ngaydangbai",
+            "publishdate",
+            "publisheddate",
+        )
         or ""
     ).strip()
 
@@ -4370,7 +4595,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
     no_campaign_label = "Chưa gắn chiến dịch"
     total_posts = 0
     total_views = 0
-    total_engagement = 0
+    total_buzz = 0
     creators = set()
     campaigns = {}
     brands_summary = {}
@@ -4402,7 +4627,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                 and entry_sheet_name == str(runtime_state.get("active_sheet_name", "") or "").strip()
             ) else get_worksheet(entry_sheet_name, entry_sheet_id, runtime_state)
             layout = detect_sheet_layout(ws)
-            col_map = apply_column_overrides(layout.get("columns"), state=runtime_state)
+            col_map = apply_column_overrides_for_tab(layout.get("columns"), entry_sheet_name, state=runtime_state)
             records, header_row, headers = get_sheet_records(ws, layout, include_row_values=True)
             link_header = resolve_header_from_column(headers, col_map.get("link"))
             campaign_header = resolve_header_from_column(headers, col_map.get("campaign"))
@@ -4437,12 +4662,17 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             share = parse_metric_number(read_record_value_from_column(record, col_map.get("share")) or first_nonempty_value(normalized_record, "share", "shares"))
             comment = parse_metric_number(read_record_value_from_column(record, col_map.get("comment")) or first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
             save = parse_metric_number(read_record_value_from_column(record, col_map.get("save")) or first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
-            engagement = reaction + share + comment + save
-            scanned_at = parse_dashboard_date(resolve_dashboard_date_value(record, normalized_record, col_map))
+            buzz_raw = (
+                read_record_value_from_column(record, col_map.get("buzz"))
+                or first_nonempty_value(normalized_record, "buzz", "buzzcount", "totalbuzz", "tongbuzz")
+            )
+            buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else share + comment
+            air_date_value = resolve_dashboard_air_date_value(record, normalized_record, col_map)
+            aired_at = parse_dashboard_date(air_date_value)
 
             total_posts += 1
             total_views += view
-            total_engagement += engagement
+            total_buzz += buzz
             creators.add(creator.strip().lower())
 
             campaign_bucket = campaigns.setdefault(
@@ -4450,7 +4680,6 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                 {
                     "posts": 0,
                     "views": 0,
-                    "engagement": 0,
                     "creators": set(),
                     "platforms": set(),
                     "started_at": None,
@@ -4458,26 +4687,26 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             )
             campaign_bucket["posts"] += 1
             campaign_bucket["views"] += view
-            campaign_bucket["engagement"] += engagement
             campaign_bucket["creators"].add(creator.strip().lower())
             campaign_bucket["platforms"].add(platform)
-            if scanned_at and (campaign_bucket["started_at"] is None or scanned_at < campaign_bucket["started_at"]):
-                campaign_bucket["started_at"] = scanned_at
-            if scanned_at:
+            if aired_at and (campaign_bucket["started_at"] is None or aired_at < campaign_bucket["started_at"]):
+                campaign_bucket["started_at"] = aired_at
+            if aired_at:
                 timeline_rows.append(
                     {
-                        "date": scanned_at.strftime("%Y-%m-%d"),
+                        "date": aired_at.strftime("%Y-%m-%d"),
                         "creator": creator.strip().lower(),
                         "view": view,
-                        "engagement": engagement,
+                        "buzz": buzz,
                         "brand": brand_name,
+                        "sheet_name": entry_sheet_name,
                     }
                 )
 
-            brand_bucket = brands_summary.setdefault(brand_name, {"views": 0, "posts": 0, "engagement": 0})
+            brand_bucket = brands_summary.setdefault(brand_name, {"views": 0, "posts": 0, "buzz": 0})
             brand_bucket["views"] += view
             brand_bucket["posts"] += 1
-            brand_bucket["engagement"] += engagement
+            brand_bucket["buzz"] += buzz
 
     named_campaigns = [name for name in campaigns.keys() if name and name != no_campaign_label]
     total_campaigns = len(named_campaigns)
@@ -4491,14 +4720,13 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
         ] or list(campaigns.items())
         sorted_campaigns = sorted(
             preferred_campaigns,
-            key=lambda item: (item[1]["posts"], item[1]["views"], item[1]["engagement"]),
+            key=lambda item: (item[1]["posts"], item[1]["views"]),
             reverse=True,
         )
     else:
         sorted_campaigns = [(no_campaign_label, {
             "posts": total_posts,
             "views": total_views,
-            "engagement": total_engagement,
             "creators": total_creators,
             "platforms": set(),
             "started_at": None,
@@ -4551,10 +4779,6 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                         <div class="overview-campaign-metric-label">Lượt xem</div>
                         <div class="overview-campaign-metric-value">{format_metric_number(camp_data["views"])}</div>
                     </div>
-                    <div class="overview-campaign-metric metric-engagement">
-                        <div class="overview-campaign-metric-label">Tương tác</div>
-                        <div class="overview-campaign-metric-value">{format_metric_number(camp_data["engagement"])}</div>
-                    </div>
                     <div class="overview-campaign-metric metric-creators">
                         <div class="overview-campaign-metric-label">Creators</div>
                         <div class="overview-campaign-metric-value">{format_metric_number(camp_creators)}</div>
@@ -4566,7 +4790,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
         
     campaigns_rendered = '<div class="flex flex-col gap-4">' + "".join(campaign_cards_html) + "</div>"
     chart_dates = sorted({item["date"] for item in timeline_rows if item.get("date")})
-    chart_period_text = "Chưa có dữ liệu ngày quét."
+    chart_period_text = "Chưa có dữ liệu ngày air bài."
     if chart_dates:
         chart_period_text = (
             f"{datetime.strptime(chart_dates[0], '%Y-%m-%d').strftime('%d/%m/%Y')}"
@@ -4582,18 +4806,18 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
         + (f" Dữ liệu tổng hợp từ {len(brands_summary)} thương hiệu." if brands_summary else " Cần có dữ liệu thương hiệu để hiện sơ đồ.")
     )
     chart_brands = []
-    if total_views > 0:
+    if brands_summary:
         for b_name, b_data in brands_summary.items():
             ratio = round((b_data["views"] / total_views) * 100, 1) if total_views > 0 else 0
             chart_brands.append({
                 "name": b_name,
                 "views": b_data["views"],
                 "posts": b_data["posts"],
-                "engagement": b_data["engagement"],
+                "buzz": b_data.get("buzz", 0),
                 "ratio": ratio
             })
     
-    chart_brands.sort(key=lambda x: x["views"], reverse=True)
+    chart_brands.sort(key=lambda x: (x["buzz"], x["views"]), reverse=True)
 
     chart_payload_json = json.dumps(
         {
@@ -4603,11 +4827,24 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
         },
         ensure_ascii=False,
     ).replace("</", "<\\/")
+    has_quota_error = any(
+        ("quota exceeded" in str(item).lower()) or ("429" in str(item).lower())
+        for item in overview_errors
+    )
+    if has_quota_error:
+        overview_error_message = (
+            "Đang chạm giới hạn đọc Google Sheet (quota). "
+            "Hệ thống đang dùng dữ liệu cache gần nhất, vui lòng đợi 1-2 phút rồi tải lại."
+        )
+    else:
+        overview_error_message = "<br>".join(html.escape(item) for item in overview_errors[:3])
+        if len(overview_errors) > 3:
+            overview_error_message += "<br>..."
+
     overview_error_html = (
         '<div class="mt-4 rounded-2xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">'
         + "Không tải được một phần overview:<br>"
-        + "<br>".join(html.escape(item) for item in overview_errors[:3])
-        + ("<br>..." if len(overview_errors) > 3 else "")
+        + overview_error_message
         + "</div>"
         if overview_errors
         else ""
@@ -4622,13 +4859,6 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
 
             <div class="overview-stat-grid">
                 <div class="overview-stat-card">
-                    <div class="overview-stat-icon icon-campaign"><i class="fa-regular fa-flag"></i></div>
-                    <div>
-                        <div class="overview-stat-label">Tổng số chiến dịch</div>
-                        <div class="overview-stat-value">{format_metric_number(total_campaigns)}</div>
-                    </div>
-                </div>
-                <div class="overview-stat-card">
                     <div class="overview-stat-icon icon-post"><i class="fa-solid fa-photo-film"></i></div>
                     <div>
                         <div class="overview-stat-label">Tổng số bài đăng</div>
@@ -4642,13 +4872,6 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                         <div class="overview-stat-value">{format_compact_metric(total_views)}</div>
                     </div>
                 </div>
-                <div class="overview-stat-card">
-                    <div class="overview-stat-icon icon-engagement"><i class="fa-solid fa-chart-line"></i></div>
-                    <div>
-                        <div class="overview-stat-label">Tổng tương tác</div>
-                        <div class="overview-stat-value">{format_compact_metric(total_engagement)}</div>
-                    </div>
-                </div>
             </div>
 
             <div class="overview-section-title">Hiệu suất tổng thể</div>
@@ -4659,24 +4882,63 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                         <div class="overview-control-title">Hiệu suất theo thương hiệu</div>
                         <div class="overview-control-subtitle">{html.escape(chart_subtitle)}</div>
                     </div>
+                    <div class="overview-head-actions">
+                        <button type="button" class="overview-filter-trigger" data-overview-filter-trigger aria-label="Mở bộ lọc biểu đồ thời gian">
+                            <i class="fa-regular fa-calendar"></i>
+                            <span>Khoảng thời gian</span>
+                            <i class="fa-solid fa-chevron-down overview-filter-trigger-chevron"></i>
+                        </button>
+                    </div>
+                </div>
+                <div class="overview-chart-filter-anchor">
+                    <div class="overview-chart-control-wrap hidden" data-overview-filter-panel>
+                        <div class="overview-time-filter-card">
+                            <div class="overview-time-filter-title">Khoảng thời gian:</div>
+                            <div class="overview-time-filter-grid">
+                                <button type="button" class="overview-chart-toggle is-active" data-overview-range="7d">7 ngày qua</button>
+                                <button type="button" class="overview-chart-toggle" data-overview-range="30d">30 ngày qua</button>
+                                <button type="button" class="overview-chart-toggle" data-overview-range="this_month">Tháng này</button>
+                                <button type="button" class="overview-chart-toggle" data-overview-range="last_month">Tháng trước</button>
+                                <button type="button" class="overview-chart-toggle overview-chart-toggle-full" data-overview-range="all_time">Toàn thời gian</button>
+                            </div>
+                            <div class="overview-time-custom-label">Hiển thị theo:</div>
+                            <div class="overview-chart-segment">
+                                <button type="button" class="overview-chart-toggle is-active" data-overview-granularity="day">Theo ngày</button>
+                                <button type="button" class="overview-chart-toggle" data-overview-granularity="week">Theo tuần</button>
+                                <button type="button" class="overview-chart-toggle" data-overview-granularity="month">Theo tháng</button>
+                            </div>
+                            <div class="overview-time-custom-label">Tùy chỉnh:</div>
+                            <div class="overview-chart-custom-range">
+                                <div class="overview-chart-custom-row">
+                                    <label>Từ:</label>
+                                    <input type="date" class="overview-chart-date-input" data-overview-custom-from />
+                                </div>
+                                <div class="overview-chart-custom-row">
+                                    <label>Đến:</label>
+                                    <input type="date" class="overview-chart-date-input" data-overview-custom-to />
+                                </div>
+                                <div class="overview-chart-custom-actions">
+                                    <button type="button" class="overview-chart-apply" data-overview-apply-custom>Áp dụng</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
                 <div class="overview-chart-meta">
-                    <div class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:#10b981;"></span><span>Bài đăng (cột)</span></div>
+                    <div class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:#10b981;"></span><span>Buzz (cột)</span></div>
                     <div class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:#38bdf8;"></span><span>Lượt xem (đường)</span></div>
-                    <div class="overview-chart-period" data-overview-chart-period>{html.escape(f"Tổng cộng {format_compact_metric(total_views)} views")}</div>
                 </div>
+                <div class="overview-chart-brand-legend" data-overview-brand-legend></div>
                 <div class="overview-chart-frame">
                     <svg class="overview-chart-svg" data-overview-chart-svg viewBox="0 0 960 320" preserveAspectRatio="none" aria-label="Sơ đồ hiệu suất tổng thể"></svg>
                     <div class="overview-chart-single hidden" data-overview-chart-single></div>
                     <div class="overview-chart-empty hidden" data-overview-chart-empty>
-                        {html.escape("Chưa có dữ liệu ngày quét trong các sheet đã lưu để dựng sơ đồ." if saved_entries else "Sheet này chưa có dữ liệu ngày quét để dựng sơ đồ.")}
+                        {html.escape("Chưa có dữ liệu ngày air bài trong các sheet đã lưu để dựng sơ đồ." if saved_entries else "Sheet này chưa có dữ liệu ngày air bài để dựng sơ đồ.")}
                     </div>
                     <div class="overview-chart-tooltip hidden" data-overview-chart-tooltip></div>
                 </div>
             </div>
 
-            <div class="overview-section-title">Chiến dịch đang diễn ra</div>
-            {campaigns_rendered}
             {overview_error_html}
         </div>
     </section>
@@ -4871,12 +5133,19 @@ def build_posts_panel_html(sheet=None, state=None):
         entry_industry_label = str(entry.get("industry_label", "") or "").strip()
         entry_campaign_description = str(entry.get("campaign_description", "") or "").strip()
         entry_slug = f"{build_dom_slug(entry_sheet_name, 'sheet')}-{entry_index}"
+        
         try:
+            # Check if this sheet is already in SHEET_DATA_CACHE (handled inside get_sheet_records)
+            # but we still want to stagger the calls to get_worksheet/get_sheet_records
+            if entry_index > 0:
+                time.sleep(0.3)
+                
             ws = sheet if (
                 sheet is not None
                 and entry_sheet_id == (runtime_state["active_sheet_id"] or "")
                 and entry_sheet_name == (runtime_state["active_sheet_name"] or "")
             ) else get_worksheet(entry_sheet_name, entry_sheet_id, runtime_state)
+            
             dataset = collect_posts_dataset_for_worksheet(
                 ws,
                 entry_index,
@@ -4907,7 +5176,7 @@ def build_posts_panel_html(sheet=None, state=None):
                 "total_reaction": 0,
                 "total_share": 0,
                 "total_comment": 0,
-                "total_engagement": 0,
+                "total_buzz": 0,
                 "creator_count": 0,
                 "campaign_count": 0,
                 "brand_label": "",
@@ -4949,7 +5218,6 @@ def build_posts_panel_html(sheet=None, state=None):
             "khac": "Khác",
         }
         primary_platform_label = platform_label_map.get(primary_platform_key, "Khác")
-        type_label = campaign_label or "Chưa gắn chiến dịch"
         status_label = "Lỗi đọc" if dataset["error"] else ("Đã lưu" if dataset["total_posts"] > 0 else "Chưa có bài")
         status_class = "posts-row-status-error" if dataset["error"] else ("posts-row-status-ready" if dataset["total_posts"] > 0 else "posts-row-status-empty")
         activity_title = html.escape(dataset["sheet_title"])
@@ -4969,7 +5237,7 @@ def build_posts_panel_html(sheet=None, state=None):
         reaction_text = format_metric_number(dataset.get("total_reaction", 0))
         comment_text = format_metric_number(dataset.get("total_comment", 0))
         share_text = format_metric_number(dataset.get("total_share", 0))
-        engagement_text = format_metric_number(dataset.get("total_engagement", 0))
+        buzz_text = format_metric_number(dataset.get("total_buzz", 0))
         platform_summary = " • ".join(
             [
                 f"{platform_label_map.get(platform_key, platform_key.title())} {count}"
@@ -4978,10 +5246,6 @@ def build_posts_panel_html(sheet=None, state=None):
             ]
         )
         detail_meta_chips = []
-        if campaign_label:
-            detail_meta_chips.append(
-                f'<div class="posts-detail-summary-chip"><i class="fa-regular fa-flag"></i><span>{html.escape(campaign_label)}</span></div>'
-            )
         if brand_label:
             detail_meta_chips.append(
                 f'<div class="posts-detail-summary-chip"><i class="fa-solid fa-tag"></i><span>{html.escape(brand_label)}</span></div>'
@@ -4990,15 +5254,11 @@ def build_posts_panel_html(sheet=None, state=None):
             detail_meta_chips.append(
                 f'<div class="posts-detail-summary-chip"><i class="fa-solid fa-shapes"></i><span>{html.escape(industry_label)}</span></div>'
             )
-        if platform_summary:
-            detail_meta_chips.append(
-                f'<div class="posts-detail-summary-chip"><i class="fa-solid fa-layer-group"></i><span>{html.escape(platform_summary)}</span></div>'
-            )
         detail_meta_chips_html = "".join(detail_meta_chips)
         sheet_snapshot_url = build_snapshot_url(dataset.get("sheet_id", ""), dataset["sheet_gid"], runtime_state)
         summary_rows_html.append(
             f"""
-            <div class="posts-sheet-list-row" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-master-campaign="{campaign_slug}" data-posts-master-search="{html.escape((dataset['sheet_title'] + ' ' + campaign_label + ' ' + brand_label + ' ' + industry_label).lower(), quote=True)}">
+            <div class="posts-sheet-list-row" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-master-campaign="all" data-posts-master-search="{html.escape((dataset['sheet_title'] + ' ' + brand_label + ' ' + industry_label).lower(), quote=True)}">
                 <div class="posts-sheet-list-cell posts-sheet-list-activity">
                     <div class="posts-sheet-list-title">{activity_title}</div>
                     <div class="posts-sheet-list-sub">{activity_sub}</div>
@@ -5006,12 +5266,6 @@ def build_posts_panel_html(sheet=None, state=None):
                 </div>
                 <div class="posts-sheet-list-cell posts-sheet-list-brand">
                     {brand_html}
-                </div>
-                <div class="posts-sheet-list-cell posts-sheet-list-campaign">
-                    <div class="posts-sheet-list-campaign-main" title="{html.escape(type_label, quote=True)}">
-                        <i class="fa-regular fa-flag"></i>
-                        <span>{html.escape(type_label)}</span>
-                    </div>
                 </div>
                 <div class="posts-sheet-list-cell">
                     <span class="posts-sheet-list-pill {status_class}">{html.escape(status_label)}</span>
@@ -5021,7 +5275,7 @@ def build_posts_panel_html(sheet=None, state=None):
                 <div class="posts-sheet-list-cell posts-sheet-list-cell-metric">{reaction_text}</div>
                 <div class="posts-sheet-list-cell posts-sheet-list-cell-metric">{comment_text}</div>
                 <div class="posts-sheet-list-cell posts-sheet-list-cell-metric">{share_text}</div>
-                <div class="posts-sheet-list-cell posts-sheet-list-cell-metric posts-sheet-list-cell-metric-strong">{engagement_text}</div>
+                <div class="posts-sheet-list-cell posts-sheet-list-cell-metric">{buzz_text}</div>
                 <div class="posts-sheet-list-cell posts-sheet-list-actions">
                     <div class="posts-sheet-actions-menu">
                         <button type="button" class="posts-sheet-actions-toggle" data-posts-sheet-action-toggle aria-haspopup="true" aria-expanded="false">
@@ -5035,7 +5289,6 @@ def build_posts_panel_html(sheet=None, state=None):
                                 data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}"
                                 data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}"
                                 data-posts-sheet-brand="{html.escape(brand_label, quote=True)}"
-                                data-posts-sheet-campaign="{html.escape(campaign_label, quote=True)}"
                                 data-posts-sheet-industry="{html.escape(industry_label, quote=True)}"
                             >
                                 <i class="fa-regular fa-pen-to-square"></i>
@@ -5106,20 +5359,28 @@ def build_posts_panel_html(sheet=None, state=None):
                             <div class="posts-detail-summary-label">Share</div>
                             <div class="posts-detail-summary-value">{share_text}</div>
                         </div>
-                        <div class="posts-detail-summary-card">
-                            <div class="posts-detail-summary-label">Engagement</div>
-                            <div class="posts-detail-summary-value">{engagement_text}</div>
-                        </div>
                     </div>
                 </div>
                 <div class="posts-toolbar rounded-[1.5rem] p-4 md:p-5">
                     <div class="posts-toolbar-row">
                         <label class="posts-search-shell">
                             <i class="fa-solid fa-magnifying-glass text-slate-400"></i>
-                            <input type="text" placeholder="Tìm kiếm bài đăng, creator hoặc chiến dịch..." class="posts-search-input posts-search-field" />
+                            <input type="text" placeholder="Tìm kiếm bài đăng hoặc creator..." class="posts-search-input posts-search-field" />
                         </label>
                         <div class="posts-toolbar-actions">
                             <div class="text-xs text-slate-400 font-bold px-3 py-2 rounded-xl border border-white/10 bg-slate-900/60" data-posts-selection-count>0 bài đã chọn</div>
+                            <div class="posts-columns-wrap">
+                                <button type="button" class="posts-toolbar-btn posts-columns-toggle" data-post-columns-toggle>
+                                    <i class="fa-solid fa-sliders"></i> Cột hiển thị
+                                </button>
+                                <div class="posts-columns-popover hidden" data-post-columns-menu>
+                                    <div class="posts-columns-head">
+                                        <div class="posts-columns-title">Cột hiển thị · <span data-post-columns-count>0/0</span></div>
+                                        <button type="button" class="posts-columns-all" data-post-columns-show-all>Tất cả</button>
+                                    </div>
+                                    <div class="posts-columns-list" data-post-columns-list></div>
+                                </div>
+                            </div>
                             <button type="button" class="posts-toolbar-btn posts-rerun-btn"><i class="fa-solid fa-rotate-left"></i> Chạy lại</button>
                         </div>
                     </div>
@@ -5134,23 +5395,22 @@ def build_posts_panel_html(sheet=None, state=None):
                             <thead>
                                 <tr>
                                     <th class="posts-check-col"><input type="checkbox" class="posts-table-check posts-select-all" data-select-all-posts aria-label="Chọn tất cả" /></th>
-                                    <th>Nội dung</th>
-                                    <th>Creator</th>
-                                    <th>Trạng thái</th>
-                                    <th>Plan</th>
-                                    <th>Line</th>
-                                    <th>Tier</th>
-                                    <th>Ngày quét</th>
-                                    <th class="text-right">View</th>
-                                    <th class="text-right">Reaction</th>
-                                    <th class="text-right">Share</th>
-                                    <th class="text-right">Comment</th>
-                                    <th class="text-right">Engagement</th>
-                                    <th>Chiến dịch</th>
+                                    <th data-post-col="content">Nội dung</th>
+                                    <th data-post-col="creator">Creator</th>
+                                    <th data-post-col="status">Trạng thái</th>
+                                    <th data-post-col="plan">Plan</th>
+                                    <th data-post-col="line">Line</th>
+                                    <th data-post-col="tier">Tier</th>
+                                    <th data-post-col="date">Ngày quét</th>
+                                    <th class="text-right" data-post-col="view">View</th>
+                                    <th class="text-right" data-post-col="reaction">Reaction</th>
+                                    <th class="text-right" data-post-col="share">Share</th>
+                                    <th class="text-right" data-post-col="comment">Comment</th>
+                                    <th class="text-right" data-post-col="buzz">Buzz</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {dataset["rows_html"] if dataset["rows_html"] else '<tr><td colspan="11" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'}
+                                {dataset["rows_html"] if dataset["rows_html"] else '<tr><td colspan="13" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'}
                             </tbody>
                         </table>
                     </div>
@@ -5163,10 +5423,6 @@ def build_posts_panel_html(sheet=None, state=None):
         )
 
     saved_count = len(datasets)
-    master_campaign_chips_html = "".join(
-        f'<button type="button" class="posts-chip{" is-active" if idx == 0 else ""}" data-master-campaign="{build_dom_slug(label or "khong-gan", "campaign")}">{html.escape(label)} <span>{count}</span></button>'
-        for idx, (label, count) in enumerate(sorted(campaign_counts.items(), key=lambda item: (-item[1], item[0].lower())), start=1)
-    )
     return f"""
     <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
         <div class="flex flex-col gap-5">
@@ -5187,12 +5443,8 @@ def build_posts_panel_html(sheet=None, state=None):
                         <div class="posts-toolbar-row">
                             <label class="posts-search-shell">
                                 <i class="fa-solid fa-magnifying-glass text-slate-400"></i>
-                                <input type="text" placeholder="Tìm sheet, thương hiệu hoặc chiến dịch..." class="posts-search-input posts-master-search-field" />
+                                <input type="text" placeholder="Tìm sheet hoặc thương hiệu..." class="posts-search-input posts-master-search-field" />
                             </label>
-                        </div>
-                        <div class="posts-filter-row">
-                            <button type="button" class="posts-chip is-active" data-master-campaign="all">Tất cả <span>{saved_count}</span></button>
-                            {master_campaign_chips_html}
                         </div>
                     </div>
                     <div class="posts-sheet-summary-grid">
@@ -5200,21 +5452,20 @@ def build_posts_panel_html(sheet=None, state=None):
                             <div class="posts-sheet-list-head">
                                 <div>Hoạt động</div>
                                 <div>Thương hiệu</div>
-                                <div>Chiến dịch</div>
                                 <div>Trạng thái</div>
                                 <div class="posts-sheet-list-head-metric">Bài đăng</div>
                                 <div class="posts-sheet-list-head-metric">View</div>
                                 <div class="posts-sheet-list-head-metric">Reaction</div>
                                 <div class="posts-sheet-list-head-metric">Comment</div>
                                 <div class="posts-sheet-list-head-metric">Share</div>
-                                <div class="posts-sheet-list-head-metric">Engagement</div>
+                                <div class="posts-sheet-list-head-metric">Buzz</div>
                                 <div class="posts-sheet-list-head-action"><i class="fa-solid fa-ellipsis-vertical"></i></div>
                             </div>
                             {"".join(summary_rows_html)}
                         </div>
                     </div>
                     <div class="posts-empty-state posts-master-empty-panel hidden mt-4">
-                        Không có sheet nào khớp bộ lọc chiến dịch hiện tại.
+                        Không có sheet nào khớp bộ lọc hiện tại.
                     </div>
                 </div>
             </div>
@@ -5239,6 +5490,7 @@ def build_posts_panel_html(sheet=None, state=None):
     """
 
 def build_row_updates(col_map, platform, now, stats):
+    stats = stats or {}
     row_updates = []
     if col_map.get("date"):
         row_updates.append(("date", col_map["date"], now))
@@ -5260,6 +5512,9 @@ def build_row_updates(col_map, platform, now, stats):
         if stat_key not in stats or stats.get(stat_key) is None:
             continue
         row_updates.append((field, col_map[field], int(stats.get(stat_key, 0))))
+    if col_map.get("buzz") and ("s" in stats or "c" in stats):
+        buzz_value = int(stats.get("s") or 0) + int(stats.get("c") or 0)
+        row_updates.append(("buzz", col_map["buzz"], buzz_value))
     return row_updates
 
 
@@ -5271,7 +5526,7 @@ def ensure_dashboard_date_column(sheet, layout=None, col_map=None, state=None):
     return resolved_col_map
 
 def normalize_cell_value(field, value):
-    if field in {"view", "like", "share", "comment", "save"}:
+    if field in {"view", "like", "share", "comment", "buzz", "save"}:
         try:
             return int(str(value).strip())
         except Exception:
@@ -5293,6 +5548,8 @@ def get_missing_metric_fields(col_map, stats):
             continue
         if not stats or stat_key not in stats or stats.get(stat_key) is None:
             missing_fields.append(field)
+    if col_map.get("buzz") and (not stats or ("s" not in stats and "c" not in stats)):
+        missing_fields.append("buzz")
     return missing_fields
 
 
@@ -5393,6 +5650,7 @@ def resolve_target_row_index(target, urls, min_row: int = 2):
 # --- Logic quet du lieu ---
 def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] = None, targets=None, source: str = "manual", state=None, multi_tabs=None):
     runtime_state = resolve_runtime_state(state)
+    add_log("⚙️ Đang khởi tạo bộ máy quét...", runtime_state)
     logger = lambda message: add_log(message, runtime_state)
     run_binding_keys = set()
     started_at = datetime.now()
@@ -5652,6 +5910,13 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     tp = runtime_state["tab_progress"].get(tab_name)
                     if tp:
                         tp["status"] = "stopped" if not runtime_state["is_running"] else "completed"
+            except Exception as tab_exc:
+                with state_lock:
+                    tp = runtime_state["tab_progress"].get(tab_name)
+                    if tp:
+                        tp["status"] = "error"
+                    shared["failed"] += max(1, len(row_plan) - int((tp or {}).get("current", 0)))
+                    logger(f"[{tab_name}] Lỗi tab: {str(tab_exc)[:100]}")
             finally:
                 close_selenium_driver(tab_driver)
 
@@ -5726,10 +5991,6 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         # Drivers are closed inside scan_one_tab's finally block
 
 # --- API & UI ---
-@app.on_event("startup")
-def on_startup():
-    ensure_scheduler_thread()
-
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     current_user = get_current_user(request)
@@ -5918,6 +6179,7 @@ def start_task(
     like: Optional[str] = None,
     share: Optional[str] = None,
     comment: Optional[str] = None,
+    buzz: Optional[str] = None,
     save: Optional[str] = None,
     start_row: Optional[str] = None,
 ):
@@ -5925,7 +6187,8 @@ def start_task(
     if auth_response:
         return auth_response
     runtime_state = get_runtime_state(current_user)
-    if any(val is not None for val in (date, air_date, link, view, like, share, comment, save)):
+    add_log("► Nhận lệnh Bắt đầu...", runtime_state)
+    if any(val is not None for val in (date, air_date, link, view, like, share, comment, buzz, save)):
         try:
             parsed_columns = parse_column_override_candidates(
                 {
@@ -5936,6 +6199,7 @@ def start_task(
                     "like": like,
                     "share": share,
                     "comment": comment,
+                    "buzz": buzz,
                     "save": save,
                 }
             )
@@ -6066,6 +6330,21 @@ def set_sheet(request: Request, sheet_name: str = "", sheet_url: str = ""):
         ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
         detected_text = format_detected_columns_text(detect_sheet_layout(ws), runtime_state)
         add_log(detected_text, runtime_state)
+        # Invalidate cache for this sheet when actively modified
+        global SHEET_DATA_CACHE, DASHBOARD_CACHE
+        cache_key = f"{runtime_state['active_sheet_id']}:{runtime_state['active_sheet_name']}"
+        if cache_key in SHEET_DATA_CACHE:
+            del SHEET_DATA_CACHE[cache_key]
+        
+        # Also invalidate dashboard cache for this user to force refresh
+        for section in ["overview", "posts", "config"]:
+            dict_key = f"{current_user['email']}:{section}"
+            if dict_key in DASHBOARD_CACHE:
+                del DASHBOARD_CACHE[dict_key]
+        
+        save_sheet_data_cache(SHEET_DATA_CACHE)
+        save_dashboard_cache(DASHBOARD_CACHE)
+
         if is_fetch_request(request):
             return build_ui_json_response(
                 f"Đã nhập sheet thành công. {detected_text}",
@@ -6085,6 +6364,83 @@ def set_sheet(request: Request, sheet_name: str = "", sheet_url: str = ""):
         if is_fetch_request(request):
             return build_ui_json_response("Không tìm thấy tab sheet. Kiểm tra lại tên tab và quyền truy cập.", level="error", ok=False, state=runtime_state)
         return HTMLResponse("<html><script>window.location.href='/?sheet_error=1';</script></html>")
+
+
+@app.post("/save-selected-sheets")
+async def save_selected_sheets(request: Request):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return auth_response
+    runtime_state = get_runtime_state(current_user)
+    if runtime_state["is_running"]:
+        return build_ui_json_response("Đang quét dữ liệu nên chưa lưu sheet được.", level="warning", ok=False, state=runtime_state)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    sheet_url = str((payload or {}).get("sheet_url", "") or "").strip()
+    requested_sheet_id = extract_sheet_id(sheet_url) if sheet_url else (runtime_state.get("active_sheet_id") or "")
+    if not requested_sheet_id:
+        return build_ui_json_response("Link/ID spreadsheet không hợp lệ.", level="error", ok=False, state=runtime_state)
+
+    raw_tabs = (payload or {}).get("tabs", [])
+    tab_items = []
+    if isinstance(raw_tabs, list):
+        for item in raw_tabs:
+            if isinstance(item, dict):
+                title = str(item.get("title", "") or "").strip()
+                gid = str(item.get("gid", "") or "0").strip() or "0"
+            else:
+                title = str(item or "").strip()
+                gid = "0"
+            if title:
+                tab_items.append({"title": title, "gid": gid})
+    if not tab_items:
+        return build_ui_json_response("Hãy chọn ít nhất 1 tab sheet để lưu.", level="warning", ok=False, state=runtime_state)
+
+    saved_count = 0
+    first_ws = None
+    first_tab = tab_items[0]
+    for item in tab_items:
+        tab_name = item["title"]
+        tab_gid = item["gid"]
+        try:
+            ws = get_worksheet(tab_name, requested_sheet_id, runtime_state)
+        except Exception as exc:
+            return build_ui_json_response(
+                f"Không truy cập được tab '{tab_name}'. Kiểm tra lại quyền truy cập sheet.",
+                level="error",
+                ok=False,
+                state=runtime_state,
+            )
+        if first_ws is None:
+            first_ws = ws
+        save_sheet_entry(
+            requested_sheet_id,
+            tab_name,
+            tab_gid,
+            owner_email=runtime_state["owner_email"],
+        )
+        saved_count += 1
+
+    set_active_sheet(first_tab["title"], requested_sheet_id, runtime_state)
+    runtime_state["active_sheet_gid"] = first_tab["gid"]
+    add_log(f"Đã lưu {saved_count} tab sheet: {', '.join(item['title'] for item in tab_items)}", runtime_state)
+    for item in tab_items:
+        add_log(f"[{item['title']}] Đã thêm vào danh sách tab quét", runtime_state)
+    return build_ui_json_response(
+        f"Đã lưu {saved_count} tab sheet. Bạn có thể cấu hình từng tab rồi bấm Bắt đầu để quét cùng lúc.",
+        level="success",
+        extra={
+            "overview_html": build_overview_panel_for_state(runtime_state, sheet=first_ws),
+            "column_config": build_column_config_payload(first_ws, runtime_state),
+            "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
+            "posts_html": build_posts_panel_html(first_ws, runtime_state),
+            "campaign_html": build_campaign_panel_html(runtime_state),
+            "schedule_config": build_schedule_config_payload(runtime_state),
+        },
+        state=runtime_state,
+    )
 
 
 @app.post("/set-schedule-targets")
@@ -6390,7 +6746,7 @@ def detect_tab_columns(request: Request, tab_name: str = ""):
         raw_columns = layout.get("columns") or {}
         tab_overrides = runtime_state.get("column_overrides_by_tab", {}).get(resolved_tab)
         col_map = apply_column_overrides(raw_columns, overrides=tab_overrides) if tab_overrides else apply_column_overrides(raw_columns, state=runtime_state)
-        fields = ["date", "air_date", "link", "view", "like", "share", "comment", "save"]
+        fields = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"]
         detected_inputs = {}
         for field in fields:
             col_idx = col_map.get(field)
@@ -6402,6 +6758,8 @@ def detect_tab_columns(request: Request, tab_name: str = ""):
                 saved_overrides[field] = col_to_a1(col_idx) if col_idx else ""
         header_row = max(1, int(layout.get("header_row") or 1))
         start_row = resolve_effective_start_row(header_row, runtime_state)
+        detected_count = sum(1 for value in detected_inputs.values() if value)
+        add_log(f"[{resolved_tab}] AUTO nhận {detected_count} cột ở header dòng {header_row}", runtime_state)
         result = {
             "ok": True,
             "tab_name": resolved_tab,
@@ -6452,6 +6810,7 @@ def set_columns(
     like: Optional[str] = None,
     share: Optional[str] = None,
     comment: Optional[str] = None,
+    buzz: Optional[str] = None,
     save: Optional[str] = None,
     start_row: Optional[str] = None,
     tab_name: Optional[str] = None,
@@ -6478,7 +6837,7 @@ def set_columns(
             return build_ui_json_response("Đang quét dữ liệu nên chưa lưu cấu hình được.", level="warning", ok=False, state=runtime_state)
         return HTMLResponse("<html><script>window.location.href='/?sheet_error=2';</script></html>")
 
-    candidates = {"date": date, "air_date": air_date, "link": link, "view": view, "like": like, "share": share, "comment": comment, "save": save}
+    candidates = {"date": date, "air_date": air_date, "link": link, "view": view, "like": like, "share": share, "comment": comment, "buzz": buzz, "save": save}
     parsed = {}
     for field, val in candidates.items():
         if (val or "").strip() == "":
@@ -6613,6 +6972,71 @@ async def set_sheet_campaign(request: Request):
 
     return build_ui_json_response(
         "Đã lưu chiến dịch cho sheet." if campaign_label else "Đã xóa chiến dịch khỏi sheet.",
+        level="success",
+        extra={
+            "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
+            "posts_html": build_posts_panel_html(active_ws, runtime_state),
+            "campaign_html": build_campaign_panel_html(runtime_state),
+        },
+        state=runtime_state,
+    )
+
+
+@app.post("/api/update-sheet-metadata")
+async def api_update_sheet_metadata(request: Request):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return auth_response
+    runtime_state = get_runtime_state(current_user)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    sheet_id = str((payload or {}).get("sheet_id", "") or "").strip()
+    original_name = str((payload or {}).get("original_name", "") or "").strip()
+    new_name = str((payload or {}).get("sheet_name", "") or "").strip()
+    campaign_label = str((payload or {}).get("campaign_label", "") or "").strip()
+    brand_label = str((payload or {}).get("brand_label", "") or "").strip()
+    industry_label = str((payload or {}).get("industry_label", "") or "").strip()
+
+    if not sheet_id or not original_name:
+        return build_ui_json_response("Thiếu thông tin sheet để cập nhật.", level="error", ok=False, state=runtime_state)
+    if not new_name:
+        return build_ui_json_response("Tên hiển thị không được để trống.", level="warning", ok=False, state=runtime_state)
+
+    updated_entries = update_saved_sheet_metadata(
+        sheet_id=sheet_id,
+        sheet_name=original_name,
+        new_sheet_name=new_name,
+        campaign_label=campaign_label,
+        brand_label=brand_label,
+        industry_label=industry_label,
+        owner_email=runtime_state["owner_email"],
+    )
+    if not updated_entries:
+        return build_ui_json_response("Không tìm thấy sheet để cập nhật.", level="warning", ok=False, state=runtime_state)
+
+    if campaign_label:
+        save_campaign_label(campaign_label, owner_email=runtime_state["owner_email"])
+
+    add_log(
+        f"Đã cập nhật thông tin sheet '{original_name}' -> '{new_name}'"
+        + (f" | BRAND={brand_label}" if brand_label else "")
+        + (f" | CAMPAIGN={campaign_label}" if campaign_label else "")
+        + (f" | INDUSTRY={industry_label}" if industry_label else ""),
+        runtime_state,
+    )
+
+    active_ws = None
+    if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
+        try:
+            active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
+        except Exception:
+            active_ws = None
+
+    return build_ui_json_response(
+        "Đã lưu thay đổi thông tin sheet.",
         level="success",
         extra={
             "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
@@ -6758,6 +7182,23 @@ def status(request: Request):
     return build_ui_state(get_runtime_state(current_user))
 
 
+@app.post("/client-log")
+async def client_log(request: Request):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return auth_response
+    runtime_state = get_runtime_state(current_user)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    message = str((payload or {}).get("message", "") or "").strip()
+    if not message:
+        return build_ui_json_response("Bỏ qua log rỗng.", level="warning", ok=False, state=runtime_state)
+    add_log(message, runtime_state)
+    return build_ui_json_response("Đã cập nhật nhật ký hoạt động.", level="info", state=runtime_state)
+
+
 @app.get("/sheet-tabs")
 def sheet_tabs(request: Request, sheet_url: str = ""):
     current_user, auth_response = require_authenticated_user(request)
@@ -6796,6 +7237,26 @@ def sheet_tabs(request: Request, sheet_url: str = ""):
             "message": f"Tìm thấy {len(tabs)} tab trong spreadsheet.",
         }
     except Exception as exc:
+        exc_lower = str(exc).lower()
+        is_quota = "quota" in exc_lower or "429" in exc_lower or "readrequests" in exc_lower
+        # On quota errors, fall back to stale cache if available
+        stale_entry = SHEET_TABS_CACHE.get(requested_sheet_id)
+        if is_quota and stale_entry and stale_entry.get("tabs"):
+            return {
+                "ok": True,
+                "sheet_id": requested_sheet_id,
+                "tabs": stale_entry["tabs"],
+                "message": "Hệ thống đang bận (Google API giới hạn). Đang hiển thị danh sách tab từ lần truy cập trước.",
+                "stale": True,
+            }
+        if is_quota:
+            return {
+                "ok": False,
+                "sheet_id": requested_sheet_id,
+                "tabs": [],
+                "message": "Google Sheet đang chạm giới hạn đọc dữ liệu. Vui lòng chờ 30–60 giây rồi thử lại.",
+                "quota_error": True,
+            }
         return {
             "ok": False,
             "sheet_id": requested_sheet_id,
@@ -6809,30 +7270,25 @@ def api_dashboard_overview(background_tasks: BackgroundTasks, request: Request):
     if auth_response:
         return {"error": "Unauthorized", "html": ""}
     
+    runtime_state = get_runtime_state(current_user)
+    active_ws = None
+    if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
+        try:
+            active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
+        except Exception:
+            active_ws = None
+
+    html_content = build_overview_panel_for_state(runtime_state, sheet=active_ws)
+    now_str = datetime.now().isoformat()
     user_email = current_user.get("email", "")
-    now = datetime.now()
-    
+
     global DASHBOARD_CACHE
     if not DASHBOARD_CACHE:
         DASHBOARD_CACHE = load_dashboard_cache()
-        
-    cache_entry = DASHBOARD_CACHE.get(f"{user_email}:overview")
-    needs_refresh = True
-    cached_html = None
-    
-    if cache_entry:
-        updated_at = datetime.fromisoformat(cache_entry["updated_at"])
-        cached_html = cache_entry["html"]
-        if (now - updated_at).total_seconds() < DASHBOARD_CACHE_TTL_SECONDS:
-            needs_refresh = False
+    DASHBOARD_CACHE[f"{user_email}:overview"] = {"updated_at": now_str, "html": html_content}
+    save_dashboard_cache(DASHBOARD_CACHE)
 
-    if needs_refresh:
-        background_tasks.add_task(background_refresh_dashboard_data, user_email, "overview")
-
-    if cached_html:
-        return {"ok": True, "status": "ready", "html": cached_html, "cached": True, "refreshing": needs_refresh}
-    
-    return {"ok": True, "status": "processing", "html": ""}
+    return {"ok": True, "status": "ready", "html": html_content, "cached": False, "refreshing": False}
 
 @app.get("/api/dashboard/posts")
 def api_dashboard_posts(background_tasks: BackgroundTasks, request: Request):
@@ -7064,9 +7520,9 @@ def home(request: Request):
             .system-log-line {{
                 display: flex;
                 gap: 10px;
-                padding: 12px 0;
+                padding: 9px 0;
                 border-bottom: 1px solid rgba(148, 163, 184, 0.08);
-                line-height: 1.65;
+                line-height: 1.45;
             }}
             .system-log-line:last-child {{
                 border-bottom: 0;
@@ -7093,6 +7549,13 @@ def home(request: Request):
                 font-style: italic;
                 word-break: break-word;
             }}
+            .system-log-tab {{
+                color: #22d3ee;
+                font-weight: 950;
+                font-style: normal;
+                white-space: nowrap;
+                flex: 0 0 auto;
+            }}
             .system-log-empty {{
                 margin-top: 5rem;
                 text-align: center;
@@ -7115,6 +7578,11 @@ def home(request: Request):
                 border: 0 !important;
                 background: transparent !important;
                 padding: 10px 12px !important;
+            }}
+            .date-shell input[type="date"]::-webkit-calendar-picker-indicator {{
+                cursor: pointer;
+                opacity: 0.95;
+                filter: invert(92%) sepia(12%) saturate(638%) hue-rotate(169deg) brightness(107%) contrast(94%);
             }}
             .date-picker-btn {{
                 width: 44px;
@@ -7353,10 +7821,6 @@ def home(request: Request):
                 color: #60a5fa;
                 background: rgba(59, 130, 246, 0.14);
             }}
-            .icon-engagement {{
-                color: #38bdf8;
-                background: rgba(56, 189, 248, 0.14);
-            }}
             .icon-creator {{
                 color: #c084fc;
                 background: rgba(168, 85, 247, 0.14);
@@ -7468,7 +7932,7 @@ def home(request: Request):
             }}
             .overview-campaign-metrics {{
                 display: grid;
-                grid-template-columns: repeat(4, minmax(0, 1fr));
+                grid-template-columns: repeat(3, minmax(0, 1fr));
                 gap: 12px;
                 margin-top: 14px;
             }}
@@ -7482,9 +7946,6 @@ def home(request: Request):
             }}
             .metric-views {{
                 background: rgba(71, 85, 105, 0.28);
-            }}
-            .metric-engagement {{
-                background: rgba(14, 116, 144, 0.22);
             }}
             .metric-creators {{
                 background: rgba(88, 28, 135, 0.24);
@@ -7528,6 +7989,7 @@ def home(request: Request):
                 color: #94a3b8;
             }}
             .overview-chart-card {{
+                position: relative;
                 padding: 18px;
                 border-radius: 22px;
                 background:
@@ -7542,31 +8004,116 @@ def home(request: Request):
                 align-items: flex-start;
                 justify-content: space-between;
                 gap: 14px;
+                padding-right: 58px;
             }}
-            .overview-chart-control-wrap {{
+            .overview-head-actions {{
                 display: flex;
                 align-items: center;
                 gap: 8px;
                 flex-wrap: wrap;
                 justify-content: flex-end;
             }}
+            .overview-filter-trigger {{
+                display: inline-flex;
+                align-items: center;
+                gap: 10px;
+                height: 36px;
+                padding: 0 14px;
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                background: rgba(15, 23, 42, 0.7);
+                color: #cbd5e1;
+                font-size: 13px;
+                font-weight: 800;
+                letter-spacing: 0.01em;
+                cursor: pointer;
+            }}
+            .overview-filter-trigger i {{
+                font-size: 14px;
+            }}
+            .overview-filter-trigger-chevron {{
+                transition: transform 0.2s ease;
+            }}
+            .overview-filter-trigger:hover {{
+                color: #f8fafc;
+                border-color: rgba(56, 189, 248, 0.45);
+                box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.12);
+            }}
+            .overview-filter-trigger.is-active {{
+                color: #f8fafc;
+                border-color: rgba(56, 189, 248, 0.5);
+                background: linear-gradient(135deg, rgba(30, 64, 175, 0.85), rgba(14, 116, 144, 0.85));
+            }}
+            .overview-filter-trigger.is-active .overview-filter-trigger-chevron {{
+                transform: rotate(180deg);
+            }}
+            .overview-chart-filter-anchor {{
+                position: absolute;
+                top: 56px;
+                right: 18px;
+                z-index: 12;
+            }}
+            .overview-chart-control-wrap {{
+                display: flex;
+                align-items: flex-start;
+                gap: 4px;
+                flex-wrap: wrap;
+                justify-content: flex-end;
+                padding: 4px;
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 0.18);
+                background: rgba(2, 6, 23, 0.92);
+                box-shadow: 0 18px 32px rgba(2, 6, 23, 0.45);
+            }}
+            .overview-time-filter-card {{
+                width: min(400px, calc(100vw - 56px));
+                padding: 7px;
+                border-radius: 10px;
+                background: rgba(15, 23, 42, 0.68);
+                border: 1px solid rgba(148, 163, 184, 0.14);
+            }}
+            .overview-time-filter-title {{
+                font-size: 11px;
+                font-weight: 900;
+                color: #f1f5f9;
+                margin-bottom: 6px;
+            }}
+            .overview-time-filter-grid {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 5px;
+            }}
+            .overview-time-filter-grid .overview-chart-toggle {{
+                min-height: 34px;
+                padding: 6px 9px;
+                font-size: 11px;
+                letter-spacing: 0.02em;
+            }}
+            .overview-time-custom-label {{
+                margin-top: 8px;
+                padding-top: 6px;
+                border-top: 1px solid rgba(148, 163, 184, 0.2);
+                font-size: 11px;
+                font-weight: 900;
+                color: #cbd5e1;
+            }}
             .overview-chart-segment {{
                 display: inline-flex;
                 align-items: center;
                 gap: 6px;
-                padding: 5px;
-                border-radius: 14px;
+                padding: 4px;
+                border-radius: 12px;
                 background: rgba(15, 23, 42, 0.62);
                 border: 1px solid rgba(148, 163, 184, 0.12);
                 box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
             }}
             .overview-chart-toggle {{
-                border: 0;
+                border: 1px solid rgba(148, 163, 184, 0.2);
                 border-radius: 10px;
                 padding: 8px 11px;
-                background: transparent;
+                background: rgba(15, 23, 42, 0.55);
                 color: #cbd5e1;
-                font-size: 11px;
+                font-size: 12px;
                 font-weight: 800;
                 letter-spacing: 0.04em;
                 cursor: pointer;
@@ -7581,12 +8128,72 @@ def home(request: Request):
                 color: #eff6ff;
                 box-shadow: 0 10px 22px rgba(37, 99, 235, 0.22);
             }}
+            .overview-chart-toggle-full {{
+                grid-column: 1 / -1;
+            }}
             .overview-chart-meta {{
                 display: flex;
                 align-items: center;
                 gap: 10px;
                 flex-wrap: wrap;
                 margin-top: 12px;
+            }}
+            .overview-chart-custom-range {{
+                margin-top: 6px;
+                display: grid;
+                gap: 6px;
+            }}
+            .overview-chart-custom-row {{
+                display: grid;
+                grid-template-columns: 42px minmax(120px, 1fr);
+                align-items: center;
+                gap: 5px;
+            }}
+            .overview-chart-custom-range label {{
+                font-size: 10px;
+                font-weight: 800;
+                color: #94a3b8;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+            }}
+            .overview-chart-custom-actions {{
+                display: flex;
+                justify-content: flex-end;
+            }}
+            .overview-chart-date-input {{
+                height: 28px;
+                border-radius: 8px;
+                border: 1px solid rgba(148, 163, 184, 0.18);
+                background: rgba(15, 23, 42, 0.75);
+                color: #e2e8f0;
+                padding: 0 8px;
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            .overview-chart-date-input::-webkit-calendar-picker-indicator {{
+                cursor: pointer;
+                opacity: 0.95;
+                filter: invert(92%) sepia(12%) saturate(638%) hue-rotate(169deg) brightness(107%) contrast(94%);
+            }}
+            .overview-chart-date-input:focus {{
+                outline: none;
+                border-color: rgba(56, 189, 248, 0.45);
+                box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15);
+            }}
+            .overview-chart-apply {{
+                height: 28px;
+                border: 1px solid rgba(14, 165, 233, 0.4);
+                border-radius: 8px;
+                padding: 0 9px;
+                background: linear-gradient(135deg, rgba(14, 165, 233, 0.25), rgba(2, 132, 199, 0.2));
+                color: #dbeafe;
+                font-size: 10px;
+                font-weight: 800;
+                letter-spacing: 0.04em;
+                cursor: pointer;
+            }}
+            .overview-chart-apply:hover {{
+                background: linear-gradient(135deg, rgba(14, 165, 233, 0.35), rgba(2, 132, 199, 0.3));
             }}
             .overview-chart-legend-item {{
                 display: inline-flex;
@@ -7614,21 +8221,17 @@ def home(request: Request):
                 background: #c084fc;
                 box-shadow: 0 0 0 5px rgba(192, 132, 252, 0.12);
             }}
-            .overview-chart-period {{
-                margin-left: auto;
-                font-size: 11px;
-                font-weight: 800;
-                color: #8fb0cf;
-                padding: 7px 11px;
-                border-radius: 999px;
-                background: rgba(14, 165, 233, 0.1);
-                border: 1px solid rgba(34, 211, 238, 0.16);
+            .overview-chart-brand-legend {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-top: 10px;
             }}
             .overview-chart-frame {{
                 position: relative;
                 margin-top: 14px;
                 padding: 12px;
-                min-height: 300px;
+                min-height: 410px;
                 border-radius: 20px;
                 background:
                     radial-gradient(circle at 12% 0%, rgba(59, 130, 246, 0.1), transparent 32%),
@@ -7649,7 +8252,7 @@ def home(request: Request):
             .overview-chart-svg {{
                 display: block;
                 width: 100%;
-                height: 260px;
+                height: 370px;
                 overflow: visible;
                 position: relative;
                 z-index: 1;
@@ -7806,7 +8409,7 @@ def home(request: Request):
                 display: flex;
                 align-items: flex-start;
                 justify-content: space-between;
-                gap: 20px;
+                gap: 14px;
             }}
             .posts-page-kicker {{
                 font-size: 13px;
@@ -7816,21 +8419,21 @@ def home(request: Request):
             }}
             .posts-page-title {{
                 margin-top: 8px;
-                font-size: clamp(2rem, 4vw, 3rem);
+                font-size: clamp(1.6rem, 2.8vw, 2.2rem);
                 line-height: 1.04;
                 font-weight: 900;
                 letter-spacing: -0.04em;
                 color: #f8fafc;
             }}
             .posts-page-subtitle {{
-                margin-top: 8px;
-                font-size: 15px;
+                margin-top: 6px;
+                font-size: 13px;
                 color: #94a3b8;
             }}
             .posts-counter-pill {{
-                min-width: 180px;
-                padding: 16px 18px;
-                border-radius: 18px;
+                min-width: 138px;
+                padding: 11px 13px;
+                border-radius: 14px;
                 background: linear-gradient(180deg, rgba(23, 31, 48, 0.9), rgba(28, 37, 58, 0.88));
                 border: 1px solid rgba(148, 163, 184, 0.12);
                 box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
@@ -7843,8 +8446,8 @@ def home(request: Request):
                 color: #64748b;
             }}
             .posts-counter-value {{
-                margin-top: 10px;
-                font-size: 24px;
+                margin-top: 6px;
+                font-size: 18px;
                 font-weight: 900;
                 color: #f8fafc;
             }}
@@ -7909,7 +8512,7 @@ def home(request: Request):
             }}
             .posts-sheet-list-head {{
                 display: grid;
-                grid-template-columns: minmax(250px, 2.15fr) minmax(170px, 0.95fr) minmax(180px, 1fr) minmax(150px, 0.84fr) minmax(95px, 0.58fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(100px, 0.7fr) minmax(120px, 0.82fr) minmax(138px, 0.9fr);
+                grid-template-columns: minmax(250px, 2.15fr) minmax(170px, 0.95fr) minmax(150px, 0.84fr) minmax(95px, 0.58fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(100px, 0.7fr) minmax(100px, 0.7fr) minmax(120px, 0.82fr) minmax(138px, 0.9fr);
                 gap: 12px;
                 align-items: center;
                 padding: 12px 16px;
@@ -7923,7 +8526,7 @@ def home(request: Request):
             .posts-sheet-list-row {{
                 width: 100%;
                 display: grid;
-                grid-template-columns: minmax(250px, 2.15fr) minmax(170px, 0.95fr) minmax(180px, 1fr) minmax(150px, 0.84fr) minmax(95px, 0.58fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(100px, 0.7fr) minmax(120px, 0.82fr) minmax(138px, 0.9fr);
+                grid-template-columns: minmax(250px, 2.15fr) minmax(170px, 0.95fr) minmax(150px, 0.84fr) minmax(95px, 0.58fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(100px, 0.7fr) minmax(100px, 0.7fr) minmax(120px, 0.82fr) minmax(138px, 0.9fr);
                 gap: 12px;
                 align-items: center;
                 padding: 12px 16px;
@@ -8034,6 +8637,12 @@ def home(request: Request):
             }}
             .posts-sheet-actions-toggle:hover {{
                 background: rgba(51, 65, 85, 0.82);
+            }}
+            .posts-sheet-actions-toggle:focus,
+            .posts-sheet-actions-toggle:focus-visible {{
+                outline: none;
+                border-color: rgba(56, 189, 248, 0.42);
+                box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.22);
             }}
             .posts-sheet-actions-toggle i {{
                 font-size: 12px;
@@ -8316,21 +8925,21 @@ def home(request: Request):
                 color: #64748b;
             }}
             .posts-tab-panel-title {{
-                margin-top: 8px;
-                font-size: 24px;
+                margin-top: 6px;
+                font-size: 18px;
                 font-weight: 900;
                 color: #f8fafc;
             }}
             .posts-tab-panel-sub {{
-                margin-top: 6px;
-                font-size: 13px;
+                margin-top: 4px;
+                font-size: 12px;
                 color: #94a3b8;
             }}
             .posts-detail-summary-shell {{
                 display: grid;
-                gap: 14px;
-                padding: 18px 20px;
-                border-radius: 22px;
+                gap: 10px;
+                padding: 12px 14px;
+                border-radius: 16px;
                 border: 1px solid rgba(148, 163, 184, 0.12);
                 background: linear-gradient(180deg, rgba(23, 31, 48, 0.9), rgba(28, 37, 58, 0.88));
             }}
@@ -8342,13 +8951,13 @@ def home(request: Request):
             .posts-detail-summary-chip {{
                 display: inline-flex;
                 align-items: center;
-                gap: 8px;
-                padding: 9px 12px;
+                gap: 6px;
+                padding: 6px 9px;
                 border-radius: 999px;
                 border: 1px solid rgba(148, 163, 184, 0.14);
                 background: rgba(15, 23, 42, 0.72);
                 color: #e2e8f0;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 800;
             }}
             .posts-detail-summary-chip i {{
@@ -8358,11 +8967,11 @@ def home(request: Request):
             .posts-detail-summary-grid {{
                 display: grid;
                 grid-template-columns: repeat(6, minmax(0, 1fr));
-                gap: 12px;
+                gap: 8px;
             }}
             .posts-detail-summary-card {{
-                padding: 14px 16px;
-                border-radius: 18px;
+                padding: 9px 11px;
+                border-radius: 12px;
                 border: 1px solid rgba(148, 163, 184, 0.12);
                 background: rgba(15, 23, 42, 0.58);
             }}
@@ -8374,8 +8983,8 @@ def home(request: Request):
                 color: #64748b;
             }}
             .posts-detail-summary-value {{
-                margin-top: 10px;
-                font-size: 24px;
+                margin-top: 6px;
+                font-size: 18px;
                 font-weight: 900;
                 color: #f8fafc;
                 line-height: 1;
@@ -8400,6 +9009,88 @@ def home(request: Request):
                 align-items: center;
                 gap: 12px;
             }}
+            .posts-columns-wrap {{
+                position: relative;
+            }}
+            .posts-columns-popover {{
+                position: absolute;
+                top: calc(100% + 10px);
+                right: 0;
+                width: min(330px, 86vw);
+                padding: 14px 14px 12px;
+                border-radius: 14px;
+                background: #021640;
+                border: 1px solid rgba(96, 165, 250, 0.24);
+                box-shadow: 0 16px 36px rgba(2, 6, 23, 0.55);
+                z-index: 40;
+            }}
+            .posts-columns-head {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                padding-bottom: 12px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+            }}
+            .posts-columns-title {{
+                font-size: 18px;
+                font-weight: 900;
+                color: #f8fafc;
+            }}
+            .posts-columns-all {{
+                border: 0;
+                background: transparent;
+                color: #f8fafc;
+                font-size: 16px;
+                font-weight: 800;
+                border-radius: 8px;
+                padding: 2px 6px;
+                cursor: pointer;
+            }}
+            .posts-columns-all:hover {{
+                color: #bae6fd;
+            }}
+            .posts-columns-list {{
+                max-height: 320px;
+                overflow: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                margin-top: 12px;
+                padding-right: 2px;
+            }}
+            .posts-columns-item {{
+                width: 100%;
+                border: 0;
+                background: transparent;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 8px;
+                color: #f8fafc;
+                font-size: 15px;
+                font-weight: 700;
+                padding: 10px 4px;
+                border-radius: 8px;
+                cursor: pointer;
+            }}
+            .posts-columns-item span {{
+                font-size: 15px;
+                line-height: 1.1;
+            }}
+            .posts-columns-item i {{
+                font-size: 18px;
+                color: #f8fafc;
+            }}
+            .posts-columns-item:hover {{
+                background: rgba(148, 163, 184, 0.1);
+            }}
+            .posts-columns-item.is-hidden {{
+                color: #9fb0cc;
+            }}
+            .posts-columns-item.is-hidden i {{
+                color: #9fb0cc;
+            }}
             .posts-mini-campaign-feedback {{
                 font-size: 12px;
                 font-weight: 700;
@@ -8421,13 +9112,13 @@ def home(request: Request):
             .posts-toolbar-btn {{
                 display: inline-flex;
                 align-items: center;
-                gap: 10px;
-                padding: 12px 15px;
-                border-radius: 14px;
+                gap: 8px;
+                padding: 9px 12px;
+                border-radius: 12px;
                 background: rgba(30, 41, 59, 0.72);
                 border: 1px solid rgba(148, 163, 184, 0.16);
                 color: #e2e8f0;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 800;
                 transition: all 0.2s ease;
             }}
@@ -8438,13 +9129,13 @@ def home(request: Request):
             .posts-search-shell {{
                 display: flex;
                 align-items: center;
-                gap: 12px;
+                gap: 10px;
                 width: 100%;
-                max-width: 560px;
+                max-width: 500px;
                 background: rgba(30, 41, 59, 0.72);
                 border: 1px solid rgba(148, 163, 184, 0.16);
-                border-radius: 14px;
-                padding: 12px 16px;
+                border-radius: 12px;
+                padding: 10px 13px;
             }}
             .posts-search-input {{
                 width: 100%;
@@ -8984,6 +9675,10 @@ def home(request: Request):
                 min-width: 200px;
                 max-width: 320px;
             }}
+            .post-content-wrap {{
+                min-width: 0;
+                max-width: 100%;
+            }}
             .posts-cell-date {{
                 color: #cbd5e1;
                 white-space: nowrap;
@@ -8993,9 +9688,23 @@ def home(request: Request):
                 white-space: nowrap;
                 font-weight: 800;
                 color: #f8fafc;
+                font-variant-numeric: tabular-nums;
+                font-feature-settings: "tnum" 1, "lnum" 1;
+                font-kerning: none;
             }}
             .posts-cell-metric-strong {{
                 color: #dbeafe;
+            }}
+            .posts-table thead th[data-post-col="view"],
+            .posts-table thead th[data-post-col="reaction"],
+            .posts-table thead th[data-post-col="share"],
+            .posts-table thead th[data-post-col="comment"],
+            .posts-table thead th[data-post-col="buzz"] {{
+                text-align: right;
+                padding-right: 16px;
+                font-variant-numeric: tabular-nums;
+                font-feature-settings: "tnum" 1, "lnum" 1;
+                font-kerning: none;
             }}
             .posts-cell-campaign {{
                 min-width: 180px;
@@ -9007,18 +9716,26 @@ def home(request: Request):
                 cursor: pointer;
             }}
             .post-title-link {{
+                display: block;
                 color: #f8fafc;
                 font-weight: 800;
                 line-height: 1.45;
                 text-decoration: none;
+                white-space: normal;
+                overflow-wrap: anywhere;
+                word-break: break-word;
             }}
             .post-title-link:hover {{
                 color: #93c5fd;
             }}
             .post-content-meta {{
+                display: block;
                 margin-top: 8px;
                 font-size: 12px;
                 color: #64748b;
+                white-space: normal;
+                overflow-wrap: anywhere;
+                word-break: break-word;
             }}
             .post-avatar {{
                 width: 42px;
@@ -9684,14 +10401,13 @@ def home(request: Request):
             html[data-theme="light"] .metric-views {{
                 background: rgba(148, 163, 184, 0.16);
             }}
-            html[data-theme="light"] .metric-engagement {{
-                background: rgba(14, 116, 144, 0.1);
-            }}
             html[data-theme="light"] .metric-creators {{
                 background: rgba(168, 85, 247, 0.1);
             }}
             html[data-theme="light"] .overview-action-pill,
             html[data-theme="light"] .overview-chart-segment,
+            html[data-theme="light"] .overview-time-filter-card,
+            html[data-theme="light"] .overview-chart-control-wrap,
             html[data-theme="light"] .posts-toolbar-btn,
             html[data-theme="light"] .posts-chip,
             html[data-theme="light"] .sheet-tab-chip,
@@ -9707,10 +10423,40 @@ def home(request: Request):
                 border-color: rgba(148, 163, 184, 0.18) !important;
                 color: #0f172a;
             }}
+            html[data-theme="light"] .overview-filter-trigger {{
+                background: rgba(255, 255, 255, 0.95);
+                color: #334155;
+                border-color: rgba(148, 163, 184, 0.26);
+            }}
+            html[data-theme="light"] .overview-time-filter-title,
+            html[data-theme="light"] .overview-time-custom-label,
+            html[data-theme="light"] .overview-chart-custom-range label {{
+                color: #334155;
+            }}
+            html[data-theme="light"] .overview-chart-date-input {{
+                background: #ffffff;
+                color: #0f172a;
+                border-color: rgba(148, 163, 184, 0.24);
+            }}
+            html[data-theme="light"] .date-shell input[type="date"]::-webkit-calendar-picker-indicator,
+            html[data-theme="light"] .overview-chart-date-input::-webkit-calendar-picker-indicator {{
+                opacity: 0.9;
+                filter: none;
+            }}
             html[data-theme="light"] .posts-sheet-summary-grid {{
                 background: rgba(255, 255, 255, 0.92) !important;
                 border-color: rgba(148, 163, 184, 0.18) !important;
                 box-shadow: 0 10px 24px rgba(148, 163, 184, 0.1);
+            }}
+            html[data-theme="light"] .posts-columns-popover {{
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(248, 250, 252, 0.99));
+                border-color: rgba(148, 163, 184, 0.22);
+            }}
+            html[data-theme="light"] .posts-columns-title {{
+                color: #0f172a;
+            }}
+            html[data-theme="light"] .posts-columns-item {{
+                color: #0f172a;
             }}
             html[data-theme="light"] .posts-sheet-list-head {{
                 background: rgba(241, 245, 249, 0.96);
@@ -9735,6 +10481,12 @@ def home(request: Request):
                 background: rgba(248, 250, 252, 0.92);
                 border-color: rgba(148, 163, 184, 0.18);
                 color: #0f172a;
+            }}
+            html[data-theme="light"] .posts-sheet-actions-toggle:focus,
+            html[data-theme="light"] .posts-sheet-actions-toggle:focus-visible {{
+                outline: none;
+                border-color: rgba(59, 130, 246, 0.34);
+                box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.16);
             }}
             html[data-theme="light"] .posts-sheet-actions-toggle i {{
                 color: #475569;
@@ -9939,11 +10691,6 @@ def home(request: Request):
                 border-color: rgba(148, 163, 184, 0.22);
                 color: #64748b;
             }}
-            html[data-theme="light"] .overview-chart-period {{
-                background: rgba(59, 130, 246, 0.1);
-                border-color: rgba(59, 130, 246, 0.16);
-                color: #1d4ed8;
-            }}
             html[data-theme="light"] .overview-chart-legend-item,
             html[data-theme="light"] .overview-chart-tooltip-title,
             html[data-theme="light"] .overview-chart-tooltip-row strong {{
@@ -10095,6 +10842,17 @@ def home(request: Request):
                 }}
                 .overview-chart-head {{
                     flex-direction: column;
+                    padding-right: 0;
+                }}
+                .overview-head-actions {{
+                    width: 100%;
+                    justify-content: flex-start;
+                }}
+                .overview-chart-filter-anchor {{
+                    position: absolute;
+                    top: 56px;
+                    right: 18px;
+                    margin-top: 0;
                 }}
                 .overview-actions {{
                     justify-content: flex-start;
@@ -10159,11 +10917,14 @@ def home(request: Request):
                 .overview-chart-meta {{
                     align-items: flex-start;
                 }}
-                .overview-chart-period {{
-                    margin-left: 0;
+                .overview-chart-filter-anchor {{
+                    position: static;
+                    margin-top: 8px;
                 }}
-                .overview-chart-segment,
                 .overview-chart-control-wrap {{
+                    width: 100%;
+                }}
+                .overview-time-filter-card {{
                     width: 100%;
                 }}
                 .overview-chart-segment {{
@@ -10173,6 +10934,16 @@ def home(request: Request):
                 .overview-chart-toggle {{
                     flex: 1 1 88px;
                 }}
+                .overview-chart-custom-range {{
+                    gap: 6px;
+                }}
+                .overview-chart-custom-row {{
+                    grid-template-columns: 1fr;
+                    gap: 6px;
+                }}
+                .overview-chart-custom-range label {{
+                    margin-top: 4px;
+                }}
                 .overview-control-header {{
                     flex-direction: column;
                 }}
@@ -10181,15 +10952,19 @@ def home(request: Request):
         <script>
             document.addEventListener("DOMContentLoaded", () => {{
                 const initialDashboardSection = {json.dumps(initial_dashboard_section)};
-                const sheetUrlInput = document.getElementById("sheet-url-input");
-                const sheetNameInput = document.getElementById("sheet-name-input");
+                let sheetUrlInput = document.getElementById("sheet-url-input");
+                let sheetNameInput = document.getElementById("sheet-name-input");
                 const setSheetForm = document.querySelector("form[action='/set-sheet']");
                 const setColumnsForm = document.getElementById("set-columns-form");
                 const setSheetSubmitBtn = setSheetForm?.querySelector("button[type='submit']");
                 const setColumnsSubmitBtn = setColumnsForm?.querySelector("button[type='submit']");
-                const sheetTabsState = document.getElementById("sheet-tabs-state");
-                const sheetTabsList = document.getElementById("sheet-tabs-list");
-                const sheetNameOptions = document.getElementById("sheet-name-options");
+                let sheetTabsState = document.getElementById("sheet-tabs-state");
+                let sheetTabsList = document.getElementById("sheet-tabs-list");
+                let sheetNameOptions = document.getElementById("sheet-name-options");
+                let colConfigTabBar = document.getElementById("col-config-tab-bar");
+                let colConfigApplyNote = document.getElementById("col-config-apply-note");
+                let colConfigActiveTabInput = document.getElementById("col-config-active-tab-input");
+                let autoFillColumnsBtn = document.getElementById("auto-fill-columns-btn");
                 const scheduleForm = document.querySelector("form[action='/set-schedule']");
                 const scheduleSheetSearch = document.getElementById("schedule-sheet-search");
                 const scheduleSheetDatalist = document.getElementById("schedule-sheet-datalist");
@@ -10273,16 +11048,15 @@ def home(request: Request):
                 const saveNotificationSettingsBtn = document.getElementById("save-notification-settings-btn");
                 const activeSheetNameEls = Array.from(document.querySelectorAll("[data-active-sheet-name]"));
                 const activeSheetIdEls = Array.from(document.querySelectorAll("[data-active-sheet-id]"));
-                const configModeEls = Array.from(document.querySelectorAll("[data-config-mode]"));
                 const columnDetectedTextEls = Array.from(document.querySelectorAll("[data-column-detected-text]"));
                 const columnInputEls = Object.fromEntries(
-                    ["date", "air_date", "link", "view", "like", "share", "comment", "save"].map((field) => [
+                    ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"].map((field) => [
                         field,
                         document.querySelector(`[data-column-input="${{field}}"]`),
                     ])
                 );
                 const columnSourceEls = Object.fromEntries(
-                    ["date", "air_date", "link", "view", "like", "share", "comment", "save"].map((field) => [
+                    ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"].map((field) => [
                         field,
                         document.querySelector(`[data-column-source="${{field}}"]`),
                     ])
@@ -10299,12 +11073,26 @@ def home(request: Request):
                 const sheetTabsCache = {{}};
                 const normalizeSheetUrl = (value) => String(value || "").trim();
                 let selectedSheetTabs = new Set();
+                let latestSheetTabs = [];
                 let scheduleSheetOptionItems = [];
                 let employeeUsersState = [];
                 let employeeStatusFilter = "all";
                 let employeeEditingEmail = "";
                 let configLocked = false;
                 let pendingSheetMetadataReveal = false;
+                let pendingInlineAction = "";
+
+                const refreshSheetTabDomRefs = () => {{
+                    sheetUrlInput = document.getElementById("sheet-url-input");
+                    sheetNameInput = document.getElementById("sheet-name-input");
+                    sheetTabsState = document.getElementById("sheet-tabs-state");
+                    sheetTabsList = document.getElementById("sheet-tabs-list");
+                    sheetNameOptions = document.getElementById("sheet-name-options");
+                    colConfigTabBar = document.getElementById("col-config-tab-bar");
+                    colConfigApplyNote = document.getElementById("col-config-apply-note");
+                    colConfigActiveTabInput = document.getElementById("col-config-active-tab-input");
+                    autoFillColumnsBtn = document.getElementById("auto-fill-columns-btn");
+                }};
 
                 const applySidebarCollapsed = (collapsed) => {{
                     const normalizedCollapsed = Boolean(collapsed);
@@ -10491,9 +11279,6 @@ def home(request: Request):
                     }}
                 }};
 
-                const colConfigTabBar = document.getElementById("col-config-tab-bar");
-                const colConfigApplyNote = document.getElementById("col-config-apply-note");
-                const colConfigActiveTabInput = document.getElementById("col-config-active-tab-input");
                 let colConfigActiveTab = "";
                 // Cache of per-tab input values keyed by tab name: {{ tabName: {{ link:"C", like:"F", ... }} }}
                 let tabColConfigCache = {{}};
@@ -10523,53 +11308,129 @@ def home(request: Request):
                     if (srEl && "start_row" in cfg) srEl.value = cfg["start_row"];
                 }};
 
-                const resetTabColBtn = document.getElementById("reset-tab-col-config-btn");
-                const updateResetTabBtnVisibility = () => {{
-                    if (!resetTabColBtn) return;
-                    // Show whenever a specific tab is active (so user can always reset)
-                    const hasActiveTab = !!colConfigActiveTab;
-                    resetTabColBtn.classList.toggle("hidden", !hasActiveTab);
-                }};
-                if (resetTabColBtn) {{
-                    resetTabColBtn.addEventListener("click", async () => {{
-                        const tab = colConfigActiveTab;
-                        if (!tab) return;
-                        if (!confirm(`Reset cấu hình cột của tab "${{tab}}" về AUTO detect?`)) return;
-                        try {{
-                            const resp = await fetch(`/clear-tab-columns?tab_name=${{encodeURIComponent(tab)}}`, {{
-                                headers: {{"X-Requested-With": "fetch"}},
-                                cache: "no-store",
-                            }});
-                            const data = await resp.json();
-                            if (data.ok) {{
-                                delete serverColConfigByTab[tab];
-                                delete tabColConfigCache[tab];
-                                // Re-fetch auto-detected values for this tab
-                                fetch(`/detect-tab-columns?tab_name=${{encodeURIComponent(tab)}}`, {{
-                                    headers: {{"X-Requested-With": "fetch"}},
-                                    cache: "no-store",
-                                }}).then(r => r.json()).then(d => {{
-                                    if (d.ok && d.detected_inputs && colConfigActiveTab === tab) {{
-                                        writeColConfigInputs(d.detected_inputs);
-                                        if (d.start_row) {{
-                                            const srEl = document.querySelector("[form='set-columns-form'][name='start_row']");
-                                            if (srEl) srEl.value = d.start_row;
-                                        }}
-                                    }}
-                                }}).catch(() => {{}});
-                                applyColumnConfigState(data);
-                                updateResetTabBtnVisibility();
-                                showNotice(data.message || "Đã reset về AUTO.", "success");
-                            }} else {{
-                                showNotice(data.message || "Không reset được.", "error");
-                            }}
-                        }} catch (_) {{
-                            showNotice("Không kết nối được.", "error");
+                const AUTO_COLUMN_FIELDS = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"];
+                const fetchAutoColumnConfigForTab = async (tabName) => {{
+                    const resolvedTabName = String(tabName || "").trim();
+                    if (!resolvedTabName) {{
+                        return null;
+                    }}
+                    try {{
+                        const response = await fetch(`/detect-tab-columns?tab_name=${{encodeURIComponent(resolvedTabName)}}`, {{
+                            headers: {{"X-Requested-With": "fetch"}},
+                            cache: "no-store",
+                        }});
+                        const data = await response.json();
+                        if (!data.ok || !data.detected_inputs) {{
+                            return null;
                         }}
-                    }});
-                }}
+                        const normalizedConfig = {{}};
+                        AUTO_COLUMN_FIELDS.forEach((field) => {{
+                            normalizedConfig[field] = String((data.detected_inputs || {{}})[field] || "").trim();
+                        }});
+                        if (data.start_row) {{
+                            normalizedConfig.start_row = String(data.start_row);
+                        }}
+                        tabColConfigCache[resolvedTabName] = normalizedConfig;
+                        serverColConfigByTab[resolvedTabName] = normalizedConfig;
+                        return {{
+                            tabName: resolvedTabName,
+                            detectedInputs: normalizedConfig,
+                            startRow: normalizedConfig.start_row || "",
+                        }};
+                    }} catch (_) {{
+                        return null;
+                    }}
+                }};
+
+                const refreshStatusNow = async () => {{
+                    try {{
+                        const response = await fetch("/status", {{
+                            headers: {{ "X-Requested-With": "fetch" }},
+                            cache: "no-store",
+                        }});
+                        const data = await response.json();
+                        applyStatusState(data);
+                        applyScheduleConfigState(data);
+                        applyScheduleTrackingState(data);
+                        return data;
+                    }} catch (_) {{
+                        return null;
+                    }}
+                }};
+
+                document.addEventListener("click", async (event) => {{
+                    const autoButton = event.target.closest("#auto-fill-columns-btn");
+                    if (!autoButton) return;
+                    event.preventDefault();
+                    const tabsForAuto = Array.from(selectedSheetTabs);
+                    if (!tabsForAuto.length) {{
+                        const fallbackTab = String(colConfigActiveTab || sheetNameInput?.value || "").trim();
+                        if (fallbackTab) tabsForAuto.push(fallbackTab);
+                    }}
+                    if (!tabsForAuto.length) {{
+                        showNotice("Chưa có tab nào để AUTO. Hãy chọn ít nhất 1 tab.", "warning");
+                        return;
+                    }}
+                    autoButton.disabled = true;
+                    autoButton.textContent = "...";
+                    void pushRealtimeLog(`Bắt đầu AUTO quét ${{tabsForAuto.length}} tab...`);
+                    let scannedTabs = 0;
+                    let totalFilledAcrossTabs = 0;
+                    let activeDetected = null;
+                    let activeStartRow = "";
+                    const activeTabForForm = String(colConfigActiveTab || tabsForAuto[0] || "").trim();
+                    for (const tabName of tabsForAuto) {{
+                        const detected = await fetchAutoColumnConfigForTab(tabName);
+                        if (!detected || !detected.detectedInputs) {{
+                            void pushRealtimeLog(`[${{tabName}}] AUTO không nhận được cột.`);
+                            continue;
+                        }}
+                        scannedTabs += 1;
+                        const filledForTab = AUTO_COLUMN_FIELDS.reduce((sum, field) => sum + (detected.detectedInputs[field] ? 1 : 0), 0);
+                        totalFilledAcrossTabs += filledForTab;
+                        if (tabName === activeTabForForm) {{
+                            activeDetected = detected.detectedInputs;
+                            activeStartRow = detected.startRow || "";
+                        }}
+                        void pushRealtimeLog(`[${{tabName}}] AUTO nhận ${{filledForTab}} cột.`);
+                    }}
+                    autoButton.disabled = false;
+                    autoButton.textContent = "AUTO";
+                    if (!scannedTabs) {{
+                        void pushRealtimeLog("AUTO chưa nhận được cột nào từ các tab đã chọn.");
+                        showNotice("AUTO chưa nhận được cột nào từ các tab đã chọn.", "warning");
+                        return;
+                    }}
+                    if (activeDetected) {{
+                        document.querySelectorAll("[data-column-input]").forEach((input) => {{
+                            const field = input.dataset.columnInput || "";
+                            const autoValue = String(activeDetected?.[field] || "").trim();
+                            input.dataset.detectedValue = autoValue;
+                            if (!autoValue) return;
+                            input.value = autoValue;
+                            input.dataset.manualValue = "";
+                            input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                        }});
+                        const srEl = document.querySelector("[form='set-columns-form'][name='start_row']");
+                        if (srEl && activeStartRow && document.activeElement !== srEl) {{
+                            srEl.value = activeStartRow;
+                        }}
+                    }}
+                    if (activeTabForForm) {{
+                        tabColConfigCache[activeTabForForm] = readColConfigInputs();
+                    }}
+                    renderColConfigTabBar(activeTabForForm);
+                    void pushRealtimeLog(`AUTO đã quét ${{scannedTabs}}/${{tabsForAuto.length}} tab, nhận tổng ${{totalFilledAcrossTabs}} cột.`);
+                    showNotice(`AUTO đã quét ${{scannedTabs}}/${{tabsForAuto.length}} tab, nhận tổng ${{totalFilledAcrossTabs}} cột.`, "success");
+                    await refreshStatusNow();
+                }});
+
+                const updateResetTabBtnVisibility = () => {{
+                    refreshSheetTabDomRefs();
+                }};
 
                 const renderColConfigTabBar = (switchToTab) => {{
+                    refreshSheetTabDomRefs();
                     if (!colConfigTabBar) return;
                     const tabs = Array.from(selectedSheetTabs);
                     if (tabs.length <= 1) {{
@@ -10651,11 +11512,13 @@ def home(request: Request):
 
                     colConfigTabBar.innerHTML = tabs.map((t) => {{
                         const isAct = t === colConfigActiveTab;
-                        return `<button type="button" data-col-tab="${{t}}" style="padding:6px 14px 8px;font-size:12px;font-weight:800;border-radius:8px 8px 0 0;border:none;cursor:pointer;transition:.15s;${{
-                            isAct
-                                ? "background:rgba(14,165,233,0.14);color:#7dd3fc;border-bottom:2px solid #38bdf8;"
-                                : "background:transparent;color:#64748b;border-bottom:2px solid transparent;"
-                        }}">${{t}}</button>`;
+                        const baseStyle = isAct
+                            ? "background:rgba(14,165,233,0.14);color:#7dd3fc;border-bottom:2px solid #38bdf8;"
+                            : "background:transparent;color:#64748b;border-bottom:2px solid transparent;";
+                        return `<div style="display:inline-flex;align-items:center;gap:6px;padding:0 2px;${{baseStyle}}">
+                            <button type="button" data-col-tab="${{t}}" style="padding:6px 2px 8px 10px;font-size:12px;font-weight:800;border:none;cursor:pointer;transition:.15s;background:transparent;color:inherit;">${{t}}</button>
+                            <button type="button" data-col-tab-remove="${{t}}" title="Bỏ chọn tab này" aria-label="Bỏ chọn tab ${{t}}" style="padding:0 8px 2px 0;border:none;background:transparent;color:${{isAct ? "#38bdf8" : "#94a3b8"}};font-size:14px;font-weight:900;line-height:1;cursor:pointer;">×</button>
+                        </div>`;
                     }}).join("");
                     if (colConfigApplyNote) colConfigApplyNote.textContent = `Cấu hình riêng cho tab: ${{colConfigActiveTab}}`;
                     colConfigTabBar.querySelectorAll("[data-col-tab]").forEach((btn) => {{
@@ -10663,16 +11526,37 @@ def home(request: Request):
                             renderColConfigTabBar(btn.dataset.colTab || "");
                         }});
                     }});
+                    colConfigTabBar.querySelectorAll("[data-col-tab-remove]").forEach((btn) => {{
+                        btn.addEventListener("click", (event) => {{
+                            event.preventDefault();
+                            event.stopPropagation();
+                            const tabToRemove = btn.dataset.colTabRemove || "";
+                            if (!tabToRemove) return;
+                            selectedSheetTabs.delete(tabToRemove);
+                            if (sheetNameInput && (sheetNameInput.value || "").trim() === tabToRemove) {{
+                                const nextTab = Array.from(selectedSheetTabs)[0] || "";
+                                sheetNameInput.value = nextTab;
+                                if (nextTab) {{
+                                    sessionStorage.setItem("draft_sheet_name", nextTab);
+                                }} else {{
+                                    sessionStorage.removeItem("draft_sheet_name");
+                                }}
+                            }}
+                            renderSheetTabs(latestSheetTabs);
+                        }});
+                    }});
                 }};
 
                 const renderSheetTabs = (tabs) => {{
+                    refreshSheetTabDomRefs();
+                    latestSheetTabs = Array.isArray(tabs) ? tabs : [];
                     if (sheetNameOptions) {{
-                        sheetNameOptions.innerHTML = tabs
+                        sheetNameOptions.innerHTML = latestSheetTabs
                             .map((tab) => `<option value="${{tab.title}}"></option>`)
                             .join("");
                     }}
                     if (!sheetTabsList) return;
-                    if (!tabs.length) {{
+                    if (!latestSheetTabs.length) {{
                         sheetTabsList.innerHTML = "";
                         sheetTabsList.classList.add("hidden");
                         return;
@@ -10687,12 +11571,12 @@ def home(request: Request):
                         <span style="font-size:12px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.1em;">Tab được quét${{countBadge}}</span>
                         <span style="flex:1"></span>${{selectAllBtn}}${{clearBtn}}
                     </div>`;
-                    sheetTabsList.innerHTML = header + tabs
+                    sheetTabsList.innerHTML = header + latestSheetTabs
                         .map((tab) => {{
                             const isActive = selectedSheetTabs.has(tab.title);
                             const activeClass = isActive ? " is-active" : "";
                             const checkIcon = isActive ? `<i class="fa-solid fa-check" style="font-size:10px;"></i>` : "";
-                            return `<button type="button" class="sheet-tab-chip${{activeClass}}" data-sheet-tab="${{tab.title}}">${{checkIcon}}${{tab.title}}</button>`;
+                            return `<button type="button" class="sheet-tab-chip${{activeClass}}" data-sheet-tab="${{tab.title}}" data-sheet-gid="${{tab.gid || "0"}}">${{checkIcon}}${{tab.title}}</button>`;
                         }})
                         .join("");
                     sheetTabsList.classList.remove("hidden");
@@ -10709,25 +11593,25 @@ def home(request: Request):
                                 sheetNameInput.value = tabTitle;
                                 sessionStorage.setItem("draft_sheet_name", tabTitle);
                             }}
-                            renderSheetTabs(tabs);
+                            renderSheetTabs(latestSheetTabs);
                         }});
                     }});
                     const selectAllBtnEl = document.getElementById("sheet-tabs-select-all");
                     if (selectAllBtnEl) {{
                         selectAllBtnEl.addEventListener("click", () => {{
-                            tabs.forEach((tab) => selectedSheetTabs.add(tab.title));
-                            if (sheetNameInput && tabs.length) {{
-                                sheetNameInput.value = tabs[0].title;
-                                sessionStorage.setItem("draft_sheet_name", tabs[0].title);
+                            latestSheetTabs.forEach((tab) => selectedSheetTabs.add(tab.title));
+                            if (sheetNameInput && latestSheetTabs.length) {{
+                                sheetNameInput.value = latestSheetTabs[0].title;
+                                sessionStorage.setItem("draft_sheet_name", latestSheetTabs[0].title);
                             }}
-                            renderSheetTabs(tabs);
+                            renderSheetTabs(latestSheetTabs);
                         }});
                     }}
                     const clearBtnEl = document.getElementById("sheet-tabs-clear");
                     if (clearBtnEl) {{
                         clearBtnEl.addEventListener("click", () => {{
                             selectedSheetTabs.clear();
-                            renderSheetTabs(tabs);
+                            renderSheetTabs(latestSheetTabs);
                         }});
                     }}
                     renderColConfigTabBar();
@@ -10738,6 +11622,9 @@ def home(request: Request):
                     scheduleSheetOptionItems = Array.from(scheduleSheetSelect.options).map((option) => ({{
                         value: option.value || "",
                         label: option.textContent || "",
+                        sheetId: option.dataset.sheetId || "",
+                        sheetName: option.dataset.sheetName || "",
+                        gid: option.dataset.sheetGid || "",
                     }})).filter((item) => item.value && item.label && item.label !== "Chưa có sheet nào để chọn");
                 }};
 
@@ -10760,6 +11647,80 @@ def home(request: Request):
                     if (exactMatch) return exactMatch;
                     const matches = getScheduleSheetMatches(rawValue);
                     return matches.length === 1 ? matches[0] : null;
+                }};
+
+                const parseScheduleBindingValue = (rawValue = "") => {{
+                    const [sheetId, ...nameParts] = String(rawValue || "").split("::");
+                    return {{
+                        sheetId: String(sheetId || "").trim(),
+                        sheetName: String(nameParts.join("::") || "").trim(),
+                    }};
+                }};
+
+                const extractSheetIdFromInput = (rawValue = "") => {{
+                    const value = String(rawValue || "").trim();
+                    if (!value) return "";
+                    const directMatch = value.match(/^[a-zA-Z0-9-_]{{20,}}$/);
+                    if (directMatch) return directMatch[0];
+                    const urlMatch = value.match(/\/spreadsheets\/(?:u\/\d+\/)?d\/([a-zA-Z0-9-_]+)/i);
+                    if (urlMatch && urlMatch[1]) return urlMatch[1];
+                    try {{
+                        const parsed = new URL(value);
+                        const queryId = parsed.searchParams.get("id") || parsed.searchParams.get("key") || "";
+                        return /^[a-zA-Z0-9-_]{{20,}}$/.test(queryId) ? queryId : "";
+                    }} catch (_) {{
+                        return "";
+                    }}
+                }};
+
+                const extractSheetGidFromInput = (rawValue = "") => {{
+                    const value = String(rawValue || "").trim();
+                    if (!value) return "";
+                    const hashMatch = value.match(/[#&?]gid=(\d+)/i);
+                    if (hashMatch && hashMatch[1]) return hashMatch[1];
+                    try {{
+                        const parsed = new URL(value);
+                        const gid = parsed.searchParams.get("gid") || "";
+                        return /^\d+$/.test(gid) ? gid : "";
+                    }} catch (_) {{
+                        return "";
+                    }}
+                }};
+
+                const resolveScheduleSheetFromSheetInput = async (rawValue = "") => {{
+                    const normalizedInput = String(rawValue || "").trim();
+                    if (!normalizedInput) return null;
+                    const sheetId = extractSheetIdFromInput(normalizedInput);
+                    if (!sheetId) return null;
+                    const gid = extractSheetGidFromInput(normalizedInput);
+                    const sameSheetItems = scheduleSheetOptionItems.filter((item) => {{
+                        const parsed = parseScheduleBindingValue(item.value);
+                        return parsed.sheetId === sheetId;
+                    }});
+                    if (!sameSheetItems.length) return null;
+                    if (sameSheetItems.length === 1 && !gid) return sameSheetItems[0];
+                    if (gid) {{
+                        const itemByGid = sameSheetItems.find((item) => String(item.gid || "") === gid);
+                        if (itemByGid) return itemByGid;
+                        try {{
+                            const response = await fetch(`/sheet-tabs?sheet_url=${{encodeURIComponent(normalizedInput)}}`, {{
+                                headers: {{ "X-Requested-With": "fetch" }},
+                                cache: "no-store",
+                            }});
+                            if (response.ok) {{
+                                const data = await response.json();
+                                if (data?.ok && Array.isArray(data.tabs)) {{
+                                    const tab = data.tabs.find((entry) => String(entry?.gid || "") === gid);
+                                    if (tab?.title) {{
+                                        const tabName = String(tab.title).trim().toLowerCase();
+                                        const itemByName = sameSheetItems.find((item) => String(item.sheetName || "").trim().toLowerCase() === tabName);
+                                        if (itemByName) return itemByName;
+                                    }}
+                                }}
+                            }}
+                        }} catch (_) {{}}
+                    }}
+                    return sameSheetItems[0];
                 }};
 
                 const renderScheduleSheetOptions = (filterValue = "", preferredValue = "") => {{
@@ -10807,7 +11768,11 @@ def home(request: Request):
 
                 const commitScheduleSheetSearch = async (showToast = false) => {{
                     if (!scheduleSheetSearch || !scheduleSheetSelect) return null;
-                    const resolvedItem = resolveScheduleSheetItem(scheduleSheetSearch.value || "");
+                    const rawInput = scheduleSheetSearch.value || "";
+                    let resolvedItem = resolveScheduleSheetItem(rawInput);
+                    if (!resolvedItem) {{
+                        resolvedItem = await resolveScheduleSheetFromSheetInput(rawInput);
+                    }}
                     if (!resolvedItem) {{
                         scheduleSheetSelect.value = "";
                         return null;
@@ -10829,9 +11794,19 @@ def home(request: Request):
                         return;
                     }}
                     scheduleSheetOptionItems.forEach((item) => {{
+                        const parsed = parseScheduleBindingValue(item.value);
+                        const normalizedSheetId = String(item.sheetId || parsed.sheetId || "").trim();
+                        const normalizedSheetName = String(item.sheetName || parsed.sheetName || "").trim();
+                        const normalizedGid = String(item.gid || "").trim();
+                        item.sheetId = normalizedSheetId;
+                        item.sheetName = normalizedSheetName;
+                        item.gid = normalizedGid;
                         const option = document.createElement("option");
                         option.value = item.value;
                         option.textContent = item.label;
+                        option.dataset.sheetId = normalizedSheetId;
+                        option.dataset.sheetName = normalizedSheetName;
+                        option.dataset.sheetGid = normalizedGid;
                         scheduleSheetSelect.appendChild(option);
                     }});
                     scheduleSheetSelect.disabled = false;
@@ -10874,6 +11849,12 @@ def home(request: Request):
                 if (scheduleSheetSearch) {{
                     scheduleSheetSearch.addEventListener("input", () => {{
                         renderScheduleSheetOptions(scheduleSheetSearch.value, scheduleSheetSelect?.value || "");
+                    }});
+                    scheduleSheetSearch.addEventListener("focus", () => {{
+                        renderScheduleSheetOptions("", scheduleSheetSelect?.value || "");
+                    }});
+                    scheduleSheetSearch.addEventListener("click", () => {{
+                        renderScheduleSheetOptions("", scheduleSheetSelect?.value || "");
                     }});
                     scheduleSheetSearch.addEventListener("change", async () => {{
                         await commitScheduleSheetSearch(false);
@@ -10918,6 +11899,12 @@ def home(request: Request):
                     const requestId = ++sheetTabsRequestId;
                     if (!silent) {{
                         setSheetTabsMessage("Đang tải danh sách tab...", "loading");
+                        const nowMs = Date.now();
+                        if (lastSheetTabsLogKey !== rawValue || nowMs - lastSheetTabsLogAt > 6000) {{
+                            lastSheetTabsLogKey = rawValue;
+                            lastSheetTabsLogAt = nowMs;
+                            void pushRealtimeLog("Đang kiểm tra link sheet để tải danh sách tab...");
+                        }}
                     }}
 
                     try {{
@@ -10933,7 +11920,8 @@ def home(request: Request):
 
                         if (!data.ok) {{
                             clearSheetTabs();
-                            setSheetTabsMessage(data.message || "Không tải được danh sách tab.", "error");
+                            const msgStyle = data.quota_error ? "warning" : "error";
+                            setSheetTabsMessage(data.message || "Không tải được danh sách tab.", msgStyle);
                             return;
                         }}
                         const tabs = Array.isArray(data.tabs) ? data.tabs : [];
@@ -10942,11 +11930,18 @@ def home(request: Request):
                             message: data.message || `Tìm thấy ${{tabs.length}} tab trong spreadsheet.`,
                         }};
                         renderSheetTabs(tabs);
-                        setSheetTabsMessage(data.message || "Đã tải danh sách tab.", "success");
+                        const tabMsgStyle = data.stale ? "warning" : "success";
+                        setSheetTabsMessage(data.message || "Đã tải danh sách tab.", tabMsgStyle);
+                        if (!silent) {{
+                            void pushRealtimeLog(data.message || `Tìm thấy ${{tabs.length}} tab trong spreadsheet.`);
+                        }}
                     }} catch (_) {{
                         if (requestId !== sheetTabsRequestId) return;
                         clearSheetTabs();
                         setSheetTabsMessage("Không tải được danh sách tab. Kiểm tra link sheet và quyền truy cập.", "error");
+                        if (!silent) {{
+                            void pushRealtimeLog("Không tải được danh sách tab. Kiểm tra link sheet và quyền truy cập.");
+                        }}
                     }}
                 }};
 
@@ -10956,25 +11951,44 @@ def home(request: Request):
                     }}
                     sheetTabsDebounce = setTimeout(() => {{
                         fetchSheetTabs(sheetUrlInput?.value || "");
-                    }}, 1500);
+                    }}, 800);
                 }};
 
-                if (sheetUrlInput) {{
-                    sheetUrlInput.addEventListener("input", scheduleSheetTabsFetch);
-                    sheetUrlInput.addEventListener("blur", () => fetchSheetTabs(sheetUrlInput.value, true));
-                }}
-                if (sheetNameInput) {{
-                    sheetNameInput.addEventListener("input", () => {{
+                const bindSheetTabLookupControls = () => {{
+                    refreshSheetTabDomRefs();
+                    if (sheetUrlInput && sheetUrlInput.dataset.sheetTabsBound !== "1") {{
+                        sheetUrlInput.dataset.sheetTabsBound = "1";
+                        restoreDraft(sheetUrlInput, "draft_sheet_url");
+                        sheetUrlInput.addEventListener("input", scheduleSheetTabsFetch);
+                        sheetUrlInput.addEventListener("paste", () => setTimeout(scheduleSheetTabsFetch, 0));
+                        sheetUrlInput.addEventListener("change", () => fetchSheetTabs(sheetUrlInput.value, true));
+                        sheetUrlInput.addEventListener("blur", () => fetchSheetTabs(sheetUrlInput.value, true));
+                    }}
+                    if (sheetNameInput && sheetNameInput.dataset.sheetTabsBound !== "1") {{
+                        sheetNameInput.dataset.sheetTabsBound = "1";
+                        restoreDraft(sheetNameInput, "draft_sheet_name");
+                        sheetNameInput.addEventListener("input", () => {{
                         if (sheetTabsList && !sheetTabsList.classList.contains("hidden")) {{
                             sheetTabsList.querySelectorAll("[data-sheet-tab]").forEach((button) => {{
                                 button.classList.toggle("is-active", (button.dataset.sheetTab || "") === sheetNameInput.value.trim());
                             }});
                         }}
-                    }});
-                }}
-                if (sheetUrlInput?.value) {{
-                    fetchSheetTabs(sheetUrlInput.value, true);
-                }}
+                        }});
+                    }}
+                    if (sheetUrlInput?.value) {{
+                        fetchSheetTabs(sheetUrlInput.value, true);
+                    }}
+                    const activeSetSheetForm = document.querySelector("form[action='/set-sheet']");
+                    if (activeSetSheetForm && activeSetSheetForm.dataset.inlineBound !== "1") {{
+                        activeSetSheetForm.dataset.inlineBound = "1";
+                        activeSetSheetForm.addEventListener("submit", async (event) => {{
+                            event.preventDefault();
+                            await submitSheetFormInline();
+                        }});
+                    }}
+                }};
+                window.bindSheetTabLookupControls = bindSheetTabLookupControls;
+                bindSheetTabLookupControls();
 
                 const applyConfigLockState = (locked, message = "") => {{
                     configLocked = Boolean(locked);
@@ -10992,13 +12006,67 @@ def home(request: Request):
                 }};
 
                 const submitSheetFormInline = async () => {{
-                    if (!setSheetForm) return null;
+                    refreshSheetTabDomRefs();
+                    const activeSetSheetForm = document.querySelector("form[action='/set-sheet']");
+                    if (!activeSetSheetForm) return null;
+                    void pushRealtimeLog("Bắt đầu xử lý nhập/lưu sheet...");
                     if (configLocked) {{
                         const message = "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập sheet.";
                         showNotice(message, "warning");
                         return {{ ok: false, message }};
                     }}
-                    const params = new URLSearchParams(new FormData(setSheetForm));
+                    const selectedTabsArr = Array.from(selectedSheetTabs);
+                    if (selectedTabsArr.length > 0) {{
+                        const tabsByTitle = Object.fromEntries(latestSheetTabs.map((tab) => [tab.title, tab]));
+                        const selectedTabsPayload = selectedTabsArr.map((title) => ({{
+                            title,
+                            gid: tabsByTitle[title]?.gid || "0",
+                        }}));
+                        try {{
+                            const response = await fetch("/save-selected-sheets", {{
+                                method: "POST",
+                                headers: {{ "Content-Type": "application/json", "X-Requested-With": "fetch" }},
+                                cache: "no-store",
+                                body: JSON.stringify({{
+                                    sheet_url: sheetUrlInput?.value || "",
+                                    tabs: selectedTabsPayload,
+                                }}),
+                            }});
+                            const data = await response.json();
+                            if (data.ok) {{
+                                sessionStorage.removeItem("draft_sheet_url");
+                                sessionStorage.removeItem("draft_sheet_name");
+                                applyActiveSheetMeta(data, true);
+                                applyColumnConfigState(data);
+                                applySheetMetadataState(data);
+                                applyScheduleConfigState(data);
+                                applyScheduleTrackingState(data);
+                                if (typeof data.overview_html === "string") {{
+                                    replaceOverviewPanelHtml(data.overview_html);
+                                }}
+                                if (typeof data.posts_html === "string") {{
+                                    replacePostsPanelHtml(data.posts_html);
+                                }}
+                                if (typeof data.campaign_html === "string") {{
+                                    replaceCampaignPanelHtml(data.campaign_html);
+                                }}
+                                if (sheetUrlInput?.value) {{
+                                    fetchSheetTabs(sheetUrlInput.value, true);
+                                }}
+                            }}
+                            applyStatusState(data);
+	                            showNotice(
+	                                data.message || (data.ok ? "Đã lưu các tab sheet." : "Không lưu được các tab sheet."),
+	                                data.level || (data.ok ? "success" : "error")
+	                            );
+	                            await refreshStatusNow();
+	                            return data;
+                        }} catch (_) {{
+                            showNotice("Không lưu được các tab sheet. Vui lòng thử lại.", "error");
+                            return null;
+                        }}
+                    }}
+                    const params = new URLSearchParams(new FormData(activeSetSheetForm));
                     try {{
                         const response = await fetch(`/set-sheet?${{params.toString()}}`, {{
                             headers: {{ "X-Requested-With": "fetch" }},
@@ -11027,11 +12095,12 @@ def home(request: Request):
                             }}
                         }}
                         applyStatusState(data);
-                        showNotice(
-                            data.message || (data.ok ? "Đã nhập sheet thành công." : "Không nhập được sheet."),
-                            data.level || (data.ok ? "success" : "error")
-                        );
-                        return data;
+	                        showNotice(
+	                            data.message || (data.ok ? "Đã nhập sheet thành công." : "Không nhập được sheet."),
+	                            data.level || (data.ok ? "success" : "error")
+	                        );
+	                        await refreshStatusNow();
+	                        return data;
                     }} catch (_) {{
                         showNotice("Không nhập được sheet. Vui lòng thử lại.", "error");
                         return null;
@@ -11048,6 +12117,7 @@ def home(request: Request):
                 if (setColumnsForm) {{
                     setColumnsForm.addEventListener("submit", async (event) => {{
                         event.preventDefault();
+                        void pushRealtimeLog("Bắt đầu lưu cấu hình cột nhập liệu...");
                         if (configLocked) {{
                             showNotice("Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy lưu sheet.", "warning");
                             return;
@@ -11106,11 +12176,12 @@ def home(request: Request):
                                     replaceCampaignPanelHtml(data.campaign_html);
                                 }}
                             }}
-                            showNotice(
-                                data.message || (data.ok ? "Đã lưu sheet thành công." : "Không lưu được sheet."),
-                                data.level || (data.ok ? "success" : "error")
-                            );
-                        }} catch (_) {{
+	                            showNotice(
+	                                data.message || (data.ok ? "Đã lưu sheet thành công." : "Không lưu được sheet."),
+	                                data.level || (data.ok ? "success" : "error")
+	                            );
+	                            await refreshStatusNow();
+	                        }} catch (_) {{
                             showNotice("Không lưu được sheet. Vui lòng thử lại.", "error");
                         }}
                     }});
@@ -11181,6 +12252,12 @@ def home(request: Request):
                     event.preventDefault();
 
                     const action = actionLink.dataset.inlineAction || "";
+                    if (pendingInlineAction) {{
+                        showNotice("Đang gửi lệnh, vui lòng chờ một chút.", "info");
+                        return;
+                    }}
+                    pendingInlineAction = action || "action";
+                    actionLink.classList.add("opacity-60", "pointer-events-none");
                     const baseUrl = actionLink.getAttribute("href") || (action === "stop" ? "/stop" : "/start");
                     let requestUrl = baseUrl;
                     if (action === "start") {{
@@ -11198,7 +12275,7 @@ def home(request: Request):
                         }} else if (draftSheetName) {{
                             params.set("sheet_name", draftSheetName);
                         }}
-                        ["date", "air_date", "link", "view", "like", "share", "comment", "save", "start_row"].forEach((name) => {{
+                        ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save", "start_row"].forEach((name) => {{
                             const field = document.querySelector(`[form='set-columns-form'][name='${{name}}']`);
                             if (!field) return;
                             params.set(name, (field.value || "").trim());
@@ -11237,6 +12314,17 @@ def home(request: Request):
                             data.message || (data.ok ? "Đã cập nhật tác vụ." : "Không thực hiện được tác vụ."),
                             data.level || (data.ok ? "success" : "error")
                         );
+                        if (action === "start" && data.ok) {{
+                            setTimeout(async () => {{
+                                try {{
+                                    const statusResponse = await fetch("/status", {{
+                                        headers: {{ "X-Requested-With": "fetch" }},
+                                        cache: "no-store",
+                                    }});
+                                    applyStatusState(await statusResponse.json());
+                                }} catch (_) {{}}
+                            }}, 800);
+                        }}
                     }} catch (_) {{
                         showNotice(
                             action === "stop"
@@ -11244,6 +12332,9 @@ def home(request: Request):
                                 : "Không bắt đầu được tác vụ. Vui lòng thử lại.",
                             "error"
                         );
+                    }} finally {{
+                        pendingInlineAction = "";
+                        actionLink.classList.remove("opacity-60", "pointer-events-none");
                     }}
                 }});
 
@@ -11468,9 +12559,39 @@ def home(request: Request):
                 let refreshInFlight = false;
                 let postsMasterCampaignFilter = "all";
                 let postsSheetActionsCloseBound = false;
+                let postsColumnsMenusCloseBound = false;
                 let overviewCampaignOpenBound = false;
+                let lastSheetTabsLogKey = "";
+                let lastSheetTabsLogAt = 0;
 
                 const showNotice = (_message = "", _level = "info") => {{}};
+                const pushRealtimeLog = async (message = "") => {{
+                    const text = String(message || "").trim();
+                    if (!text) return;
+                    const activeLogSection = document.getElementById("log-section");
+                    if (activeLogSection) {{
+                        const now = new Date();
+                        const hh = String(now.getHours()).padStart(2, "0");
+                        const mm = String(now.getMinutes()).padStart(2, "0");
+                        const ss = String(now.getSeconds()).padStart(2, "0");
+                        const safeText = text.replace(/[&<>]/g, (ch) => ({{ "&": "&amp;", "<": "&lt;", ">": "&gt;" }}[ch] || ch));
+                        const row = document.createElement("div");
+                        row.className = "system-log-line";
+                        row.innerHTML = `<span class="system-log-time">[${{hh}}:${{mm}}:${{ss}}]</span><span class="system-log-message">${{safeText}}</span>`;
+                        activeLogSection.insertBefore(row, activeLogSection.firstChild);
+                    }}
+                    try {{
+                        const response = await fetch("/client-log", {{
+                            method: "POST",
+                            headers: {{ "Content-Type": "application/json", "X-Requested-With": "fetch" }},
+                            cache: "no-store",
+                            body: JSON.stringify({{ message: text }}),
+                        }});
+                        if (!response.ok) return;
+                        const data = await response.json();
+                        applyStatusState(data);
+                    }} catch (_) {{}}
+                }};
                 const syncPostsDomRefs = () => {{
                     postsVisibleCount = document.getElementById("posts-visible-count");
                     postsActiveTabLabel = document.getElementById("posts-active-tab-label");
@@ -11490,6 +12611,17 @@ def home(request: Request):
                         const shouldKeepOpen = exceptMenu && menu === exceptMenu;
                         menu.classList.toggle("hidden", !shouldKeepOpen);
                         const toggle = menu.parentElement?.querySelector("[data-posts-sheet-action-toggle]");
+                        if (toggle) {{
+                            toggle.setAttribute("aria-expanded", shouldKeepOpen ? "true" : "false");
+                        }}
+                    }});
+                }};
+                const closePostsColumnMenus = (exceptMenu = null) => {{
+                    document.querySelectorAll("[data-post-columns-menu]").forEach((menu) => {{
+                        const shouldKeepOpen = exceptMenu && menu === exceptMenu;
+                        menu.classList.toggle("hidden", !shouldKeepOpen);
+                        const wrap = menu.closest(".posts-columns-wrap");
+                        const toggle = wrap?.querySelector("[data-post-columns-toggle]");
                         if (toggle) {{
                             toggle.setAttribute("aria-expanded", shouldKeepOpen ? "true" : "false");
                         }}
@@ -11783,12 +12915,13 @@ def home(request: Request):
                 const applyActiveSheetMeta = (data, syncInputs = false) => {{
                     const sheetName = (data?.active_sheet_name || "").trim() || "Chưa cài đặt";
                     const sheetId = (data?.active_sheet_id || "").trim() || "Chưa cài đặt";
-                    activeSheetNameEls.forEach((el) => {{
+                    document.querySelectorAll("[data-active-sheet-name]").forEach((el) => {{
                         el.textContent = sheetName;
                     }});
-                    activeSheetIdEls.forEach((el) => {{
+                    document.querySelectorAll("[data-active-sheet-id]").forEach((el) => {{
                         el.textContent = sheetId;
                     }});
+                    refreshSheetTabDomRefs();
                     if (syncInputs && sheetNameInput && typeof data?.active_sheet_name === "string") {{
                         sheetNameInput.value = data.active_sheet_name;
                     }}
@@ -11800,15 +12933,12 @@ def home(request: Request):
                 const applyColumnConfigState = (data) => {{
                     const columnConfig = data?.column_config;
                     if (!columnConfig) return;
-                    const manualMode = columnConfig.manual_mode || "AUTO";
-                    configModeEls.forEach((el) => {{
-                        el.textContent = manualMode;
-                    }});
                     const inputValues = columnConfig.input_values || {{}};
                     const detectedInputs = columnConfig.detected_inputs || {{}};
                     const manualInputs = columnConfig.manual_inputs || {{}};
                     const inputSources = columnConfig.input_sources || {{}};
-                    Object.entries(columnInputEls).forEach(([field, el]) => {{
+                    ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"].forEach((field) => {{
+                        const el = document.querySelector(`[data-column-input="${{field}}"]`);
                         if (!el) return;
                         const nextValue = inputValues[field] || "";
                         if (document.activeElement !== el) {{
@@ -11817,7 +12947,8 @@ def home(request: Request):
                         el.dataset.detectedValue = detectedInputs[field] || "";
                         el.dataset.manualValue = manualInputs[field] || "";
                     }});
-                    Object.entries(columnSourceEls).forEach(([field, el]) => {{
+                    ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"].forEach((field) => {{
+                        const el = document.querySelector(`[data-column-source="${{field}}"]`);
                         if (!el) return;
                         el.textContent = inputSources[field] || "CHƯA THẤY";
                     }});
@@ -11826,7 +12957,7 @@ def home(request: Request):
                         startRowField.value = `${{columnConfig.start_row || 2}}`;
                     }}
                     const detectedText = columnConfig.detected_text || "";
-                    columnDetectedTextEls.forEach((el) => {{
+                    document.querySelectorAll("[data-column-detected-text]").forEach((el) => {{
                         el.textContent = detectedText;
                     }});
                     // Re-apply active tab's per-tab overrides on top of the global defaults
@@ -11880,7 +13011,7 @@ def home(request: Request):
                     scheduleLabelEls.forEach((el) => {{
                         el.textContent = label;
                     }});
-                    if (scheduleSheetSelect && typeof scheduleConfig.sheet_options_html === "string" && scheduleConfig.sheet_options_html.trim()) {{
+                    if (scheduleSheetSelect && typeof scheduleConfig.sheet_options_html === "string") {{
                         scheduleSheetSelect.innerHTML = scheduleConfig.sheet_options_html;
                         snapshotScheduleSheetOptions();
                         rebuildScheduleSheetSelectOptions(scheduleConfig.sheet_binding_key || scheduleSheetSelect.value || "");
@@ -12034,7 +13165,6 @@ def home(request: Request):
                                 date: parsedDate,
                                 creator: String(item?.creator || "").trim().toLowerCase(),
                                 view: Number(item?.view || 0) || 0,
-                                engagement: Number(item?.engagement || 0) || 0,
                             }};
                         }})
                         .filter(Boolean)
@@ -12069,14 +13199,12 @@ def home(request: Request):
                                 posts: 0,
                                 creators: new Set(),
                                 views: 0,
-                                engagement: 0,
                             }});
                         }}
                         const bucket = bucketMap.get(key);
                         bucket.posts += 1;
                         if (item.creator) bucket.creators.add(item.creator);
                         bucket.views += item.view;
-                        bucket.engagement += item.engagement;
                     }});
 
                     return Array.from(bucketMap.values())
@@ -12089,51 +13217,254 @@ def home(request: Request):
                             posts: bucket.posts,
                             creators: bucket.creators.size,
                             views: bucket.views,
-                            engagement: bucket.engagement,
                         }}));
                 }};
 
-                const aggregateBrandsForChart = (rawEntries) => {{
+                const aggregateAirDateForChart = (rawEntries, options = {{}}) => {{
+                    const normalizeDay = (sourceDate) => new Date(
+                        sourceDate.getFullYear(),
+                        sourceDate.getMonth(),
+                        sourceDate.getDate()
+                    );
+                    const parseIsoDateInput = (value) => {{
+                        const raw = String(value || "").trim();
+                        if (!raw) return null;
+                        const parsed = new Date(`${{raw}}T00:00:00`);
+                        return Number.isNaN(parsed.getTime()) ? null : normalizeDay(parsed);
+                    }};
+                    const addDays = (sourceDate, amount) => {{
+                        const next = new Date(sourceDate.getTime());
+                        next.setDate(next.getDate() + amount);
+                        return normalizeDay(next);
+                    }};
+
                     const normalized = (Array.isArray(rawEntries) ? rawEntries : [])
                         .map((item) => {{
                             const parsedDate = createOverviewDate(item?.date);
                             if (!parsedDate) return null;
                             return {{
-                                date: parsedDate,
-                                brand: String(item?.brand || "Chưa gắn").trim(),
+                                date: normalizeDay(parsedDate),
                                 views: Number(item?.view || 0) || 0,
-                                posts: 1,
-                                engagement: Number(item?.engagement || 0) || 0,
+                                buzz: Number(item?.buzz || 0) || 0,
+                                brand: String(item?.brand || "").trim(),
+                                sheetName: String(item?.sheet_name || item?.sheet || "").trim(),
                             }};
                         }})
-                        .filter(Boolean);
-                    
+                        .filter(Boolean)
+                        .sort((a, b) => a.date - b.date);
                     if (!normalized.length) return [];
 
-                    const brandMap = new Map();
-                    let totalViews = 0;
-                    normalized.forEach((item) => {{
-                        if (!brandMap.has(item.brand)) {{
-                            brandMap.set(item.brand, {{
-                                name: item.brand,
+                    const latestDate = normalized[normalized.length - 1].date;
+                    const nowDate = normalizeDay(new Date());
+                    const rangeKey = String(options.range || "30d");
+                    const granularity = String(options.granularity || "day");
+                    let fromDate = null;
+                    let toDate = null;
+
+                    if (rangeKey === "today") {{
+                        fromDate = nowDate;
+                        toDate = nowDate;
+                    }} else if (rangeKey === "24h") {{
+                        toDate = nowDate;
+                        fromDate = addDays(nowDate, -1);
+                    }} else if (rangeKey === "7d") {{
+                        toDate = nowDate;
+                        fromDate = addDays(nowDate, -6);
+                    }} else if (rangeKey === "30d") {{
+                        toDate = nowDate;
+                        fromDate = addDays(nowDate, -29);
+                    }} else if (rangeKey === "this_month") {{
+                        fromDate = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1);
+                        toDate = new Date(nowDate.getFullYear(), nowDate.getMonth() + 1, 0);
+                    }} else if (rangeKey === "last_month") {{
+                        fromDate = new Date(nowDate.getFullYear(), nowDate.getMonth() - 1, 1);
+                        toDate = new Date(nowDate.getFullYear(), nowDate.getMonth(), 0);
+                    }} else if (rangeKey === "all_time") {{
+                        fromDate = normalized[0].date;
+                        toDate = latestDate;
+                    }} else if (rangeKey === "custom") {{
+                        const requestedFrom = parseIsoDateInput(options.customFrom);
+                        const requestedTo = parseIsoDateInput(options.customTo);
+                        if (requestedFrom && requestedTo) {{
+                            fromDate = requestedFrom <= requestedTo ? requestedFrom : requestedTo;
+                            toDate = requestedTo >= requestedFrom ? requestedTo : requestedFrom;
+                        }} else if (requestedFrom) {{
+                            fromDate = requestedFrom;
+                            toDate = addDays(requestedFrom, 30);
+                        }} else if (requestedTo) {{
+                            toDate = requestedTo;
+                            fromDate = addDays(requestedTo, -30);
+                        }}
+                        if (fromDate && toDate && (toDate.getTime() - fromDate.getTime()) > 30 * 24 * 60 * 60 * 1000) {{
+                            toDate = addDays(fromDate, 30);
+                        }}
+                    }}
+
+                    if (!fromDate || !toDate) {{
+                        toDate = nowDate;
+                        fromDate = addDays(nowDate, -29);
+                    }}
+
+                    const effectiveToDate = toDate > latestDate ? latestDate : toDate;
+                    const bucketBySevenDaysInMonth =
+                        (rangeKey === "this_month" || rangeKey === "last_month") && granularity === "day";
+                    const filtered = normalized.filter((item) => item.date >= fromDate && item.date <= effectiveToDate);
+                    if (!filtered.length) return [];
+
+                    const bucketMap = new Map();
+                    filtered.forEach((item) => {{
+                        let bucketDate = item.date;
+                        let bucketEndDate = item.date;
+                        if (granularity === "month") {{
+                            bucketDate = new Date(item.date.getFullYear(), item.date.getMonth(), 1);
+                        }} else if (granularity === "week") {{
+                            bucketDate = startOfOverviewWeek(item.date);
+                        }} else if (bucketBySevenDaysInMonth) {{
+                            const dayIndex = item.date.getDate() - 1;
+                            const chunkStartDay = Math.floor(dayIndex / 7) * 7 + 1;
+                            bucketDate = new Date(item.date.getFullYear(), item.date.getMonth(), chunkStartDay);
+                            const monthEnd = new Date(item.date.getFullYear(), item.date.getMonth() + 1, 0);
+                            const chunkEnd = addDays(bucketDate, 6);
+                            bucketEndDate = chunkEnd < monthEnd ? chunkEnd : monthEnd;
+                            if (bucketEndDate > effectiveToDate) bucketEndDate = effectiveToDate;
+                        }}
+                        const key = bucketBySevenDaysInMonth
+                            ? `${{bucketDate.toISOString().slice(0, 10)}}__${{bucketEndDate.toISOString().slice(0, 10)}}`
+                            : bucketDate.toISOString().slice(0, 10);
+                        if (!bucketMap.has(key)) {{
+                            bucketMap.set(key, {{
+                                key,
+                                date: bucketDate,
+                                endDate: bucketEndDate,
                                 views: 0,
-                                posts: 0,
-                                engagement: 0
+                                buzz: 0,
+                                brandStats: new Map(),
+                                sheetStats: new Map(),
                             }});
                         }}
-                        const b = brandMap.get(item.brand);
-                        b.views += item.views;
-                        b.posts += 1;
-                        b.engagement += item.engagement;
-                        totalViews += item.views;
+                        const bucket = bucketMap.get(key);
+                        bucket.views += item.views;
+                        bucket.buzz += item.buzz;
+                        if (item.brand) {{
+                            const currentBrand = bucket.brandStats.get(item.brand) || {{ views: 0, posts: 0 }};
+                            currentBrand.views += item.views;
+                            currentBrand.posts += 1;
+                            bucket.brandStats.set(item.brand, currentBrand);
+                        }}
+                        if (item.sheetName) {{
+                            const currentSheet = bucket.sheetStats.get(item.sheetName) || {{ views: 0, posts: 0 }};
+                            currentSheet.views += item.views;
+                            currentSheet.posts += 1;
+                            bucket.sheetStats.set(item.sheetName, currentSheet);
+                        }}
                     }});
 
-                    return Array.from(brandMap.values())
-                        .map(b => ({{
-                            ...b,
-                            ratio: totalViews > 0 ? Math.round((b.views / totalViews) * 100 * 10) / 10 : 0
-                        }}))
-                        .sort((a, b) => b.posts - a.posts);
+                    const filledBuckets = [];
+                    if (bucketBySevenDaysInMonth) {{
+                        let cursor = new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate());
+                        const monthEnd = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0);
+                        while (cursor <= effectiveToDate) {{
+                            let rangeEnd = addDays(cursor, 6);
+                            if (rangeEnd > monthEnd) rangeEnd = monthEnd;
+                            if (rangeEnd > effectiveToDate) rangeEnd = effectiveToDate;
+                            const key = `${{cursor.toISOString().slice(0, 10)}}__${{rangeEnd.toISOString().slice(0, 10)}}`;
+                            const existing = bucketMap.get(key);
+                            filledBuckets.push(existing || {{
+                                key,
+                                date: new Date(cursor),
+                                endDate: new Date(rangeEnd),
+                                views: 0,
+                                buzz: 0,
+                                brandStats: new Map(),
+                                sheetStats: new Map(),
+                            }});
+                            cursor = addDays(cursor, 7);
+                        }}
+                    }} else if (granularity === "month") {{
+                        let cursor = new Date(fromDate.getFullYear(), fromDate.getMonth(), 1);
+                        const limit = new Date(effectiveToDate.getFullYear(), effectiveToDate.getMonth(), 1);
+                        while (cursor <= limit) {{
+                            const key = cursor.toISOString().slice(0, 10);
+                            const existing = bucketMap.get(key);
+                            filledBuckets.push(existing || {{
+                                key,
+                                date: new Date(cursor),
+                                endDate: new Date(cursor),
+                                views: 0,
+                                buzz: 0,
+                                brandStats: new Map(),
+                                sheetStats: new Map(),
+                            }});
+                            cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+                        }}
+                    }} else if (granularity === "week") {{
+                        let cursor = startOfOverviewWeek(fromDate);
+                        const limit = startOfOverviewWeek(effectiveToDate);
+                        while (cursor <= limit) {{
+                            const key = cursor.toISOString().slice(0, 10);
+                            const existing = bucketMap.get(key);
+                            filledBuckets.push(existing || {{
+                                key,
+                                date: new Date(cursor),
+                                endDate: new Date(cursor),
+                                views: 0,
+                                buzz: 0,
+                                brandStats: new Map(),
+                                sheetStats: new Map(),
+                            }});
+                            cursor = addDays(cursor, 7);
+                        }}
+                    }} else {{
+                        let cursor = new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate());
+                        while (cursor <= effectiveToDate) {{
+                            const key = cursor.toISOString().slice(0, 10);
+                            const existing = bucketMap.get(key);
+                            filledBuckets.push(existing || {{
+                                key,
+                                date: new Date(cursor),
+                                endDate: new Date(cursor),
+                                views: 0,
+                                buzz: 0,
+                                brandStats: new Map(),
+                                sheetStats: new Map(),
+                            }});
+                            cursor = addDays(cursor, 1);
+                        }}
+                    }}
+
+                    return filledBuckets
+                        .sort((a, b) => a.date - b.date)
+                        .map((bucket) => {{
+                            const allBrands = Array.from(bucket.brandStats.entries())
+                                .sort((a, b) => (b[1].views - a[1].views) || (b[1].posts - a[1].posts))
+                                .map(([name, stat]) => ({{
+                                    name,
+                                    views: Number(stat?.views || 0) || 0,
+                                    posts: Number(stat?.posts || 0) || 0,
+                                }}));
+                            const allSheets = Array.from(bucket.sheetStats.entries())
+                                .sort((a, b) => (b[1].views - a[1].views) || (b[1].posts - a[1].posts))
+                                .map(([name, stat]) => ({{
+                                    name,
+                                    views: Number(stat?.views || 0) || 0,
+                                    posts: Number(stat?.posts || 0) || 0,
+                                }}));
+                            let label = formatOverviewShortDate(bucket.date);
+                            if (bucketBySevenDaysInMonth) {{
+                                const rangeEnd = bucket.endDate || bucket.date;
+                                label = `${{formatOverviewShortDate(bucket.date)}}-${{formatOverviewShortDate(rangeEnd)}}`;
+                            }} else if (granularity === "week") {{
+                                label = `W ${{formatOverviewShortDate(bucket.date)}}`;
+                            }} else if (granularity === "month") {{
+                                label = formatOverviewMonth(bucket.date);
+                            }}
+                            return {{
+                                ...bucket,
+                                label,
+                                topBrands: allBrands,
+                                topSheets: allSheets,
+                            }};
+                        }});
                 }};
 
                 const createSvgNode = (name, attrs = {{}}) => {{
@@ -12176,7 +13507,10 @@ def home(request: Request):
                         const emptyState = card.querySelector("[data-overview-chart-empty]");
                         const tooltip = card.querySelector("[data-overview-chart-tooltip]");
                         const periodLabel = card.querySelector("[data-overview-chart-period]");
-                        if (!dataScript || !svg || !singleState || !emptyState || !tooltip || !periodLabel) return;
+                        const brandLegend = card.querySelector("[data-overview-brand-legend]");
+                        const filterTrigger = card.querySelector("[data-overview-filter-trigger]");
+                        const filterPanel = card.querySelector("[data-overview-filter-panel]");
+                        if (!dataScript || !svg || !singleState || !emptyState || !tooltip) return;
 
                         let payload = {{ entries: [] }};
                         try {{
@@ -12185,15 +13519,50 @@ def home(request: Request):
                             payload = {{ entries: [] }};
                         }}
                         const rawEntries = Array.isArray(payload.entries) ? payload.entries : [];
+                        const customFromInput = card.querySelector("[data-overview-custom-from]");
+                        const customToInput = card.querySelector("[data-overview-custom-to]");
+                        const customApplyButton = card.querySelector("[data-overview-apply-custom]");
                         if (!card._overviewChartState) {{
-                            card._overviewChartState = {{ range: "7d", granularity: "day" }};
+                            card._overviewChartState = {{ range: "7d", granularity: "day", customFrom: "", customTo: "" }};
                         }}
+                        const setChartControlActiveState = () => {{
+                            card.querySelectorAll("[data-overview-range]").forEach((button) => {{
+                                const key = button.dataset.overviewRange || "";
+                                button.classList.toggle("is-active", key === card._overviewChartState.range);
+                            }});
+                            card.querySelectorAll("[data-overview-granularity]").forEach((button) => {{
+                                const key = button.dataset.overviewGranularity || "";
+                                button.classList.toggle("is-active", key === card._overviewChartState.granularity);
+                            }});
+                        }};
+                        const applyDefaultCustomRangeInputs = () => {{
+                            if (!customFromInput || !customToInput) return;
+                            const today = new Date();
+                            today.setHours(0, 0, 0, 0);
+                            const fromDate = new Date(today.getTime());
+                            fromDate.setDate(fromDate.getDate() - 29);
+                            const toIso = today.toISOString().slice(0, 10);
+                            const fromIso = fromDate.toISOString().slice(0, 10);
+                            if (!customFromInput.value) customFromInput.value = fromIso;
+                            if (!customToInput.value) customToInput.value = toIso;
+                            if (!card._overviewChartState.customFrom) card._overviewChartState.customFrom = fromIso;
+                            if (!card._overviewChartState.customTo) card._overviewChartState.customTo = toIso;
+                        }};
+                        applyDefaultCustomRangeInputs();
+                        setChartControlActiveState();
+                        const setFilterPanelOpen = (isOpen) => {{
+                            if (!filterPanel) return;
+                            filterPanel.classList.toggle("hidden", !isOpen);
+                            if (filterTrigger) {{
+                                filterTrigger.classList.toggle("is-active", isOpen);
+                                filterTrigger.setAttribute("aria-expanded", isOpen ? "true" : "false");
+                            }}
+                        }};
+                        setFilterPanelOpen(false);
 
                         const renderChart = () => {{
                             try {{
-                                const brands = (Array.isArray(payload.brands) && payload.brands.length > 0) 
-                                    ? payload.brands.sort((a, b) => b.posts - a.posts)
-                                    : aggregateBrandsForChart(rawEntries);
+                                const points = aggregateAirDateForChart(rawEntries, card._overviewChartState);
 
                                 tooltip.classList.add("hidden");
                                 svg.replaceChildren();
@@ -12201,31 +13570,48 @@ def home(request: Request):
                                 singleState.innerHTML = "";
                                 svg.classList.remove("hidden");
 
-                                if (!brands.length) {{
+                                if (!points.length) {{
                                     emptyState.classList.remove("hidden");
-                                    periodLabel.textContent = "Chưa có dữ liệu thương hiệu";
+                                    if (periodLabel) periodLabel.textContent = "Chưa có dữ liệu ngày air bài";
+                                    if (brandLegend) brandLegend.innerHTML = "";
                                     return;
                                 }}
 
                                 emptyState.classList.add("hidden");
                                 
                                 const formatMetric = (v) => {{
-                                    if (v >= 1000000) return (v / 1000000).toFixed(1).replace(/\.0$/, "") + "M";
-                                    if (v >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, "") + "K";
+                                    if (v >= 1000000) return (v / 1000000).toFixed(1).replace(/\\.0$/, "") + "M";
+                                    if (v >= 1000) return (v / 1000).toFixed(1).replace(/\\.0$/, "") + "K";
                                     return String(v);
                                 }};
 
-                                const totalPosts = brands.reduce((sum, b) => sum + (b.posts || 0), 0);
-                                const totalViews = brands.reduce((sum, b) => sum + (b.views || 0), 0);
-                                const fPosts = new Intl.NumberFormat("vi-VN").format(totalPosts);
-                                periodLabel.textContent = "Tổng cộng " + fPosts + " bài đăng, " + formatMetric(totalViews) + " views";
-                                const showTooltip = (event, brandData) => {{
-                                    if (!tooltip || !brandData) return;
+                                const totalBuzz = points.reduce((sum, b) => sum + (b.buzz || 0), 0);
+                                const totalViews = points.reduce((sum, b) => sum + (b.views || 0), 0);
+                                const fBuzz = new Intl.NumberFormat("vi-VN").format(totalBuzz);
+                                const firstPoint = points[0];
+                                const lastPoint = points[points.length - 1];
+                                const spanText = firstPoint && lastPoint
+                                    ? `${{formatOverviewLongDate(firstPoint.date)}} - ${{formatOverviewLongDate(lastPoint.date)}}`
+                                    : "";
+                                if (periodLabel) periodLabel.textContent = "Tổng cộng " + fBuzz + " buzz, " + formatMetric(totalViews) + " views" + (spanText ? (" | " + spanText) : "");
+                                const showTooltip = (event, pointData) => {{
+                                    if (!tooltip || !pointData) return;
+                                    const topBrands = Array.isArray(pointData.topBrands) ? pointData.topBrands : [];
+                                    const topSheets = Array.isArray(pointData.topSheets) ? pointData.topSheets : [];
+                                    const topBrandHtml = topBrands.length
+                                        ? topBrands.map((item, idx) => `<div style="color:#93c5fd;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
+                                        : '<div style="color:#64748b;">Chưa có dữ liệu thương hiệu</div>';
+                                    const topSheetHtml = topSheets.length
+                                        ? topSheets.map((item, idx) => `<div style="color:#a5b4fc;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
+                                        : '<div style="color:#64748b;">Chưa có dữ liệu sheet</div>';
                                     tooltip.innerHTML = `
-                                        <div style="font-weight:800;color:#f8fafc;">${{brandData.name || "N/A"}}</div>
-                                        <div style="margin-top:4px;color:#cbd5e1;">Bài đăng: <strong>${{new Intl.NumberFormat("vi-VN").format(brandData.posts || 0)}}</strong></div>
-                                        <div style="color:#cbd5e1;">Lượt xem: <strong>${{new Intl.NumberFormat("vi-VN").format(brandData.views || 0)}}</strong></div>
-                                        <div style="color:#cbd5e1;">Tương tác: <strong>${{new Intl.NumberFormat("vi-VN").format(brandData.engagement || 0)}}</strong></div>
+                                        <div style="font-weight:800;color:#f8fafc;">${{pointData.label || pointData.key || "N/A"}}</div>
+                                        <div style="margin-top:4px;color:#cbd5e1;">Buzz: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.buzz || 0)}}</strong></div>
+                                        <div style="color:#cbd5e1;">Lượt xem: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.views || 0)}}</strong></div>
+                                        <div style="margin-top:8px;color:#94a3b8;font-weight:700;">Thương hiệu (${{topBrands.length}}):</div>
+                                        <div style="margin-top:2px;">${{topBrandHtml}}</div>
+                                        <div style="margin-top:8px;color:#94a3b8;font-weight:700;">Sheet (${{topSheets.length}}):</div>
+                                        <div style="margin-top:2px;">${{topSheetHtml}}</div>
                                     `;
                                     tooltip.classList.remove("hidden");
                                     const rect = svg.getBoundingClientRect();
@@ -12239,26 +13625,38 @@ def home(request: Request):
                                     tooltip.classList.add("hidden");
                                 }};
 
-                                const width = 960;
-                                const height = 320;
-                                svg.setAttribute("viewBox", "0 0 960 320");
-                                svg.removeAttribute("preserveAspectRatio");
+                                const width = Math.max(960, Math.round(svg.clientWidth || 960));
+                                const height = Math.max(380, Math.round(svg.clientHeight || 380));
+                                svg.setAttribute("viewBox", `0 0 ${{width}} ${{height}}`);
+                                svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
 
-                                const padding = {{ top: 44, right: 62, bottom: 48, left: 62 }};
+                                const padding = {{ top: 34, right: 50, bottom: 48, left: 50 }};
                                 const innerWidth = width - padding.left - padding.right;
                                 const innerHeight = height - padding.top - padding.bottom;
                                 
-                                const maxPosts = Math.max(1, ...brands.map(b => b.posts || 0));
-                                const maxViews = Math.max(1, ...brands.map(b => b.views || 0));
+                                const rawMaxBuzz = Math.max(1, ...points.map(b => b.buzz || 0));
+                                const rawMaxViews = Math.max(1, ...points.map(b => b.views || 0));
+                                const maxBuzz = Math.max(1, Math.ceil(rawMaxBuzz * 1.15));
+                                const maxViews = Math.max(1, Math.ceil(rawMaxViews * 1.15));
                                 const tickCount = 4;
                                 
-                                const colWidth = innerWidth / Math.max(1, brands.length);
-                                const barW = Math.min(40, colWidth * 0.6);
+                                const tentativeStep = points.length <= 1
+                                    ? innerWidth
+                                    : innerWidth / Math.max(1, points.length - 1);
+                                const barW = Math.min(34, Math.max(18, (tentativeStep || 96) * 0.22));
+                                const edgeGap = Math.max(12, Math.ceil(barW / 2) + 4);
+                                const effectiveInnerWidth = Math.max(1, innerWidth - edgeGap * 2);
+                                const groupStep = points.length <= 1
+                                    ? 0
+                                    : effectiveInnerWidth / Math.max(1, points.length - 1);
+                                const firstGroupX = padding.left + edgeGap;
+                                const buzzColor = "#f59e0b";
+                                if (brandLegend) brandLegend.innerHTML = "";
                                 const xAt = (index) => {{
-                                    if (brands.length === 1) return padding.left + innerWidth / 2;
-                                    return padding.left + (colWidth * index) + (colWidth / 2);
+                                    if (points.length === 1) return padding.left + innerWidth / 2;
+                                    return firstGroupX + (groupStep * index);
                                 }};
-                                const yPosts = (val) => padding.top + innerHeight - ((val || 0) / maxPosts * innerHeight);
+                                const yBuzz = (val) => padding.top + innerHeight - ((val || 0) / maxBuzz * innerHeight);
                                 const yViews = (val) => padding.top + innerHeight - ((val || 0) / maxViews * innerHeight);
 
                                 const chartUid = card.dataset.overviewChartUid || ("overview-" + Math.random().toString(36).slice(2, 10));
@@ -12274,11 +13672,6 @@ def home(request: Request):
                                 greyGrad.appendChild(createSvgNode("stop", {{ offset: "0%", "stop-color": "rgba(148, 163, 184, 0.35)", "stop-opacity": "1" }}));
                                 greyGrad.appendChild(createSvgNode("stop", {{ offset: "100%", "stop-color": "rgba(148, 163, 184, 0.15)", "stop-opacity": "1" }}));
                                 defs.appendChild(greyGrad);
-
-                                const blueGrad = createSvgNode("linearGradient", {{ id: "line-grad-" + chartUid, x1:0, y1:0, x2:0, y2:1 }});
-                                blueGrad.appendChild(createSvgNode("stop", {{ offset: "0%", "stop-color": "#38bdf8", "stop-opacity": "0.3" }}));
-                                blueGrad.appendChild(createSvgNode("stop", {{ offset: "100%", "stop-color": "#38bdf8", "stop-opacity": "0" }}));
-                                defs.appendChild(blueGrad);
                                 svg.appendChild(defs);
 
                                 const bgRect = createSvgNode("rect", {{
@@ -12289,7 +13682,7 @@ def home(request: Request):
 
                                 for (let i = 0; i <= tickCount; i++) {{
                                     const y = padding.top + (innerHeight * i) / tickCount;
-                                    const postVal = Math.round(maxPosts * (tickCount - i) / tickCount);
+                                    const buzzVal = Math.round(maxBuzz * (tickCount - i) / tickCount);
                                     const viewVal = Math.round(maxViews * (tickCount - i) / tickCount);
                                     
                                     svg.appendChild(createSvgNode("line", {{
@@ -12301,7 +13694,7 @@ def home(request: Request):
                                         x: padding.left - 12, y: y + 4, fill: "rgba(16, 185, 129, 0.6)",
                                         "font-size": 11, "font-weight": 700, "text-anchor": "end"
                                     }});
-                                    lblLeft.textContent = postVal;
+                                    lblLeft.textContent = formatMetric(buzzVal);
                                     svg.appendChild(lblLeft);
 
                                     const lblRight = createSvgNode("text", {{
@@ -12312,56 +13705,86 @@ def home(request: Request):
                                     svg.appendChild(lblRight);
                                 }}
 
-                                brands.forEach((b, i) => {{
+                                const viewLinePoints = [];
+                                const xLabelStep = Math.max(1, Math.ceil(points.length / 10));
+                                points.forEach((b, i) => {{
                                     const x = xAt(i);
-                                    const y = yPosts(b.posts);
-                                    const h = Math.max(4, innerHeight - (y - padding.top));
-                                    
-                                    const bar = createSvgNode("rect", {{
-                                        x: x - barW / 2, y, width: barW, height: h + 20, 
-                                        rx: 6, fill: "url(#bar-grad-" + chartUid + ")",
-                                        style: "transition: all 0.3s ease; clip-path: inset(0 0 20px 0);"
-                                    }});
-                                    bar.addEventListener("mouseenter", (e) => showTooltip(e, b));
-                                    bar.addEventListener("mouseleave", hideTooltip);
-                                    svg.appendChild(bar);
-                                    
-                                    const valTxt = createSvgNode("text", {{
-                                        x, y: y - 10, fill: (i === 0 ? "#10b981" : "#94a3b8"),
-                                        "font-size": 12, "font-weight": 800, "text-anchor": "middle"
-                                    }});
-                                    valTxt.textContent = (b.posts || 0) + " bài";
-                                    svg.appendChild(valTxt);
-                                    
-                                    const nameTxt = createSvgNode("text", {{
-                                        x, y: height - 14, fill: "rgba(148, 163, 184, 0.8)",
-                                        "font-size": 11, "font-weight": 700, "text-anchor": "middle"
-                                    }});
-                                    const bName = b.name || "N/A";
-                                    nameTxt.textContent = bName.length > 14 ? bName.slice(0, 12) + ".." : bName;
-                                    svg.appendChild(nameTxt);
+                                    const buzzY = yBuzz(b.buzz);
+                                    const buzzH = Math.max(4, innerHeight - (buzzY - padding.top));
+                                    const viewY = yViews(b.views);
+                                    const buzzX = x - barW / 2;
+
+                                    const pointBuzz = Number(b?.buzz || 0) || 0;
+                                    if (pointBuzz > 0) {{
+                                        const bar = createSvgNode("rect", {{
+                                            x: buzzX, y: buzzY, width: barW, height: buzzH + 20, 
+                                            rx: 6, fill: buzzColor, stroke: "rgba(15, 23, 42, 0.5)", "stroke-width": 1,
+                                            style: "transition: all 0.3s ease; clip-path: inset(0 0 20px 0);"
+                                        }});
+                                        bar.addEventListener("mouseenter", (e) => showTooltip(e, b));
+                                        bar.addEventListener("mouseleave", hideTooltip);
+                                        svg.appendChild(bar);
+                                    }}
+                                    viewLinePoints.push({{ x, y: viewY, data: b }});
+
+                                    if (i % xLabelStep === 0 || i === points.length - 1) {{
+                                        const dateTxt = createSvgNode("text", {{
+                                            x,
+                                            y: height - 14,
+                                            fill: "rgba(148, 163, 184, 0.9)",
+                                            "font-size": 10,
+                                            "font-weight": 700,
+                                            "text-anchor": "middle"
+                                        }});
+                                        dateTxt.textContent = b.label || "";
+                                        svg.appendChild(dateTxt);
+                                    }}
                                 }});
 
-                                const linePoints = brands.map((b, i) => ({{ x: xAt(i), y: yViews(b.views || 0) }}));
-                                const pathD = buildSmoothLinePath(linePoints);
-                                const linePath = createSvgNode("path", {{
-                                    d: pathD, fill: "none", stroke: "#38bdf8", "stroke-width": 3.5,
-                                    "stroke-linecap": "round", "stroke-linejoin": "round"
-                                }});
-                                svg.appendChild(linePath);
-                                
-                                linePoints.forEach((p, i) => {{
-                                    const b = brands[i];
-                                    const halo = createSvgNode("circle", {{ cx: p.x, cy: p.y, r: 8, fill: "#38bdf8", "fill-opacity": 0.1 }});
-                                    svg.appendChild(halo);
-                                    
-                                    const point = createSvgNode("circle", {{
-                                        cx: p.x, cy: p.y, r: 4.5, fill: "#0f172a", stroke: "#38bdf8", "stroke-width": 2.5
+                                if (viewLinePoints.length > 0) {{
+                                    const linePathData = viewLinePoints
+                                        .map((pt, idx) => `${{idx === 0 ? "M" : "L"}}${{pt.x}} ${{pt.y}}`)
+                                        .join(" ");
+                                    const linePath = createSvgNode("path", {{
+                                        d: linePathData,
+                                        fill: "none",
+                                        stroke: "#38bdf8",
+                                        "stroke-width": 3,
+                                        "stroke-linecap": "round",
+                                        "stroke-linejoin": "round",
+                                        opacity: "0.95"
                                     }});
-                                    point.addEventListener("mouseenter", (e) => showTooltip(e, b));
-                                    point.addEventListener("mouseleave", hideTooltip);
-                                    svg.appendChild(point);
-                                }});
+                                    svg.appendChild(linePath);
+
+                                    viewLinePoints.forEach((pt) => {{
+                                        const pointViews = Number(pt.data?.views || 0) || 0;
+                                        if (pointViews > 0) {{
+                                            const point = createSvgNode("circle", {{
+                                                cx: pt.x,
+                                                cy: pt.y,
+                                                r: 5,
+                                                fill: "#0f172a",
+                                                stroke: "#38bdf8",
+                                                "stroke-width": 3
+                                            }});
+                                            point.addEventListener("mouseenter", (e) => showTooltip(e, pt.data));
+                                            point.addEventListener("mouseleave", hideTooltip);
+                                            svg.appendChild(point);
+                                        }}
+                                        if (pointViews > 0) {{
+                                            const viewTxt = createSvgNode("text", {{
+                                                x: pt.x,
+                                                y: pt.y - 12,
+                                                fill: "#38bdf8",
+                                                "font-size": 11,
+                                                "font-weight": 800,
+                                                "text-anchor": "middle"
+                                            }});
+                                            viewTxt.textContent = formatMetric(pointViews);
+                                            svg.appendChild(viewTxt);
+                                        }}
+                                    }});
+                                }}
                             }} catch (error) {{
                                 emptyState.classList.add("hidden");
                                 svg.classList.add("hidden");
@@ -12374,12 +13797,49 @@ def home(request: Request):
                             card.querySelectorAll("[data-overview-range]").forEach((button) => {{
                                 button.addEventListener("click", () => {{
                                     card._overviewChartState.range = button.dataset.overviewRange || "7d";
+                                    setChartControlActiveState();
                                     renderChart();
                                 }});
                             }});
                             card.querySelectorAll("[data-overview-granularity]").forEach((button) => {{
                                 button.addEventListener("click", () => {{
                                     card._overviewChartState.granularity = button.dataset.overviewGranularity || "day";
+                                    setChartControlActiveState();
+                                    renderChart();
+                                }});
+                            }});
+                            if (customApplyButton) {{
+                                customApplyButton.addEventListener("click", () => {{
+                                    card._overviewChartState.range = "custom";
+                                    card._overviewChartState.customFrom = customFromInput ? customFromInput.value : "";
+                                    card._overviewChartState.customTo = customToInput ? customToInput.value : "";
+                                    setChartControlActiveState();
+                                    renderChart();
+                                }});
+                            }}
+                            if (filterTrigger && filterPanel) {{
+                                filterTrigger.addEventListener("click", (event) => {{
+                                    event.stopPropagation();
+                                    const isHidden = filterPanel.classList.contains("hidden");
+                                    setFilterPanelOpen(isHidden);
+                                }});
+                                document.addEventListener("click", (event) => {{
+                                    const target = event.target;
+                                    if (filterPanel.contains(target) || target === filterTrigger) return;
+                                    setFilterPanelOpen(false);
+                                }});
+                                document.addEventListener("keydown", (event) => {{
+                                    if (event.key === "Escape") setFilterPanelOpen(false);
+                                }});
+                            }}
+                            [customFromInput, customToInput].forEach((input) => {{
+                                if (!input) return;
+                                input.addEventListener("keydown", (event) => {{
+                                    if (event.key !== "Enter") return;
+                                    card._overviewChartState.range = "custom";
+                                    card._overviewChartState.customFrom = customFromInput ? customFromInput.value : "";
+                                    card._overviewChartState.customTo = customToInput ? customToInput.value : "";
+                                    setChartControlActiveState();
                                     renderChart();
                                 }});
                             }});
@@ -12404,9 +13864,15 @@ def home(request: Request):
 
                 const applyStatusState = (data) => {{
                     if (!data) return;
-                    if (statusBadge) {{
-                        statusBadge.className = data.status_badge_class;
-                        statusBadge.textContent = data.status_badge_text;
+                    const currentStatusBadge = document.getElementById("status-badge");
+                    const currentTaskEl = document.getElementById("current-task");
+                    const currentProgressBar = document.getElementById("progress-bar");
+                    const currentProgressText = document.getElementById("progress-text");
+                    const currentLogSection = document.getElementById("log-section");
+                    const currentPrimaryAction = document.getElementById("primary-action");
+                    if (currentStatusBadge) {{
+                        currentStatusBadge.className = data.status_badge_class;
+                        currentStatusBadge.textContent = data.status_badge_text;
                     }}
                     if (sidebarStatusText) {{
                         sidebarStatusText.textContent = data.status_badge_text;
@@ -12414,20 +13880,20 @@ def home(request: Request):
                     if (sidebarStatusTask) {{
                         sidebarStatusTask.textContent = data.current_task;
                     }}
-                    if (currentTaskLabel) {{
-                        currentTaskLabel.textContent = data.current_task;
+                    if (currentTaskEl) {{
+                        currentTaskEl.textContent = data.current_task;
                     }}
-                    if (progressBar) {{
-                        progressBar.style.width = data.progress_width;
+                    if (currentProgressBar) {{
+                        currentProgressBar.style.width = data.progress_width;
                     }}
-                    if (progressText) {{
-                        progressText.textContent = data.progress_text || "";
+                    if (currentProgressText) {{
+                        currentProgressText.textContent = data.progress_text || "";
                     }}
-                    if (logSection && typeof data.log_html === "string") {{
-                        logSection.innerHTML = data.log_html;
+                    if (currentLogSection && typeof data.log_html === "string") {{
+                        currentLogSection.innerHTML = data.log_html;
                     }}
-                    if (primaryAction && typeof data.primary_action_html === "string") {{
-                        primaryAction.innerHTML = data.primary_action_html;
+                    if (currentPrimaryAction && typeof data.primary_action_html === "string") {{
+                        currentPrimaryAction.innerHTML = data.primary_action_html;
                     }}
                     applyConfigLockState(Boolean(data.config_locked), data.config_lock_message || "");
                     // Merge server-saved per-tab column overrides into our local reference dict
@@ -12442,8 +13908,8 @@ def home(request: Request):
                     applyTabProgressState(data);
                 }};
 
-                const tabProgressSection = document.getElementById("tab-progress-section");
                 const applyTabProgressState = (data) => {{
+                    const tabProgressSection = document.getElementById("tab-progress-section");
                     if (!tabProgressSection) return;
                     const tp = data?.tab_progress;
                     if (!tp || typeof tp !== "object" || !Object.keys(tp).length) {{
@@ -12459,25 +13925,26 @@ def home(request: Request):
                         const pct = tot > 0 ? Math.round((cur / tot) * 100) : (status === "completed" ? 100 : 0);
                         const isCompleted = status === "completed";
                         const isStopped = status === "stopped";
-                        const barColor = isCompleted ? "bg-emerald-500" : isStopped ? "bg-amber-400" : "bg-sky-500";
+                        const isError = status === "error";
+                        const barColor = isCompleted ? "#22c55e" : isStopped ? "#f59e0b" : isError ? "#ef4444" : "#0ea5e9";
                         const badgeColor = isCompleted
                             ? "background:rgba(16,185,129,0.15);color:#6ee7b7;border-color:rgba(52,211,153,0.25);"
                             : isStopped
                             ? "background:rgba(251,191,36,0.13);color:#fcd34d;border-color:rgba(253,230,138,0.25);"
+                            : isError
+                            ? "background:rgba(239,68,68,0.13);color:#fca5a5;border-color:rgba(252,165,165,0.25);"
                             : "background:rgba(14,165,233,0.13);color:#7dd3fc;border-color:rgba(125,211,252,0.22);";
-                        const badgeLabel = isCompleted ? "HOÀN TẤT" : isStopped ? "ĐÃ DỪNG" : "ĐANG QUÉT";
-                        return `<div style="background:rgba(15,23,42,0.55);border:1px solid rgba(148,163,184,0.12);border-radius:12px;padding:10px 12px;">
-                            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
-                                <span style="font-size:12px;font-weight:800;color:#e2e8f0;">${{tabName}}</span>
-                                <span style="font-size:10px;font-weight:800;letter-spacing:.08em;padding:2px 8px;border-radius:999px;border:1px solid;${{badgeColor}}">${{badgeLabel}}</span>
+                        const badgeLabel = isCompleted ? "✓ HOÀN TẤT" : isStopped ? "ĐÃ DỪNG" : isError ? "LỖI" : "ĐANG CHẠY";
+                        return `<div style="display:grid;grid-template-columns:minmax(0,1.1fr) minmax(120px,1.8fr) 44px minmax(92px,auto);align-items:center;gap:12px;padding:8px 0;">
+                            <div style="display:flex;align-items:center;gap:9px;min-width:0;">
+                                <i class="fa-regular fa-file-lines" style="color:#22d3ee;font-size:15px;flex:0 0 auto;"></i>
+                                <span style="font-size:12px;font-weight:850;color:#f8fafc;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${{tabName}}</span>
                             </div>
-                            <div style="display:flex;align-items:center;gap:8px;">
-                                <div style="flex:1;background:rgba(30,41,59,0.8);border-radius:999px;height:6px;overflow:hidden;">
-                                    <div class="${{barColor}}" style="height:100%;border-radius:999px;width:${{pct}}%;transition:width .8s ease;"></div>
-                                </div>
-                                <span style="font-size:11px;font-weight:700;color:#94a3b8;min-width:36px;text-align:right;">${{pct}}%</span>
+                            <div style="background:rgba(30,41,59,0.82);border:1px solid rgba(56,189,248,0.22);border-radius:999px;height:9px;overflow:hidden;">
+                                <div style="height:100%;border-radius:999px;width:${{pct}}%;background:${{barColor}};box-shadow:0 0 16px ${{barColor}};transition:width .8s ease;"></div>
                             </div>
-                            <div style="font-size:10px;color:#64748b;margin-top:4px;">${{cur}}/${{tot}} bài</div>
+                            <span style="font-size:12px;font-weight:900;color:#e2e8f0;text-align:right;">${{pct}}%</span>
+                            <span style="font-size:10px;font-weight:950;letter-spacing:.06em;text-align:center;padding:6px 10px;border-radius:999px;border:1px solid;white-space:nowrap;${{badgeColor}}">${{badgeLabel}}</span>
                         </div>`;
                     }}).join("");
                 }};
@@ -12547,7 +14014,6 @@ def home(request: Request):
                             link: checkbox.dataset.link || "",
                             title: checkbox.dataset.title || "",
                             platform: checkbox.dataset.platformName || "",
-                            campaign: checkbox.dataset.campaignName || "",
                         }}))
                         .filter((item) => item.sheet_id && item.sheet_name && item.row_idx);
                 }};
@@ -12697,6 +14163,7 @@ def home(request: Request):
 
                 const openCampaignSheetsInPosts = (campaignSlug = "all") => {{
                     closePostsSheetActionMenus();
+                    closePostsColumnMenus();
                     setActivePanel("bai-dang", {{ historyMode: "push" }});
                     setActivePostsTab("");
                     if (postsMasterSearchField) {{
@@ -12720,7 +14187,10 @@ def home(request: Request):
                         try {{
                             const res = await fetch("/api/update-sheet-metadata", {{
                                 method: "POST",
-                                headers: {{ "Content-Type": "application/json" }},
+                                headers: {{
+                                    "Content-Type": "application/json",
+                                    "X-Requested-With": "fetch",
+                                }},
                                 body: JSON.stringify(p)
                             }});
                             const data = await res.json();
@@ -12730,11 +14200,14 @@ def home(request: Request):
                                     modal.classList.remove("flex");
                                 }}
                                 showNotice(data.message || "Cập nhật thành công", "success");
-                                if (data.html) {{
-                                    const appContainer = document.getElementById("app-container");
-                                    if (appContainer) appContainer.innerHTML = data.html;
-                                    syncPostsDomRefs();
-                                    initializeOverviewCharts();
+                                if (typeof data.overview_html === "string") {{
+                                    replaceOverviewPanelHtml(data.overview_html);
+                                }}
+                                if (typeof data.posts_html === "string") {{
+                                    replacePostsPanelHtml(data.posts_html);
+                                }}
+                                if (typeof data.campaign_html === "string") {{
+                                    replaceCampaignPanelHtml(data.campaign_html);
                                 }}
                             }} else {{
                                 showNotice(data?.message || "Lỗi cập nhật", "error");
@@ -12772,6 +14245,10 @@ def home(request: Request):
                         document.addEventListener("click", () => closePostsSheetActionMenus());
                         postsSheetActionsCloseBound = true;
                     }}
+                    if (!postsColumnsMenusCloseBound) {{
+                        document.addEventListener("click", () => closePostsColumnMenus());
+                        postsColumnsMenusCloseBound = true;
+                    }}
                     if (!overviewCampaignOpenBound) {{
                         document.addEventListener("click", (event) => {{
                             const trigger = event.target.closest("[data-overview-open-campaign]");
@@ -12788,6 +14265,7 @@ def home(request: Request):
                                 return;
                             }}
                             closePostsSheetActionMenus();
+                            closePostsColumnMenus();
                             setActivePostsTab(card.dataset.postsTabTrigger || "");
                         }});
                     }});
@@ -12796,6 +14274,7 @@ def home(request: Request):
                         toggle.addEventListener("click", (event) => {{
                             event.preventDefault();
                             event.stopPropagation();
+                            closePostsColumnMenus();
                             const menu = toggle.parentElement?.querySelector("[data-posts-sheet-action-menu]");
                             if (!menu) return;
                             const shouldOpen = menu.classList.contains("hidden");
@@ -12808,6 +14287,7 @@ def home(request: Request):
                             event.preventDefault();
                             event.stopPropagation();
                             closePostsSheetActionMenus();
+                            closePostsColumnMenus();
                             setActivePostsTab(button.dataset.postsSheetTarget || "");
                         }});
                     }});
@@ -12817,6 +14297,7 @@ def home(request: Request):
                             event.preventDefault();
                             event.stopPropagation();
                             closePostsSheetActionMenus();
+                            closePostsColumnMenus();
                             
                             const modal = document.getElementById("edit-metadata-modal");
                             if (!modal) return;
@@ -12825,7 +14306,6 @@ def home(request: Request):
                             modal.querySelector("[data-edit-meta-orig-name]").value = button.dataset.postsSheetName || "";
                             modal.querySelector("[data-edit-meta-name]").value = button.dataset.postsSheetName || "";
                             modal.querySelector("[data-edit-meta-brand]").value = button.dataset.postsSheetBrand || "";
-                            modal.querySelector("[data-edit-meta-campaign]").value = button.dataset.postsSheetCampaign || "";
                             modal.querySelector("[data-edit-meta-industry]").value = button.dataset.postsSheetIndustry || "";
                             
                             modal.classList.remove("hidden");
@@ -12842,6 +14322,7 @@ def home(request: Request):
                     if (postsBackButton) {{
                         postsBackButton.addEventListener("click", () => {{
                             closePostsSheetActionMenus();
+                            closePostsColumnMenus();
                             setActivePostsTab("");
                         }});
                     }}
@@ -12866,6 +14347,12 @@ def home(request: Request):
                         const chips = Array.from(panel.querySelectorAll(".posts-chip"));
                         const selectAll = panel.querySelector("[data-select-all-posts]");
                         const rowChecks = Array.from(panel.querySelectorAll("[data-post-select]"));
+                        const columnsToggle = panel.querySelector("[data-post-columns-toggle]");
+                        const columnsMenu = panel.querySelector("[data-post-columns-menu]");
+                        const columnsList = panel.querySelector("[data-post-columns-list]");
+                        const columnsCount = panel.querySelector("[data-post-columns-count]");
+                        const columnsShowAll = panel.querySelector("[data-post-columns-show-all]");
+                        const postsTable = panel.querySelector(".posts-table");
 
                         chips.forEach((chip) => {{
                             chip.addEventListener("click", () => {{
@@ -12902,6 +14389,83 @@ def home(request: Request):
                                 syncPostsSelectionState();
                             }});
                         }});
+
+                        if (columnsToggle && columnsMenu && columnsList && postsTable) {{
+                            const columnDefs = Array.from(postsTable.querySelectorAll("thead th[data-post-col]"))
+                                .map((th) => {{
+                                    const key = th.dataset.postCol || "";
+                                    const rawLabel = (th.textContent || "").trim();
+                                    const displayLabelMap = {{
+                                        content: "Nội dung",
+                                        creator: "Creator",
+                                        status: "Trạng thái",
+                                        plan: "Tham gia",
+                                        line: "Line",
+                                        tier: "Tier",
+                                        date: "Ngày",
+                                        view: "View",
+                                        reaction: "Reaction",
+                                        share: "Share",
+                                        comment: "Comment",
+                                        buzz: "Buzz",
+                                    }};
+                                    const label = displayLabelMap[key] || rawLabel;
+                                    return key && label ? {{ key, label }} : null;
+                                }})
+                                .filter(Boolean);
+                            const hiddenColumns = new Set();
+
+                            const renderColumnItems = () => {{
+                                const visibleCount = columnDefs.filter((col) => !hiddenColumns.has(col.key)).length;
+                                if (columnsCount) columnsCount.textContent = `${{visibleCount}}/${{columnDefs.length}}`;
+                                if (!columnsList) return;
+                                columnsList.innerHTML = columnDefs.map((col) => {{
+                                    const visible = !hiddenColumns.has(col.key);
+                                    return `
+                                        <button type="button" class="posts-columns-item${{visible ? "" : " is-hidden"}}" data-post-columns-item="${{col.key}}">
+                                            <span>${{col.label}}</span>
+                                            <i class="fa-regular ${{visible ? "fa-eye" : "fa-eye-slash"}}"></i>
+                                        </button>
+                                    `;
+                                }}).join("");
+                                columnsList.querySelectorAll("[data-post-columns-item]").forEach((button) => {{
+                                    button.addEventListener("click", () => {{
+                                        const key = button.dataset.postColumnsItem || "";
+                                        if (!key) return;
+                                        if (hiddenColumns.has(key)) {{
+                                            hiddenColumns.delete(key);
+                                        }} else {{
+                                            hiddenColumns.add(key);
+                                        }}
+                                        postsTable.querySelectorAll(`[data-post-col="${{key}}"]`).forEach((cell) => {{
+                                            cell.classList.toggle("hidden", hiddenColumns.has(key));
+                                        }});
+                                        renderColumnItems();
+                                    }});
+                                }});
+                            }};
+
+                            renderColumnItems();
+
+                            columnsToggle.addEventListener("click", (event) => {{
+                                event.preventDefault();
+                                event.stopPropagation();
+                                const shouldOpen = columnsMenu.classList.contains("hidden");
+                                closePostsColumnMenus(shouldOpen ? columnsMenu : null);
+                            }});
+                            columnsMenu.addEventListener("click", (event) => event.stopPropagation());
+                            if (columnsShowAll) {{
+                                columnsShowAll.addEventListener("click", () => {{
+                                    hiddenColumns.clear();
+                                    columnDefs.forEach((col) => {{
+                                        postsTable.querySelectorAll(`[data-post-col="${{col.key}}"]`).forEach((cell) => {{
+                                            cell.classList.remove("hidden");
+                                        }});
+                                    }});
+                                    renderColumnItems();
+                                }});
+                            }}
+                        }}
                     }});
 
                     if (postsTabCards.length) {{
@@ -13124,6 +14688,7 @@ def home(request: Request):
                         {{ id: "config", url: "/api/dashboard/config", replacer: (html) => {{
                             const el = document.getElementById("cau-hinh");
                             if (el) el.innerHTML = html;
+                            window.bindSheetTabLookupControls?.();
                         }} }},
                         {{ id: "schedule", url: "/api/dashboard/schedule", replacer: (html) => {{
                             const el = document.getElementById("lich-tu-dong");
@@ -13187,7 +14752,7 @@ def home(request: Request):
 
                 // 3. Start polling
                 refreshDashboard();
-                setInterval(refreshDashboard, 4000);
+                setInterval(refreshDashboard, 1200);
             }});
         </script>
     </head>
@@ -13249,24 +14814,24 @@ def home(request: Request):
 
                     <section id="lich-tu-dong" data-dashboard-section="lich-tu-dong" class="dashboard-section dashboard-panel mb-6">
                         <div class="dashboard-section-title">Lịch tự động</div>
-                        <div class="bg-black/20 rounded-3xl p-6 border border-white/5">
+                        <div class="bg-black/20 rounded-2xl p-4 md:p-5 border border-white/5">
                             <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
                                 <span>Lịch tự động</span><span class="hidden" data-schedule-label>{schedule_text}</span>
                             </div>
-                            <form action="/set-schedule" method="get" class="flex flex-col gap-3">
+                            <form action="/set-schedule" method="get" class="flex flex-col gap-2">
                                 <div>
-                                    <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Sheet áp dụng cho lịch</label>
-                                    <input id="schedule-sheet-search" type="text" list="schedule-sheet-datalist" autocomplete="off" placeholder="Gõ để tìm hoặc chọn sheet..." value="{html.escape(runtime_state['schedule_sheet_name'] or '', quote=True)}" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
+                                    <label class="block text-[11px] text-slate-400 mb-1 uppercase tracking-wider">Sheet áp dụng cho lịch</label>
+                                    <input id="schedule-sheet-search" type="text" list="schedule-sheet-datalist" autocomplete="off" placeholder="Gõ để tìm hoặc chọn sheet..." value="{html.escape(runtime_state['schedule_sheet_name'] or '', quote=True)}" class="w-full bg-slate-900 text-slate-100 rounded-xl px-3 py-2 border border-white/10 outline-none focus:border-cyan-400" />
                                     <datalist id="schedule-sheet-datalist"></datalist>
                                     <select id="schedule-sheet-select" name="sheet_binding" class="hidden">
                                         {schedule_config["sheet_options_html"]}
                                     </select>
-                                    <p class="mt-1 text-[11px] text-slate-500">Gõ tên sheet ở ngay ô này để hiện gợi ý, rồi chọn luôn trong cùng một dòng.</p>
+                                    <p class="mt-1 text-[10px] text-slate-500">Gõ tên sheet ở ngay ô này để hiện gợi ý, rồi chọn luôn trong cùng một dòng.</p>
                                 </div>
-                                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
                                     <div>
-                                        <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Chế độ chạy</label>
-                                        <select id="schedule-mode-select" name="mode" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400">
+                                        <label class="block text-[11px] text-slate-400 mb-1 uppercase tracking-wider">Chế độ chạy</label>
+                                        <select id="schedule-mode-select" name="mode" class="w-full bg-slate-900 text-slate-100 rounded-xl px-3 py-2 border border-white/10 outline-none focus:border-cyan-400">
                                             <option value="off" {mode_selected["off"]}>Chưa bật</option>
                                             <option value="daily" {mode_selected["daily"]}>Hằng ngày</option>
                                             <option value="weekly" {mode_selected["weekly"]}>Hằng tuần</option>
@@ -13274,52 +14839,52 @@ def home(request: Request):
                                         </select>
                                     </div>
                                     <div>
-                                        <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Giờ chạy (HH:MM)</label>
-                                        <input name="at" value="{runtime_state['schedule_time']}" placeholder="VD: 09:00" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
+                                        <label class="block text-[11px] text-slate-400 mb-1 uppercase tracking-wider">Giờ chạy (HH:MM)</label>
+                                        <input name="at" value="{runtime_state['schedule_time']}" placeholder="VD: 09:00" class="w-full bg-slate-900 text-slate-100 rounded-xl px-3 py-2 border border-white/10 outline-none focus:border-cyan-400" />
                                     </div>
                                 </div>
-                                <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
                                     <div id="schedule-weekday-shell">
-                                        <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Thứ trong tuần</label>
-                                        <select id="schedule-weekday-select" name="weekday" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400">
+                                        <label class="block text-[11px] text-slate-400 mb-1 uppercase tracking-wider">Thứ trong tuần</label>
+                                        <select id="schedule-weekday-select" name="weekday" class="w-full bg-slate-900 text-slate-100 rounded-xl px-3 py-2 border border-white/10 outline-none focus:border-cyan-400">
                                             {weekday_options}
                                         </select>
-                                        <p class="mt-1 text-[11px] text-slate-500">Dùng cho chế độ hằng tuần.</p>
+                                        <p class="mt-1 text-[10px] text-slate-500">Dùng cho chế độ hằng tuần.</p>
                                     </div>
                                     <div id="schedule-monthdate-shell">
-                                        <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Ngày trong tháng / lịch xem trước</label>
+                                        <label class="block text-[11px] text-slate-400 mb-1 uppercase tracking-wider">Ngày trong tháng / lịch xem trước</label>
                                         <div class="date-shell">
-                                            <input id="schedule-monthdate-input" name="monthdate" type="text" value="{schedule_date_value}" placeholder="YYYY-MM-DD" class="flex-1 bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
+                                            <input id="schedule-monthdate-input" name="monthdate" type="text" value="{schedule_date_value}" placeholder="YYYY-MM-DD" class="flex-1 bg-slate-900 text-slate-100 rounded-xl px-3 py-2 border border-white/10 outline-none focus:border-cyan-400" />
                                             <button id="monthdate-picker-btn" type="button" class="date-picker-btn" title="Mở lịch">
                                                 <i class="fa-solid fa-calendar-days"></i>
                                             </button>
                                         </div>
                                         <input name="monthday" type="hidden" value="{runtime_state['schedule_monthday']}" />
-                                        <p id="schedule-monthdate-help" class="mt-1 text-[11px] text-slate-500">Hằng tháng: chọn ngày chạy. Hằng tuần: mở lịch để xem các ngày của thứ đã chọn được khoanh sẵn.</p>
+                                        <p id="schedule-monthdate-help" class="mt-1 text-[10px] text-slate-500">Hằng tháng: chọn ngày chạy. Hằng tuần: mở lịch để xem các ngày của thứ đã chọn được khoanh sẵn.</p>
                                     </div>
                                 </div>
-                                <div class="grid grid-cols-1 gap-3">
+                                <div class="grid grid-cols-1 gap-2">
                                     <div>
-                                        <label class="block text-xs text-slate-400 mb-2 uppercase tracking-wider">Ngày kết thúc vòng lặp</label>
+                                        <label class="block text-[11px] text-slate-400 mb-1 uppercase tracking-wider">Ngày kết thúc vòng lặp</label>
                                         <div class="date-shell">
-                                            <input id="schedule-enddate-input" name="enddate" type="text" value="{schedule_end_value}" placeholder="YYYY-MM-DD" class="flex-1 bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
+                                            <input id="schedule-enddate-input" name="enddate" type="text" value="{schedule_end_value}" placeholder="YYYY-MM-DD" class="flex-1 bg-slate-900 text-slate-100 rounded-xl px-3 py-2 border border-white/10 outline-none focus:border-cyan-400" />
                                             <button id="enddate-picker-btn" type="button" class="date-picker-btn" title="Mở lịch kết thúc">
                                                 <i class="fa-solid fa-calendar-check"></i>
                                             </button>
                                         </div>
-                                        <p class="mt-1 text-[11px] text-slate-500">Để trống nếu muốn lặp vô thời hạn. Nếu có ngày này thì lịch sẽ tự dừng sau ngày đã chọn.</p>
+                                        <p class="mt-1 text-[10px] text-slate-500">Để trống nếu muốn lặp vô thời hạn. Nếu có ngày này thì lịch sẽ tự dừng sau ngày đã chọn.</p>
                                     </div>
                                 </div>
-                                <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu lịch</button>
+                                <button type="submit" class="w-full py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-xs shadow-sm shadow-slate-900/10">Lưu lịch</button>
                             </form>
                         </div>
                     </section>
 
                     <section id="theo-doi-lan-chay" data-dashboard-section="theo-doi-lan-chay" class="dashboard-section dashboard-panel mb-6">
                         <div class="dashboard-section-title">Theo dõi lần chạy</div>
-                        <div class="bg-black/20 rounded-3xl p-6 border border-white/5">
+                        <div class="bg-black/20 rounded-2xl p-4 md:p-5 border border-white/5">
                             <div class="grid grid-cols-1 gap-4">
-                                <div class="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+                                <div class="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3">
                                     <div class="flex items-center justify-between gap-3 mb-3">
                                         <div>
                                             <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Sheet đã đặt lịch</div>
@@ -13330,7 +14895,7 @@ def home(request: Request):
                                         {schedule_tracking["entries_html"]}
                                     </div>
                                 </div>
-                                <div id="schedule-track-detail-shell" class="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
+                                <div id="schedule-track-detail-shell" class="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3">
                                     <div class="flex items-center justify-between gap-3 mb-3">
                                         <div>
                                             <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Theo dõi lần chạy</div>
@@ -13338,64 +14903,64 @@ def home(request: Request):
                                         </div>
                                         <div class="text-xs text-slate-500">Tự cập nhật theo lịch và khi bấm chạy tay</div>
                                     </div>
-                                    <div id="schedule-track-empty-state" class="rounded-2xl border border-dashed border-white/10 bg-slate-900/35 px-4 py-10 text-center {'hidden' if schedule_tracking['has_active_entry'] else ''}">
+                                    <div id="schedule-track-empty-state" class="rounded-2xl border border-dashed border-white/10 bg-slate-900/35 px-3 py-8 text-center {'hidden' if schedule_tracking['has_active_entry'] else ''}">
                                         <div class="text-sm font-black text-slate-200">Chọn một sheet ở danh sách bên trên</div>
                                         <div class="mt-2 text-xs text-slate-500">Khi bạn bấm đúng sheet muốn xem, bảng tracking bên dưới mới hiện chi tiết của sheet đó.</div>
                                     </div>
                                     <div id="schedule-track-detail-body" class="grid grid-cols-1 2xl:grid-cols-[minmax(0,1fr),340px] gap-4 items-start {'hidden' if not schedule_tracking['has_active_entry'] else ''}">
                                         <div>
-                                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3">
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-2">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Lần kế tiếp</div>
                                                     <div id="schedule-track-next" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["next_run_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Bắt đầu gần nhất</div>
                                                     <div id="schedule-track-started" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_started_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Kết thúc gần nhất</div>
                                                     <div id="schedule-track-finished" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_finished_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thời lượng</div>
                                                     <div id="schedule-track-duration" class="mt-2 text-sm font-black text-cyan-200">{html.escape(schedule_tracking["last_duration_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Đang chạy từ</div>
                                                     <div id="schedule-track-running" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["is_running_text"])}</div>
                                                 </div>
                                             </div>
-                                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3 mt-3">
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-2 mt-2">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Trạng thái</div>
                                                     <div id="schedule-track-status" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_status_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Nguồn chạy</div>
                                                     <div id="schedule-track-source" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_source_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Tab đã chạy</div>
                                                     <div id="schedule-track-sheet" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_sheet_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Link đã quét</div>
                                                     <div id="schedule-track-processed" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_processed_text"])}</div>
                                                 </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
+                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
                                                     <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thành công / trượt</div>
                                                     <div class="mt-2 text-sm font-black text-slate-100"><span id="schedule-track-success">{html.escape(schedule_tracking["last_success_text"])}</span> / <span id="schedule-track-failed">{html.escape(schedule_tracking["last_failed_text"])}</span></div>
                                                 </div>
                                             </div>
-                                            <div class="mt-4">
+                                            <div class="mt-3">
                                                 <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 font-black mb-2">Lịch sử gần nhất</div>
                                                 <div id="schedule-track-history" class="grid gap-2">
                                                     {schedule_tracking["history_html"]}
                                                 </div>
                                             </div>
                                         </div>
-                                        <div class="rounded-2xl border border-white/10 bg-slate-900/40 p-4">
+                                        <div class="rounded-2xl border border-white/10 bg-slate-900/40 p-3">
                                             <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Lịch xem trước</div>
                                             <div id="schedule-track-calendar-title" class="mt-2 text-base font-black text-slate-100">{html.escape(schedule_tracking["calendar_title"])}</div>
                                             <div id="schedule-track-calendar-subtext" class="mt-1 text-xs text-slate-400 leading-5">{html.escape(schedule_tracking["calendar_subtext"])}</div>
@@ -13425,15 +14990,9 @@ def home(request: Request):
                                 <input type="text" data-edit-meta-name name="sheet_name" class="w-full bg-slate-800 border-0 rounded-2xl p-4 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Nhập tên mới cho sheet..." />
                             </div>
 
-                            <div class="grid grid-cols-2 gap-4">
-                                <div class="space-y-1.5">
-                                    <label class="text-[11px] uppercase tracking-widest text-slate-500 font-black ml-1">Thương hiệu</label>
-                                    <input type="text" data-edit-meta-brand name="brand_label" class="w-full bg-slate-800 border-0 rounded-2xl p-4 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Tên thương hiệu..." />
-                                </div>
-                                <div class="space-y-1.5">
-                                    <label class="text-[11px] uppercase tracking-widest text-slate-500 font-black ml-1">Chiến dịch</label>
-                                    <input type="text" data-edit-meta-campaign name="campaign_label" class="w-full bg-slate-800 border-0 rounded-2xl p-4 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Tên chiến dịch..." />
-                                </div>
+                            <div class="space-y-1.5">
+                                <label class="text-[11px] uppercase tracking-widest text-slate-500 font-black ml-1">Thương hiệu</label>
+                                <input type="text" data-edit-meta-brand name="brand_label" class="w-full bg-slate-800 border-0 rounded-2xl p-4 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Tên thương hiệu..." />
                             </div>
 
                             <div class="space-y-1.5">

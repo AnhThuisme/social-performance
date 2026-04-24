@@ -1,71 +1,25 @@
-import os
 import json
 import re
 import time
 import urllib.parse
+from datetime import datetime
 from typing import Callable, Optional
 
 import requests
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.edge.options import Options as EdgeOptions
-from selenium.webdriver.edge.service import Service as EdgeService
 
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = max(8.0, float(os.getenv("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", "16") or "16"))
-DEFAULT_SETTLE_SECONDS = max(0.2, float(os.getenv("SELENIUM_SETTLE_SECONDS", "0.9") or "0.9"))
-DEFAULT_SCROLL_SETTLE_SECONDS = max(0.05, float(os.getenv("SELENIUM_SCROLL_SETTLE_SECONDS", "0.18") or "0.18"))
-DEFAULT_READY_POLL_SECONDS = max(0.05, float(os.getenv("SELENIUM_READY_POLL_SECONDS", "0.15") or "0.15"))
-DEFAULT_READY_TIMEOUT_SECONDS = max(0.5, float(os.getenv("SELENIUM_READY_TIMEOUT_SECONDS", "2.4") or "2.4"))
-REMOTE_DRIVER_RETRY_ATTEMPTS = max(1, int(os.getenv("SELENIUM_REMOTE_RETRY_ATTEMPTS", "3") or "3"))
-REMOTE_DRIVER_RETRY_DELAY_SECONDS = max(0.5, float(os.getenv("SELENIUM_REMOTE_RETRY_DELAY_SECONDS", "2") or "2"))
-REMOTE_PAGE_LOAD_TIMEOUT_SECONDS = max(
-    DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS,
-    float(os.getenv("SELENIUM_REMOTE_PAGE_LOAD_TIMEOUT_SECONDS", "30") or "30"),
-)
-REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS = max(
-    3.0,
-    float(os.getenv("SELENIUM_REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS", "8") or "8"),
-)
-REMOTE_STATUS_TIMEOUT_SECONDS = max(
-    REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS,
-    float(os.getenv("SELENIUM_REMOTE_STATUS_TIMEOUT_SECONDS", "75") or "75"),
-)
-REMOTE_STATUS_POLL_SECONDS = max(
-    0.5,
-    float(os.getenv("SELENIUM_REMOTE_STATUS_POLL_SECONDS", "2") or "2"),
-)
-REMOTE_READY_CACHE_SECONDS = max(
-    1.0,
-    float(os.getenv("SELENIUM_REMOTE_READY_CACHE_SECONDS", "12") or "12"),
-)
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 15
+DEFAULT_SETTLE_SECONDS = 1.7
+TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS = 40
+TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS = 1.2
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
-IS_VERCEL_RUNTIME = bool(str(os.getenv("VERCEL", "") or "").strip())
-RECOVERABLE_WEBDRIVER_ERROR_MARKERS = (
-    "service unavailable",
-    "invalid session id",
-    "session deleted",
-    "target window already closed",
-    "disconnected",
-    "chrome not reachable",
-    "no such window",
-    "unable to route",
-    "connection refused",
-    "remote end closed connection",
-    "timeout receiving message from renderer",
-)
-
-
-class RecoverableSeleniumError(RuntimeError):
-    pass
-
-
-REMOTE_READY_CACHE = {}
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -77,46 +31,7 @@ def _emit(logger: Optional[Callable[[str], None]], message: str):
         pass
 
 
-def _first_env(*names: str) -> str:
-    for name in names:
-        value = str(os.getenv(name, "") or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def is_recoverable_webdriver_error(exc_or_message) -> bool:
-    error_text = str(exc_or_message or "").strip().lower()
-    if not error_text:
-        return bool(_remote_url())
-    return any(marker in error_text for marker in RECOVERABLE_WEBDRIVER_ERROR_MARKERS)
-
-
-def describe_webdriver_error(exc) -> str:
-    parts = []
-    class_name = exc.__class__.__name__ if exc else "WebDriverException"
-    direct_text = str(exc or "").strip()
-    if direct_text:
-        parts.append(direct_text)
-    msg_attr = str(getattr(exc, "msg", "") or "").strip()
-    if msg_attr and msg_attr not in parts:
-        parts.append(msg_attr)
-    cause = getattr(exc, "__cause__", None)
-    cause_text = str(cause or "").strip()
-    if cause_text and cause_text not in parts:
-        parts.append(cause_text)
-    if class_name and all(class_name not in item for item in parts):
-        parts.append(class_name)
-    if not parts:
-        parts.append(class_name)
-    return " | ".join(parts)
-
-
 def _add_common_browser_args(options, headless: bool = True):
-    try:
-        options.page_load_strategy = "eager"
-    except Exception:
-        pass
     args = [
         "--disable-gpu",
         "--no-sandbox",
@@ -124,7 +39,6 @@ def _add_common_browser_args(options, headless: bool = True):
         "--disable-notifications",
         "--disable-popup-blocking",
         "--disable-blink-features=AutomationControlled",
-        "--blink-settings=imagesEnabled=false",
         "--window-size=1440,2200",
         "--lang=en-US",
         f"--user-agent={DEFAULT_USER_AGENT}",
@@ -148,211 +62,12 @@ def _apply_stealth(driver):
         pass
 
 
-def _remote_url() -> str:
-    raw_value = _first_env("SELENIUM_REMOTE_URL", "REMOTE_WEBDRIVER_URL")
-    if not raw_value:
-        return ""
-
-    normalized = raw_value.strip().strip("\"'").rstrip("/")
-    if normalized.lower() in {"value", "your-value", "your_url_here"}:
-        return ""
-    if normalized.endswith("/wd/hub/status"):
-        normalized = normalized[: -len("/wd/hub/status")]
-    elif normalized.endswith("/status"):
-        normalized = normalized[: -len("/status")]
-    return normalized
-
-
-def has_remote_selenium_url() -> bool:
-    return bool(_remote_url())
-
-
-def _remote_status_url(remote_url: str) -> str:
-    normalized = str(remote_url or "").strip().rstrip("/")
-    if not normalized:
-        return ""
-    if normalized.endswith("/wd/hub/status"):
-        return normalized
-    if normalized.endswith("/wd/hub"):
-        return normalized + "/status"
-    if normalized.endswith("/status"):
-        return normalized
-    return normalized + "/wd/hub/status"
-
-
-def _remote_status_is_ready(payload) -> bool:
-    if isinstance(payload, dict):
-        value = payload.get("value")
-        if isinstance(value, dict):
-            if value.get("ready") is True:
-                return True
-            if str(value.get("availability", "") or "").strip().upper() == "UP":
-                return True
-        if payload.get("ready") is True:
-            return True
-    return False
-
-
-def _describe_remote_status_payload(payload) -> str:
-    if not isinstance(payload, dict):
-        return ""
-    value = payload.get("value")
-    if isinstance(value, dict):
-        message = str(value.get("message", "") or "").strip()
-        if message:
-            return message
-        availability = str(value.get("availability", "") or "").strip()
-        if availability:
-            return f"availability={availability}"
-    message = str(payload.get("message", "") or "").strip()
-    if message:
-        return message
-    status = str(payload.get("status", "") or "").strip()
-    if status:
-        return f"status={status}"
-    return ""
-
-
-def _wait_for_remote_service(
-    remote_url: str,
-    logger: Optional[Callable[[str], None]] = None,
-    browser_name: str = "Remote Chrome",
-):
-    normalized_url = str(remote_url or "").strip()
-    if not normalized_url:
-        return
-
-    cached_ready_at = REMOTE_READY_CACHE.get(normalized_url, 0.0)
-    now = time.time()
-    if cached_ready_at and (now - cached_ready_at) <= REMOTE_READY_CACHE_SECONDS:
-        return
-
-    status_url = _remote_status_url(normalized_url)
-    deadline = now + REMOTE_STATUS_TIMEOUT_SECONDS
-    last_status_text = ""
-    has_waited = False
-
-    while time.time() < deadline:
-        try:
-            response = requests.get(status_url, timeout=REMOTE_STATUS_REQUEST_TIMEOUT_SECONDS)
-            if response.ok:
-                payload = response.json() if response.content else {}
-                if _remote_status_is_ready(payload):
-                    REMOTE_READY_CACHE[normalized_url] = time.time()
-                    if has_waited:
-                        _emit(logger, f"{browser_name} da san sang, dang mo browser...")
-                    return
-                last_status_text = _describe_remote_status_payload(payload) or f"HTTP {response.status_code}"
-            else:
-                last_status_text = f"HTTP {response.status_code}"
-        except Exception as exc:
-            last_status_text = describe_webdriver_error(exc)
-
-        if not has_waited:
-            _emit(logger, f"{browser_name} dang doi Selenium service khoi dong tu remote host...")
-            has_waited = True
-        time.sleep(REMOTE_STATUS_POLL_SECONDS)
-
-    detail = last_status_text or "remote status endpoint chua san sang"
-    raise RuntimeError(
-        f"Selenium remote chua san sang: {detail}. "
-        f"Kiem tra lai {status_url}"
-    )
-
-
-def _build_remote_driver(
-    headless: bool = True,
-    browser_name: str = "chrome",
-    logger: Optional[Callable[[str], None]] = None,
-):
-    remote_url = _remote_url()
-    if not remote_url:
-        raise RuntimeError(
-            "Missing or invalid SELENIUM_REMOTE_URL. "
-            "Use a Selenium server URL like https://your-service.onrender.com/wd/hub"
-        )
-
-    browser_key = (browser_name or "chrome").strip().lower()
-    if browser_key == "edge":
-        options = EdgeOptions()
-    else:
-        browser_key = "chrome"
-        options = ChromeOptions()
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-        options.add_experimental_option(
-            "prefs",
-            {
-                "profile.managed_default_content_settings.images": 2,
-                "profile.default_content_setting_values.notifications": 2,
-            },
-        )
-
-    _add_common_browser_args(options, headless=headless)
-    _wait_for_remote_service(
-        remote_url,
-        logger=logger,
-        browser_name=f"Remote {browser_key.capitalize()}",
-    )
-    try:
-        driver = webdriver.Remote(command_executor=remote_url, options=options)
-    except KeyError as exc:
-        raise RuntimeError(
-            f"Remote Selenium URL khong dung dinh dang: {remote_url}. "
-            "Hay dung URL server, khong dung trang /status."
-        ) from exc
-    driver.set_page_load_timeout(REMOTE_PAGE_LOAD_TIMEOUT_SECONDS)
-    _apply_stealth(driver)
-    REMOTE_READY_CACHE[remote_url] = time.time()
-    return driver
-
-
-def _remote_driver_builders(preferred_browser: str = "", logger: Optional[Callable[[str], None]] = None):
-    remote_url = _remote_url()
-    if not remote_url:
-        return []
-
-    requested = (
-        _first_env("SELENIUM_REMOTE_BROWSER")
-        or (preferred_browser or "").strip().lower()
-        or "chrome"
-    )
-    browser_order = ["chrome", "edge"]
-    if requested in browser_order:
-        browser_order.remove(requested)
-        browser_order.insert(0, requested)
-
-    return [
-        (
-            f"Remote {browser_name.capitalize()}",
-            lambda headless, browser_name=browser_name, logger=logger: _build_remote_driver(
-                headless=headless,
-                browser_name=browser_name,
-                logger=logger,
-            ),
-        )
-        for browser_name in browser_order
-    ]
-
-
 def _build_chrome_driver(headless: bool = True):
     options = ChromeOptions()
     _add_common_browser_args(options, headless=headless)
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    options.add_experimental_option(
-        "prefs",
-        {
-            "profile.managed_default_content_settings.images": 2,
-            "profile.default_content_setting_values.notifications": 2,
-        },
-    )
-    chrome_binary = _first_env("CHROME_BIN", "GOOGLE_CHROME_BIN", "CHROMIUM_BIN")
-    chromedriver_path = _first_env("CHROMEDRIVER_PATH")
-    if chrome_binary:
-        options.binary_location = chrome_binary
-    service = ChromeService(executable_path=chromedriver_path) if chromedriver_path else None
-    driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
+    driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
     return driver
@@ -361,12 +76,7 @@ def _build_chrome_driver(headless: bool = True):
 def _build_edge_driver(headless: bool = True):
     options = EdgeOptions()
     _add_common_browser_args(options, headless=headless)
-    edge_binary = _first_env("EDGE_BIN")
-    edgedriver_path = _first_env("MSEDGEDRIVER_PATH", "EDGEDRIVER_PATH")
-    if edge_binary:
-        options.binary_location = edge_binary
-    service = EdgeService(executable_path=edgedriver_path) if edgedriver_path else None
-    driver = webdriver.Edge(service=service, options=options) if service else webdriver.Edge(options=options)
+    driver = webdriver.Edge(options=options)
     driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
     return driver
@@ -393,54 +103,6 @@ def create_selenium_driver(
     raise RuntimeError("Không mở được Selenium browser. " + " | ".join(errors))
 
 
-def create_selenium_driver(
-    logger: Optional[Callable[[str], None]] = None,
-    headless: bool = True,
-    preferred_browser: str = "",
-):
-    errors = []
-    preferred = (preferred_browser or "").strip().lower()
-    builders = _remote_driver_builders(preferred_browser=preferred_browser, logger=logger)
-    local_builders = [("Chrome", _build_chrome_driver), ("Edge", _build_edge_driver)]
-    if preferred:
-        local_builders.sort(key=lambda item: 0 if item[0].lower() == preferred else 1)
-    builders.extend(local_builders)
-
-    for browser_name, builder in builders:
-        is_remote_builder = browser_name.lower().startswith("remote ")
-        max_attempts = REMOTE_DRIVER_RETRY_ATTEMPTS if is_remote_builder else 1
-        for attempt in range(1, max_attempts + 1):
-            try:
-                driver = builder(headless=headless)
-                mode = "headless" if headless else "normal"
-                _emit(logger, f"Selenium dang dung {browser_name} {mode}")
-                return driver
-            except Exception as exc:
-                error_detail = describe_webdriver_error(exc)
-                if is_remote_builder and not str(error_detail or "").strip():
-                    error_detail = "Remote Selenium khong tra ve thong tin loi"
-                recoverable = is_remote_builder and is_recoverable_webdriver_error(error_detail)
-                if recoverable and attempt < max_attempts:
-                    delay_seconds = REMOTE_DRIVER_RETRY_DELAY_SECONDS * attempt
-                    _emit(
-                        logger,
-                        f"{browser_name} tam thoi chua san sang, thu mo lai lan {attempt + 1}/{max_attempts} sau {delay_seconds:.1f}s...",
-                    )
-                    time.sleep(delay_seconds)
-                    continue
-                errors.append(f"{browser_name}: {error_detail[:180]}")
-                break
-
-    message = "Khong mo duoc Selenium browser. " + " | ".join(errors)
-    if IS_VERCEL_RUNTIME and not _remote_url():
-        message += (
-            " Vercel runtime khong co Chrome/chromedriver local. "
-            "Hay deploy phan quet Selenium bang Docker (Render/Railway/Fly) "
-            "hoac cung cap SELENIUM_REMOTE_URL."
-        )
-    raise RuntimeError(message)
-
-
 def close_selenium_driver(driver):
     if not driver:
         return
@@ -448,6 +110,23 @@ def close_selenium_driver(driver):
         driver.quit()
     except Exception:
         pass
+
+
+def _detect_platform_from_url(url: str) -> str:
+    url_lower = str(url or "").strip().lower()
+    if "facebook.com" in url_lower or "fb.watch" in url_lower:
+        return "facebook"
+    if "tiktok.com" in url_lower or "vt.tiktok.com" in url_lower or "vm.tiktok.com" in url_lower:
+        return "tiktok"
+    if "instagram.com" in url_lower:
+        return "instagram"
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
+    return ""
+
+
+def _is_tiktok_url(url: str) -> bool:
+    return _detect_platform_from_url(url) == "tiktok"
 
 
 def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> str:
@@ -471,12 +150,12 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
                 pass
 
         try:
-            response = requests.head(url, allow_redirects=True, timeout=6)
+            response = requests.head(url, allow_redirects=True, timeout=10)
             if response.url:
                 return response.url.split("#")[0]
         except Exception:
             try:
-                response = requests.get(url, allow_redirects=True, timeout=6, stream=True)
+                response = requests.get(url, allow_redirects=True, timeout=10, stream=True)
                 final_url = response.url
                 response.close()
                 if final_url:
@@ -490,14 +169,34 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
 
 
 def _wait_until_ready(driver):
-    deadline = time.time() + DEFAULT_READY_TIMEOUT_SECONDS
-    while time.time() < deadline:
+    for _ in range(24):
         try:
-            if driver.execute_script("return document.readyState") in {"interactive", "complete"}:
+            if driver.execute_script("return document.readyState") == "complete":
                 break
         except Exception:
             pass
-        time.sleep(DEFAULT_READY_POLL_SECONDS)
+        time.sleep(0.25)
+
+
+def _focus_visible_browser_window(driver):
+    if not driver:
+        return
+    try:
+        driver.set_window_position(30, 30)
+    except Exception:
+        pass
+    try:
+        driver.set_window_size(1280, 960)
+    except Exception:
+        pass
+    try:
+        driver.maximize_window()
+    except Exception:
+        pass
+    try:
+        driver.execute_script("window.focus();")
+    except Exception:
+        pass
 
 
 def _read_current_page_bundle(driver):
@@ -540,19 +239,13 @@ def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None
         driver.get(url)
     except TimeoutException:
         _emit(logger, f"Timeout khi tải trang: {url[:90]}")
-    except WebDriverException as exc:
-        error_detail = describe_webdriver_error(exc)
-        if "timeout receiving message from renderer" in error_detail.lower():
-            _emit(logger, f"Trang phan hoi cham, van thu doc du lieu: {url[:90]}")
-        else:
-            raise
     _wait_until_ready(driver)
     time.sleep(DEFAULT_SETTLE_SECONDS)
     try:
         driver.execute_script("window.scrollTo(0, Math.min(900, document.body.scrollHeight * 0.25));")
-        time.sleep(DEFAULT_SCROLL_SETTLE_SECONDS)
+        time.sleep(0.8)
         driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(DEFAULT_SCROLL_SETTLE_SECONDS)
+        time.sleep(0.4)
     except Exception:
         pass
     return _read_current_page_bundle(driver)
@@ -657,17 +350,105 @@ def _extract_text_metric(text: str, labels) -> Optional[int]:
     return _extract_number(text, patterns)
 
 
+def _format_air_date(day, month) -> str:
+    try:
+        day_num = int(day)
+        month_num = int(month)
+    except Exception:
+        return ""
+    if not (1 <= day_num <= 31 and 1 <= month_num <= 12):
+        return ""
+    return f"{day_num}-{month_num}"
+
+
+def _format_air_date_from_datetime(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return _format_air_date(value.day, value.month)
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1_000_000_000_000:
+            timestamp /= 1000.0
+        try:
+            return _format_air_date_from_datetime(datetime.fromtimestamp(timestamp))
+        except Exception:
+            return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    if re.fullmatch(r"\d{10,13}", raw):
+        try:
+            return _format_air_date_from_datetime(float(raw))
+        except Exception:
+            return ""
+    normalized = raw.replace("T", " ").replace("Z", "").strip()
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%m-%d",
+        "%m/%d",
+        "%m.%d",
+    ):
+        try:
+            parsed = datetime.strptime(normalized, fmt)
+            return _format_air_date(parsed.day, parsed.month)
+        except Exception:
+            continue
+    try:
+        return _format_air_date_from_datetime(datetime.fromisoformat(normalized))
+    except Exception:
+        return ""
+
+
+def _extract_air_date_from_text(text: str) -> str:
+    if not text:
+        return ""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    for line in lines[:20]:
+        cleaned = line.replace("·", " ").replace("•", " ").strip()
+        match = re.fullmatch(r"([01]?\d)\s*[-/.]\s*([0-3]?\d)", cleaned)
+        if match:
+            month_token, day_token = match.groups()
+            return _format_air_date(day_token, month_token)
+    return ""
+
+
 def _has_tiktok_challenge(bundle) -> bool:
     text = (bundle.get("text") or "").strip().lower()
     source = (bundle.get("source") or "").lower()
-    return any(
-        marker in text or marker in source
-        for marker in (
-            "drag the slider to fit the puzzle",
-            "verifying...",
-            "captcha",
-        )
+    visible_markers = (
+        "drag the slider to fit the puzzle",
+        "verify to continue",
+        "complete the puzzle",
     )
+    if any(marker in text for marker in visible_markers):
+        return True
+    source_markers = (
+        "secsdk-captcha",
+        "captcha-verify-container",
+        "captcha_container",
+        "drag the slider to fit the puzzle",
+    )
+    return any(marker in source for marker in source_markers)
+
+
+def _payload_has_tiktok_signal(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    signal_keys = ("v", "l", "s", "c", "save")
+    signal_count = 0
+    for key in signal_keys:
+        try:
+            if int(payload.get(key) or 0) > 0:
+                signal_count += 1
+        except Exception:
+            continue
+    return signal_count >= 2
 
 
 def _extract_tiktok_caption(bundle) -> str:
@@ -718,6 +499,9 @@ def _extract_tiktok_photo_from_text(bundle):
         "s": metric_values[-1],
         "cap": _extract_tiktok_caption(bundle),
     }
+    air_date = _extract_air_date_from_text(text)
+    if air_date:
+        payload["air_date"] = air_date
     if len(metric_values) >= 4:
         payload["save"] = metric_values[-2]
     return payload
@@ -742,6 +526,9 @@ def _extract_tiktok(bundle):
         anchor_infos = item.get("anchorInfos") if isinstance(item, dict) else []
         has_shop_anchor = bool(anchors or anchor_infos)
         is_ad_video = bool(item.get("isAd")) if isinstance(item, dict) else False
+        air_date = _format_air_date_from_datetime(
+            item.get("createTime") if isinstance(item, dict) else None
+        ) or _extract_air_date_from_text(bundle.get("text") or "")
         payload = {
             "v": _parse_compact_number(_pick_dict_value(stats_v2, stats, "playCount")) or 0,
             "l": _parse_compact_number(_pick_dict_value(stats_v2, stats, "diggCount")) or 0,
@@ -752,6 +539,8 @@ def _extract_tiktok(bundle):
             or metas.get("og:description", "")
             or metas.get("og:title", ""),
         }
+        if air_date:
+            payload["air_date"] = air_date
         save_count = _parse_compact_number(_pick_dict_value(stats_v2, stats, "collectCount"))
         if save_count is not None:
             payload["save"] = save_count
@@ -765,7 +554,7 @@ def _extract_tiktok(bundle):
             payload["_warning"] = (
                 f"TikTok video {warning_text}. TikTok web public có thể chỉ trả số liệu giới hạn, nên các chỉ số có thể lệch."
             )
-        if any(payload.get(key) for key in ("v", "l", "s", "c", "save")) or payload.get("cap"):
+        if any(payload.get(key) for key in ("v", "l", "s", "c", "save")) or payload.get("cap") or payload.get("air_date"):
             return payload
 
     if is_photo_post:
@@ -782,6 +571,11 @@ def _extract_tiktok(bundle):
         or metas.get("og:description", "")
         or metas.get("og:title", ""),
     }
+    air_date = _format_air_date_from_datetime(
+        _extract_string(source, [r'"createTime"\s*:\s*"?(\d{10,13})"?'])
+    ) or _extract_air_date_from_text(bundle.get("text") or "")
+    if air_date:
+        payload["air_date"] = air_date
     save_count = _extract_number(
         source,
         [
@@ -819,6 +613,12 @@ def _extract_instagram(bundle):
                     continue
                 caption_obj = item.get("caption")
                 caption_text = caption_obj.get("text", "") if isinstance(caption_obj, dict) else str(caption_obj or "")
+                air_date = (
+                    _format_air_date_from_datetime(item.get("taken_at"))
+                    or _format_air_date_from_datetime(item.get("taken_at_timestamp"))
+                    or _format_air_date_from_datetime(item.get("published_at"))
+                    or _extract_air_date_from_text(text)
+                )
                 payload = {
                     "v": _parse_compact_number(item.get("view_count"))
                     or _parse_compact_number(item.get("play_count"))
@@ -831,10 +631,12 @@ def _extract_instagram(bundle):
                     "c": _parse_compact_number(item.get("comment_count")) or 0,
                     "cap": caption_text or metas.get("og:description", "") or metas.get("og:title", ""),
                 }
-                if any(payload.get(key) for key in ("v", "l", "s", "c")) or payload.get("cap"):
+                if air_date:
+                    payload["air_date"] = air_date
+                if any(payload.get(key) for key in ("v", "l", "s", "c")) or payload.get("cap") or payload.get("air_date"):
                     return payload
 
-    return {
+    payload = {
         "v": _extract_number(
             source,
             [
@@ -869,6 +671,22 @@ def _extract_instagram(bundle):
         or metas.get("og:description", "")
         or metas.get("og:title", ""),
     }
+    air_date = (
+        _format_air_date_from_datetime(
+            _extract_string(
+                source,
+                [
+                    r'"taken_at"\s*:\s*"?(\d{10,13})"?',
+                    r'"taken_at_timestamp"\s*:\s*"?(\d{10,13})"?',
+                    r'"published_at"\s*:\s*"?(\d{10,13})"?',
+                ],
+            )
+        )
+        or _extract_air_date_from_text(text)
+    )
+    if air_date:
+        payload["air_date"] = air_date
+    return payload
 
 
 def _extract_facebook_target_ids(url: str):
@@ -987,6 +805,21 @@ def _extract_facebook(bundle):
         )
         or metas.get("og:title", ""),
     }
+    air_date = (
+        _format_air_date_from_datetime(
+            _extract_string(
+                scoped_source,
+                [
+                    r'"creation_time"\s*:\s*"?(\d{10,13})"?',
+                    r'"publish_time"\s*:\s*"?(\d{10,13})"?',
+                    r'"story_creation_time"\s*:\s*"?(\d{10,13})"?',
+                ],
+            )
+        )
+        or _extract_air_date_from_text(text)
+    )
+    if air_date:
+        payload["air_date"] = air_date
 
     view_value = (
         _extract_number(
@@ -1113,12 +946,54 @@ def _extract_facebook(bundle):
 
 
 def _should_retry_tiktok_visually(bundle, payload) -> bool:
-    url = (bundle.get("url") or "").lower()
-    text = (bundle.get("text") or "").strip().lower()
-    has_signal = any((payload or {}).get(key) for key in ("v", "l", "s", "c", "save"))
-    photo_post = "/photo/" in url
-    login_only = text in {"", "log in"} or text.startswith("log in\n")
-    return (photo_post or _has_tiktok_challenge(bundle)) and (not has_signal or login_only or _has_tiktok_challenge(bundle))
+    if _has_tiktok_challenge(bundle):
+        # Neu van doc duoc so lieu kha day du thi khong can day Chrome thuong len nua.
+        if _payload_has_tiktok_signal(payload):
+            return False
+        return True
+
+    # Chi mo Chrome thuong khi that su gap slider captcha.
+    # Cac case TikTok Shop/App banner van co so lieu thi khong can day cua so len nua.
+    return False
+
+
+def _wait_for_tiktok_manual_challenge(
+    driver,
+    bundle,
+    logger: Optional[Callable[[str], None]] = None,
+):
+    if not _has_tiktok_challenge(bundle):
+        return bundle
+
+    _focus_visible_browser_window(driver)
+    _emit(
+        logger,
+        "TikTok đang hiện captcha slider. Chrome thường đã mở ra, bạn kéo captcha xong thì tool sẽ tự đọc tiếp số liệu.",
+    )
+
+    best_bundle = bundle
+    deadline = time.time() + TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        time.sleep(TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS)
+        try:
+            current_bundle = _read_current_page_bundle(driver)
+        except Exception:
+            continue
+        if len(current_bundle.get("text", "")) >= len(best_bundle.get("text", "")):
+            best_bundle = current_bundle
+        if not _has_tiktok_challenge(current_bundle):
+            _emit(logger, "Đã qua captcha TikTok, đang lấy lại số liệu...")
+            time.sleep(0.6)
+            try:
+                refreshed_bundle = _read_current_page_bundle(driver)
+                if len(refreshed_bundle.get("text", "")) >= len(best_bundle.get("text", "")):
+                    best_bundle = refreshed_bundle
+            except Exception:
+                pass
+            return best_bundle
+
+    _emit(logger, "TikTok captcha chưa được giải xong trong thời gian chờ, bỏ qua lần đọc này.")
+    return best_bundle
 
 
 def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
@@ -1129,6 +1004,7 @@ def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[
     _wait_until_ready(driver)
 
     best_bundle = _read_current_page_bundle(driver)
+    best_bundle = _wait_for_tiktok_manual_challenge(driver, best_bundle, logger=logger)
     deadline = time.time() + 12
     while time.time() < deadline:
         time.sleep(1)
@@ -1160,7 +1036,14 @@ def _retry_tiktok_with_visible_browser(url: str, logger: Optional[Callable[[str]
 
 
 def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Optional[Callable[[str], None]] = None):
-    platform = (platform_name or "").strip().lower()
+    requested_platform = (platform_name or "").strip().lower()
+    detected_platform = _detect_platform_from_url(url)
+    platform = detected_platform or requested_platform
+    if detected_platform and requested_platform and detected_platform != requested_platform:
+        _emit(
+            logger,
+            f"Phát hiện lệch platform: sheet ghi {requested_platform}, nhưng link thực là {detected_platform}. Dùng theo link thực.",
+        )
     if platform == "facebook":
         url = resolve_fb_url(url, logger=logger)
 
@@ -1179,14 +1062,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if not extractor:
             return None
         payload = extractor(bundle)
-        if platform == "tiktok" and _should_retry_tiktok_visually(bundle, payload):
-            if own_driver and has_remote_selenium_url():
-                _emit(
-                    logger,
-                    "TikTok/headless bi chan tren remote, dong session hien tai va thu lai bang Chrome thuong 1 lan",
-                )
-                close_selenium_driver(driver)
-                driver = None
+        if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
             if retry_payload:
                 payload = retry_payload
@@ -1196,17 +1072,14 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if warning_message:
             _emit(logger, warning_message)
         has_signal = any(payload.get(key) for key in ("v", "l", "s", "c", "save"))
-        if has_signal or payload.get("cap"):
+        if has_signal or payload.get("cap") or payload.get("air_date"):
             return payload
         return None
     except WebDriverException as exc:
-        error_detail = describe_webdriver_error(exc)
-        _emit(logger, f"Lỗi Selenium {platform}: {error_detail[:200]}")
-        if is_recoverable_webdriver_error(exc):
-            raise RecoverableSeleniumError(error_detail) from exc
+        _emit(logger, f"Lỗi Selenium {platform}: {str(exc)[:160]}")
         return None
     except Exception as exc:
-        _emit(logger, f"Lỗi đọc dữ liệu {platform}: {str(exc)[:200]}")
+        _emit(logger, f"Lỗi đọc dữ liệu {platform}: {str(exc)[:160]}")
         return None
     finally:
         if own_driver:

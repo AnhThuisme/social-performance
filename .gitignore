@@ -16,3 +16,20 @@ dist/
 # Local exports and generated files
 Social_Export.xlsx
 _dashboard_rendered.html
+
+# Local debug/render/temp snapshots (safe to delete)
+_dashboard_inline_check.js
+_dashboard_main.js
+_dashboard_script.js
+_rendered_home.html
+_fb_source_*.html
+
+# Local runtime caches (safe to delete; app will recreate)
+dashboard_cache.json
+sheet_data_cache.json
+sheet_tabs_cache.json
+
+# Local helper/test scripts (not needed for runtime)
+test.js
+fix_braces.py
+git_scraper.py
