@@ -49,7 +49,7 @@ DASHBOARD_SECTION_IDS = {
 # ==========================================
 # Cáº¤U HÃŒNH THÃ”NG Sá»
 # ==========================================
-SERVICE_ACCOUNT_FILE = 'credential.json'
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "credential.json").strip() or "credential.json"
 AUTH_SETTINGS_FILE = "auth_settings.json"
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
@@ -3569,10 +3569,43 @@ def ensure_scheduler_thread():
     scheduler_thread.start()
 
 def get_gspread_client():
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    )
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    service_account_json = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    service_account_json_base64 = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64") or "").strip()
+
+    if service_account_json:
+        try:
+            info = json.loads(service_account_json)
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+            return gspread.authorize(creds)
+        except Exception as exc:
+            raise ValueError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON không hợp lệ. "
+                "Vui lòng dán nguyên JSON service account."
+            ) from exc
+
+    if service_account_json_base64:
+        try:
+            decoded = base64.b64decode(service_account_json_base64).decode("utf-8")
+            info = json.loads(decoded)
+            creds = Credentials.from_service_account_info(info, scopes=scopes)
+            return gspread.authorize(creds)
+        except Exception as exc:
+            raise ValueError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 không hợp lệ. "
+                "Vui lòng kiểm tra lại chuỗi base64."
+            ) from exc
+
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(
+            "Thiếu Google credentials. Hãy set GOOGLE_SERVICE_ACCOUNT_JSON "
+            "(hoặc GOOGLE_SERVICE_ACCOUNT_JSON_BASE64) trên môi trường deploy."
+        )
+
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
     return gspread.authorize(creds)
 
 def extract_sheet_id(sheet_input: str) -> Optional[str]:
