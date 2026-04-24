@@ -7182,6 +7182,11 @@ def status(request: Request):
     return build_ui_state(get_runtime_state(current_user))
 
 
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+
 @app.post("/client-log")
 async def client_log(request: Request):
     current_user, auth_response = require_authenticated_user(request)
