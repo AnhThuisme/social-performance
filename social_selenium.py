@@ -24,6 +24,7 @@ def _env_float(name: str, default: float, min_value: float) -> float:
 
 
 DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 30.0, 5.0)
+TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 12.0, 3.0)
 DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.7, 0.1)
 READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
 READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
@@ -250,10 +251,21 @@ def _read_current_page_bundle(driver):
 
 
 def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
+    target_timeout = (
+        TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS
+        if _is_tiktok_url(url)
+        else DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
+    )
     try:
+        driver.set_page_load_timeout(target_timeout)
         driver.get(url)
     except TimeoutException:
         _emit(logger, f"Timeout khi tải trang: {url[:90]}")
+    finally:
+        try:
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
     _wait_until_ready(driver)
     time.sleep(DEFAULT_SETTLE_SECONDS)
     try:
@@ -1013,9 +1025,15 @@ def _wait_for_tiktok_manual_challenge(
 
 def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
     try:
+        driver.set_page_load_timeout(TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS)
         driver.get(url)
     except TimeoutException:
         _emit(logger, f"Timeout khi tải TikTok visual retry: {url[:90]}")
+    finally:
+        try:
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
     _wait_until_ready(driver)
 
     best_bundle = _read_current_page_bundle(driver)
