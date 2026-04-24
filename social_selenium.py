@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 import urllib.parse
@@ -11,10 +12,23 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.edge.options import Options as EdgeOptions
 
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 15
-DEFAULT_SETTLE_SECONDS = 1.7
-TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS = 40
-TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS = 1.2
+def _env_float(name: str, default: float, min_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        return value if value >= min_value else default
+    except Exception:
+        return default
+
+
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 30.0, 5.0)
+DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.7, 0.1)
+READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
+READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
+TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS", 40.0, 5.0)
+TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS", 1.2, 0.2)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -169,13 +183,14 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
 
 
 def _wait_until_ready(driver):
-    for _ in range(24):
+    deadline = time.time() + READY_TIMEOUT_SECONDS
+    while time.time() < deadline:
         try:
             if driver.execute_script("return document.readyState") == "complete":
                 break
         except Exception:
             pass
-        time.sleep(0.25)
+        time.sleep(READY_POLL_SECONDS)
 
 
 def _focus_visible_browser_window(driver):
