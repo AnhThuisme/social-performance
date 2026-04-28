@@ -266,6 +266,7 @@ def build_default_runtime_state(owner_email: str = ""):
         "current_task": "Đang chờ lệnh",
         "logs": [],
         "pending_updates": [],
+        "failed_items": [],
         "column_overrides": dict(COLUMN_OVERRIDES),
         "column_overrides_by_tab": {},
         "column_config_approval": dict(COLUMN_CONFIG_APPROVAL),
@@ -358,6 +359,8 @@ def ensure_runtime_state_shape(runtime_state):
     runtime_state.setdefault("run_progress_total", 0)
     runtime_state.setdefault("run_progress_phase", "idle")
     runtime_state.setdefault("tab_progress", {})
+    if not isinstance(runtime_state.get("failed_items"), list):
+        runtime_state["failed_items"] = []
     return runtime_state
 
 
@@ -775,6 +778,14 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 </div>
                                 <div id="log-section" class="bg-black/40 rounded-2xl p-4 h-[42vh] min-h-[320px] max-h-[560px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
                                     {build_log_html(runtime_state)}
+                                </div>
+                            </div>
+                            <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10 mt-4">
+                                <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
+                                    <span>Danh sách lỗi quét</span><span class="text-rose-300">Theo dõi nhanh</span>
+                                </div>
+                                <div id="failed-section" class="bg-black/40 rounded-2xl p-4 h-[24vh] min-h-[180px] max-h-[320px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
+                                    {build_failed_html(runtime_state)}
                                 </div>
                             </div>
                         </div>
@@ -2671,6 +2682,45 @@ def build_pending_html(state=None):
         </div>
     """
 
+
+def add_failed_item(tab_name: str, row_idx: int, platform: str, url: str, reason: str, state=None):
+    runtime_state = resolve_runtime_state(state)
+    failed_items = runtime_state.get("failed_items") or []
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    failed_items.insert(0, {
+        "time": timestamp,
+        "tab": str(tab_name or "").strip(),
+        "row": int(row_idx or 0),
+        "platform": str(platform or "").strip(),
+        "url": str(url or "").strip(),
+        "reason": str(reason or "Không lấy được số liệu").strip(),
+    })
+    runtime_state["failed_items"] = failed_items[:50]
+
+
+def build_failed_html(state=None):
+    runtime_state = resolve_runtime_state(state)
+    failed_items = runtime_state.get("failed_items") or []
+    if not failed_items:
+        return '<p class="system-log-empty">Chưa có dòng lỗi lấy số liệu.</p>'
+    rows = []
+    for item in failed_items[:30]:
+        time_text = html.escape(str(item.get("time") or ""))
+        tab_text = html.escape(str(item.get("tab") or ""))
+        row_text = html.escape(str(item.get("row") or ""))
+        platform_text = html.escape(str(item.get("platform") or ""))
+        reason_text = html.escape(str(item.get("reason") or "Không lấy được số liệu"))
+        url_text = html.escape(str(item.get("url") or ""))
+        rows.append(
+            f'<div class="system-log-line">'
+            f'<span class="system-log-time">[{time_text}]</span>'
+            f'<span class="system-log-tab">[{tab_text}]</span>'
+            f'<span class="system-log-message">Dòng {row_text} · {platform_text} · {reason_text}</span>'
+            f'</div>'
+            f'<div class="text-[11px] text-slate-400 break-all pl-2 pb-2">{url_text}</div>'
+        )
+    return "".join(rows)
+
 def set_run_progress(current: Optional[int] = None, total: Optional[int] = None, phase: Optional[str] = None, state=None):
     runtime_state = resolve_runtime_state(state)
     if total is not None:
@@ -2821,6 +2871,7 @@ def build_ui_state(state=None):
     payload = build_status_payload(runtime_state)
     payload["pending_html"] = build_pending_html(runtime_state)
     payload["log_html"] = build_log_html(runtime_state)
+    payload["failed_html"] = build_failed_html(runtime_state)
     payload["active_sheet_name"] = runtime_state["active_sheet_name"] or ""
     payload["active_sheet_id"] = runtime_state["active_sheet_id"] or ""
     payload["active_sheet_gid"] = runtime_state["active_sheet_gid"] or ""
@@ -5938,6 +5989,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                             logger(f"[{tab_name}] Dòng {i}: Cập nhật thành công")
                             shared["success"] += 1
                     elif runtime_state["is_running"]:
+                        add_failed_item(tab_name, i, platform, url, "Không lấy được số liệu", runtime_state)
                         if ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE:
                             red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
                             update_metric_highlights(ws, i, col_map, red_fields)
@@ -13923,6 +13975,7 @@ def home(request: Request):
                     const currentProgressBar = document.getElementById("progress-bar");
                     const currentProgressText = document.getElementById("progress-text");
                     const currentLogSection = document.getElementById("log-section");
+                    const currentFailedSection = document.getElementById("failed-section");
                     const currentPrimaryAction = document.getElementById("primary-action");
                     if (currentStatusBadge) {{
                         currentStatusBadge.className = data.status_badge_class;
@@ -13945,6 +13998,9 @@ def home(request: Request):
                     }}
                     if (currentLogSection && typeof data.log_html === "string") {{
                         currentLogSection.innerHTML = data.log_html;
+                    }}
+                    if (currentFailedSection && typeof data.failed_html === "string") {{
+                        currentFailedSection.innerHTML = data.failed_html;
                     }}
                     if (currentPrimaryAction && typeof data.primary_action_html === "string") {{
                         currentPrimaryAction.innerHTML = data.primary_action_html;
