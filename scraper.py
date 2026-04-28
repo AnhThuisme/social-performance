@@ -29,6 +29,21 @@ from googleapiclient.discovery import build
 from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
 
 
+def _configure_process_timezone() -> str:
+    # Force server process timezone so datetime.now() follows app timezone everywhere.
+    tz_name = (os.getenv("APP_TIMEZONE") or "Asia/Ho_Chi_Minh").strip() or "Asia/Ho_Chi_Minh"
+    os.environ["TZ"] = tz_name
+    try:
+        time.tzset()
+    except Exception:
+        # tzset is not available on some platforms (e.g. Windows local dev)
+        pass
+    return tz_name
+
+
+APP_TIMEZONE = _configure_process_timezone()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_scheduler_thread()
