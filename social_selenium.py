@@ -457,16 +457,39 @@ def _read_current_page_bundle(driver):
 
 def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
     target_timeout = _resolve_page_load_timeout(url)
+    timed_out = False
     try:
         driver.set_page_load_timeout(target_timeout)
         driver.get(url)
     except TimeoutException:
+        timed_out = True
         _emit(logger, f"Timeout khi tải trang: {url[:90]}")
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
     finally:
         try:
             driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
         except Exception:
             pass
+
+    if timed_out:
+        # Driver may be in unstable renderer state after timeout.
+        # Return a lightweight bundle immediately to avoid extra blocking.
+        try:
+            current_url = driver.current_url or url
+        except Exception:
+            current_url = url
+        return {
+            "source": "",
+            "text": "",
+            "metas": {},
+            "title": "",
+            "url": current_url,
+            "_timed_out": True,
+        }
+
     _wait_until_ready(driver)
     time.sleep(DEFAULT_SETTLE_SECONDS)
     try:
@@ -1301,6 +1324,10 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
 
     try:
         bundle = _collect_page_bundle(driver, url, logger=logger)
+        if bundle.get("_timed_out"):
+            if platform == "tiktok":
+                _emit(logger, "TikTok timeout: bỏ qua retry sâu trên cùng driver để tránh treo dây chuyền.")
+            return None
         extractor_map = {
             "tiktok": _extract_tiktok,
             "instagram": _extract_instagram,
