@@ -146,6 +146,11 @@ def _is_tiktok_url(url: str) -> bool:
     return _detect_platform_from_url(url) == "tiktok"
 
 
+def _is_facebook_login_gate(url: str) -> bool:
+    raw = str(url or "").strip().lower()
+    return "facebook.com/login" in raw and "next=" in raw
+
+
 def _resolve_page_load_timeout(url: str) -> float:
     platform = _detect_platform_from_url(url)
     if platform == "tiktok":
@@ -1088,6 +1093,9 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         )
     if platform == "facebook":
         url = resolve_fb_url(url, logger=logger)
+        if _is_facebook_login_gate(url):
+            _emit(logger, "Facebook trả về trang login/chặn truy cập, bỏ qua link này để chạy tiếp nhanh.")
+            return None
 
     own_driver = driver is None
     if own_driver:
