@@ -311,6 +311,23 @@ def _is_facebook_login_gate(url: str) -> bool:
     return "facebook.com/login" in raw and "next=" in raw
 
 
+def _extract_facebook_next_url(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        if "facebook.com/login" not in (parsed.netloc or "").lower() and "/login" not in (parsed.path or "").lower():
+            return ""
+        qs = urllib.parse.parse_qs(parsed.query)
+        next_url = str((qs.get("next") or [""])[0] or "").strip()
+        if not next_url:
+            return ""
+        decoded = urllib.parse.unquote(next_url).split("#")[0].strip()
+        if decoded.startswith("/"):
+            decoded = "https://www.facebook.com" + decoded
+        return decoded
+    except Exception:
+        return ""
+
+
 def _resolve_page_load_timeout(url: str) -> float:
     platform = _detect_platform_from_url(url)
     if platform == "tiktok":
@@ -345,14 +362,24 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
         try:
             response = requests.head(url, allow_redirects=True, timeout=10)
             if response.url:
-                return response.url.split("#")[0]
+                resolved = response.url.split("#")[0]
+                if _is_facebook_login_gate(resolved):
+                    next_url = _extract_facebook_next_url(resolved)
+                    if next_url:
+                        return next_url
+                return resolved
         except Exception:
             try:
                 response = requests.get(url, allow_redirects=True, timeout=10, stream=True)
                 final_url = response.url
                 response.close()
                 if final_url:
-                    return final_url.split("#")[0]
+                    resolved = final_url.split("#")[0]
+                    if _is_facebook_login_gate(resolved):
+                        next_url = _extract_facebook_next_url(resolved)
+                        if next_url:
+                            return next_url
+                    return resolved
             except Exception as exc:
                 _emit(logger, f"resolve_fb_url request error: {exc}")
                 return url
@@ -1254,10 +1281,16 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
     if platform == "facebook":
         if driver is not None:
             _ensure_facebook_cookies(driver, logger=logger)
+        original_fb_url = url
         url = resolve_fb_url(url, logger=logger)
         if _is_facebook_login_gate(url):
-            _emit(logger, "Facebook trả về trang login/chặn truy cập, bỏ qua link này để chạy tiếp nhanh.")
-            return None
+            fallback_url = _extract_facebook_next_url(url) or original_fb_url
+            if fallback_url and not _is_facebook_login_gate(fallback_url):
+                _emit(logger, "Facebook trả về login-gate, chuyển về link bài gốc để thử lại.")
+                url = fallback_url
+            else:
+                _emit(logger, "Facebook trả về trang login/chặn truy cập, bỏ qua link này để chạy tiếp nhanh.")
+                return None
     elif platform == "tiktok":
         if driver is not None:
             _ensure_tiktok_cookies(driver, logger=logger)
