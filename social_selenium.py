@@ -178,6 +178,7 @@ def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = Non
         return
     cookies = _load_tt_cookies_from_env(logger=logger)
     if not cookies:
+        _emit(logger, "TT_COOKIES_JSON đang trống/chưa set, quét TikTok sẽ chạy không có session.")
         driver._tt_cookies_applied = True
         return
     try:
@@ -197,6 +198,14 @@ def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = Non
         pass
     driver._tt_cookies_applied = True
     _emit(logger, f"Đã nạp {applied}/{len(cookies)} cookie TikTok trước khi quét.")
+    try:
+        current_url = str(driver.current_url or "")
+    except Exception:
+        current_url = ""
+    if applied <= 0:
+        _emit(logger, "Không nạp được cookie TikTok nào vào browser session.")
+    if "login" in current_url.lower():
+        _emit(logger, "Sau khi nạp cookie, TikTok vẫn trả về trạng thái login/challenge.")
 
 
 def _add_common_browser_args(options, headless: bool = True):
