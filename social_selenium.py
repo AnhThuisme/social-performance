@@ -27,6 +27,8 @@ DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECON
 TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 12.0, 3.0)
 FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 10.0, 3.0)
 INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 10.0, 3.0)
+TIKTOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_TIKTOK_SOFT_RETRY_ATTEMPTS", 1.0, 0.0))
+TIKTOK_SOFT_RETRY_DELAY_SECONDS = _env_float("SELENIUM_TIKTOK_SOFT_RETRY_DELAY_SECONDS", 1.2, 0.0)
 DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.7, 0.1)
 READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
 READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
@@ -1189,6 +1191,16 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if not extractor:
             return None
         payload = extractor(bundle)
+        if platform == "tiktok" and not payload and TIKTOK_SOFT_RETRY_ATTEMPTS > 0:
+            for attempt in range(1, TIKTOK_SOFT_RETRY_ATTEMPTS + 1):
+                if TIKTOK_SOFT_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(TIKTOK_SOFT_RETRY_DELAY_SECONDS)
+                _emit(logger, f"TikTok retry ngắn lần {attempt}/{TIKTOK_SOFT_RETRY_ATTEMPTS}...")
+                retry_bundle = _collect_page_bundle(driver, url, logger=logger)
+                retry_payload = extractor(retry_bundle)
+                if retry_payload:
+                    payload = retry_payload
+                    break
         if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
             if retry_payload:
