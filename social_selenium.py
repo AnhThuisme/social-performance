@@ -1334,7 +1334,19 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
             return payload
         return None
     except WebDriverException as exc:
-        _emit(logger, f"Lỗi Selenium {platform}: {str(exc)[:160]}")
+        error_text = str(exc)
+        error_lower = error_text.lower()
+        if (
+            platform == "tiktok"
+            and driver is not None
+            and "timed out receiving message from renderer" in error_lower
+        ):
+            try:
+                setattr(driver, "_needs_restart", True)
+            except Exception:
+                pass
+            _emit(logger, "TikTok renderer timeout, đánh dấu restart driver để quét nhanh dòng tiếp theo.")
+        _emit(logger, f"Lỗi Selenium {platform}: {error_text[:160]}")
         return None
     except Exception as exc:
         _emit(logger, f"Lỗi đọc dữ liệu {platform}: {str(exc)[:160]}")

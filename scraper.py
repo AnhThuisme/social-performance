@@ -5859,6 +5859,11 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         if not tab_driver_failed:
                             try:
                                 stats = get_social_stats(url, platform, driver=tab_driver, logger=locked_log)
+                                if tab_driver is not None and getattr(tab_driver, "_needs_restart", False):
+                                    locked_log(f"[{tab_name}] Driver bị treo sau timeout, đang restart để chạy tiếp...")
+                                    close_selenium_driver(tab_driver)
+                                    tab_driver = None
+                                    tab_driver = create_selenium_driver(logger=locked_log)
                             except Exception as e:
                                 error_msg = str(e).lower()
                                 if "invalid session" in error_msg or "session id" in error_msg:
