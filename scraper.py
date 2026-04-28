@@ -747,12 +747,6 @@ def background_refresh_dashboard_data(user_email, section_type):
                                     <input name="start_row" form="set-columns-form" value="{runtime_state.get('start_row', 2)}" inputmode="numeric" placeholder="VD: 2" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
                                 </div>
                             </div>
-                            <div class="text-xs text-emerald-200/85 bg-emerald-500/10 border border-emerald-500/20 rounded-xl px-3 py-2 mb-3" data-column-detected-text>
-                                {column_config['detected_text']}
-                            </div>
-                            <div class="text-xs text-cyan-200/80 bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2 mb-3">
-                                Các ô đã tự hiện cột đang nhận. Bạn sửa trực tiếp ngay trong đó nếu cần. Xóa trống ô nào thì ô đó quay về AUTO theo header của sheet. Buzz được tính bằng Comment + Share. Dòng bắt đầu nhận số từ 2 trở lên.
-                            </div>
                             <form id="set-columns-form" action="/set-columns" method="get" class="mb-4">
                                 <input id="col-config-active-tab-input" type="hidden" name="tab_name" value="" />
                                 <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu cấu hình nhập liệu</button>
