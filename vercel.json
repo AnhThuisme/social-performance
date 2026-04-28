@@ -5,7 +5,7 @@
       "src": "/(.*)",
       "status": 307,
       "headers": {
-        "Location": "https://social-performance.onrender.com/$1"
+        "Location": "https://social-performance-j0dr.onrender.com/$1"
       }
     }
   ]
