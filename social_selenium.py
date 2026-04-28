@@ -41,6 +41,8 @@ DEFAULT_USER_AGENT = (
 )
 _FB_COOKIES_CACHE = None
 _FB_COOKIES_CACHE_KEY = None
+_TT_COOKIES_CACHE = None
+_TT_COOKIES_CACHE_KEY = None
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -123,6 +125,78 @@ def _ensure_facebook_cookies(driver, logger: Optional[Callable[[str], None]] = N
         pass
     driver._fb_cookies_applied = True
     _emit(logger, f"Đã nạp {applied}/{len(cookies)} cookie Facebook trước khi quét.")
+
+
+def _load_tt_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
+    global _TT_COOKIES_CACHE, _TT_COOKIES_CACHE_KEY
+    raw = (os.getenv("TT_COOKIES_JSON") or "").strip()
+    if not raw:
+        _TT_COOKIES_CACHE = []
+        _TT_COOKIES_CACHE_KEY = ""
+        return []
+    if raw == _TT_COOKIES_CACHE_KEY and _TT_COOKIES_CACHE is not None:
+        return _TT_COOKIES_CACHE
+    try:
+        payload = json.loads(raw)
+        cookies = payload if isinstance(payload, list) else payload.get("cookies", [])
+        normalized = []
+        for item in cookies if isinstance(cookies, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "")
+            if not name:
+                continue
+            cookie = {"name": name, "value": value}
+            domain = str(item.get("domain") or "").strip() or ".tiktok.com"
+            path = str(item.get("path") or "").strip() or "/"
+            cookie["domain"] = domain
+            cookie["path"] = path
+            if "secure" in item:
+                cookie["secure"] = bool(item.get("secure"))
+            if "httpOnly" in item:
+                cookie["httpOnly"] = bool(item.get("httpOnly"))
+            expiry = item.get("expiry")
+            try:
+                if expiry is not None:
+                    cookie["expiry"] = int(expiry)
+            except Exception:
+                pass
+            normalized.append(cookie)
+        _TT_COOKIES_CACHE_KEY = raw
+        _TT_COOKIES_CACHE = normalized
+        return normalized
+    except Exception as exc:
+        _emit(logger, f"TT_COOKIES_JSON không hợp lệ: {str(exc)[:120]}")
+        _TT_COOKIES_CACHE_KEY = raw
+        _TT_COOKIES_CACHE = []
+        return []
+
+
+def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = None):
+    if getattr(driver, "_tt_cookies_applied", False):
+        return
+    cookies = _load_tt_cookies_from_env(logger=logger)
+    if not cookies:
+        driver._tt_cookies_applied = True
+        return
+    try:
+        driver.get("https://www.tiktok.com/")
+    except Exception:
+        pass
+    applied = 0
+    for cookie in cookies:
+        try:
+            driver.add_cookie(cookie)
+            applied += 1
+        except Exception:
+            continue
+    try:
+        driver.get("https://www.tiktok.com/")
+    except Exception:
+        pass
+    driver._tt_cookies_applied = True
+    _emit(logger, f"Đã nạp {applied}/{len(cookies)} cookie TikTok trước khi quét.")
 
 
 def _add_common_browser_args(options, headless: bool = True):
@@ -1175,6 +1249,9 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if _is_facebook_login_gate(url):
             _emit(logger, "Facebook trả về trang login/chặn truy cập, bỏ qua link này để chạy tiếp nhanh.")
             return None
+    elif platform == "tiktok":
+        if driver is not None:
+            _ensure_tiktok_cookies(driver, logger=logger)
 
     own_driver = driver is None
     if own_driver:
