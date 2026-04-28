@@ -29,6 +29,8 @@ FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIM
 INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 10.0, 3.0)
 TIKTOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_TIKTOK_SOFT_RETRY_ATTEMPTS", 1.0, 0.0))
 TIKTOK_SOFT_RETRY_DELAY_SECONDS = _env_float("SELENIUM_TIKTOK_SOFT_RETRY_DELAY_SECONDS", 1.2, 0.0)
+TIKTOK_TIMEOUT_STREAK_THRESHOLD = max(1, int(_env_float("SELENIUM_TIKTOK_TIMEOUT_STREAK_THRESHOLD", 2.0, 1.0)))
+TIKTOK_TIMEOUT_COOLDOWN_SECONDS = _env_float("SELENIUM_TIKTOK_TIMEOUT_COOLDOWN_SECONDS", 90.0, 5.0)
 DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.7, 0.1)
 READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
 READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
@@ -43,6 +45,8 @@ _FB_COOKIES_CACHE = None
 _FB_COOKIES_CACHE_KEY = None
 _TT_COOKIES_CACHE = None
 _TT_COOKIES_CACHE_KEY = None
+_TIKTOK_TIMEOUT_STREAK = 0
+_TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -182,6 +186,7 @@ def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = Non
         driver._tt_cookies_applied = True
         return
     try:
+        driver.set_page_load_timeout(min(8.0, TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS))
         driver.get("https://www.tiktok.com/")
     except Exception:
         pass
@@ -193,9 +198,15 @@ def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = Non
         except Exception:
             continue
     try:
+        driver.set_page_load_timeout(min(8.0, TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS))
         driver.get("https://www.tiktok.com/")
     except Exception:
         pass
+    finally:
+        try:
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
     driver._tt_cookies_applied = True
     _emit(logger, f"Đã nạp {applied}/{len(cookies)} cookie TikTok trước khi quét.")
     try:
@@ -1293,6 +1304,7 @@ def _retry_tiktok_with_visible_browser(url: str, logger: Optional[Callable[[str]
 
 
 def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Optional[Callable[[str], None]] = None):
+    global _TIKTOK_TIMEOUT_STREAK, _TIKTOK_TIMEOUT_COOLDOWN_UNTIL
     requested_platform = (platform_name or "").strip().lower()
     detected_platform = _detect_platform_from_url(url)
     platform = detected_platform or requested_platform
@@ -1315,6 +1327,11 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 _emit(logger, "Facebook trả về trang login/chặn truy cập, bỏ qua link này để chạy tiếp nhanh.")
                 return None
     elif platform == "tiktok":
+        now_ts = time.time()
+        if now_ts < _TIKTOK_TIMEOUT_COOLDOWN_UNTIL:
+            remaining = int(max(1, _TIKTOK_TIMEOUT_COOLDOWN_UNTIL - now_ts))
+            _emit(logger, f"TikTok đang cooldown {remaining}s sau nhiều timeout liên tiếp, bỏ qua nhanh link này.")
+            return None
         if driver is not None:
             _ensure_tiktok_cookies(driver, logger=logger)
 
@@ -1327,6 +1344,13 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if bundle.get("_timed_out"):
             if platform == "tiktok":
                 _emit(logger, "TikTok timeout: bỏ qua retry sâu trên cùng driver để tránh treo dây chuyền.")
+                _TIKTOK_TIMEOUT_STREAK += 1
+                if _TIKTOK_TIMEOUT_STREAK >= TIKTOK_TIMEOUT_STREAK_THRESHOLD:
+                    _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = time.time() + TIKTOK_TIMEOUT_COOLDOWN_SECONDS
+                    _emit(
+                        logger,
+                        f"TikTok timeout liên tiếp, tạm cooldown {int(TIKTOK_TIMEOUT_COOLDOWN_SECONDS)}s để tránh nghẽn tiến trình.",
+                    )
             return None
         extractor_map = {
             "tiktok": _extract_tiktok,
@@ -1357,6 +1381,9 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if warning_message:
             _emit(logger, warning_message)
         has_signal = any(payload.get(key) for key in ("v", "l", "s", "c", "save"))
+        if platform == "tiktok":
+            _TIKTOK_TIMEOUT_STREAK = 0
+            _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
         if has_signal or payload.get("cap") or payload.get("air_date"):
             return payload
         return None
