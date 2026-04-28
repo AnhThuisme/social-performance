@@ -23,8 +23,10 @@ def _env_float(name: str, default: float, min_value: float) -> float:
         return default
 
 
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 30.0, 5.0)
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 20.0, 5.0)
 TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 12.0, 3.0)
+FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 10.0, 3.0)
+INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 10.0, 3.0)
 DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.7, 0.1)
 READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
 READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
@@ -144,6 +146,17 @@ def _is_tiktok_url(url: str) -> bool:
     return _detect_platform_from_url(url) == "tiktok"
 
 
+def _resolve_page_load_timeout(url: str) -> float:
+    platform = _detect_platform_from_url(url)
+    if platform == "tiktok":
+        return TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS
+    if platform == "facebook":
+        return FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS
+    if platform == "instagram":
+        return INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS
+    return DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
+
+
 def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> str:
     try:
         if not url:
@@ -251,11 +264,7 @@ def _read_current_page_bundle(driver):
 
 
 def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
-    target_timeout = (
-        TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS
-        if _is_tiktok_url(url)
-        else DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
-    )
+    target_timeout = _resolve_page_load_timeout(url)
     try:
         driver.set_page_load_timeout(target_timeout)
         driver.get(url)
