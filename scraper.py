@@ -13,6 +13,7 @@ import socket
 import ssl
 import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import pandas as pd
 import urllib.parse
@@ -26,7 +27,7 @@ import uvicorn
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
+from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats, reset_stale_selenium_sessions
 
 
 def _configure_process_timezone() -> str:
@@ -42,6 +43,23 @@ def _configure_process_timezone() -> str:
 
 
 APP_TIMEZONE = _configure_process_timezone()
+_SIDEBAR_MASCOT_DATA_URI = None
+FAST_START_COMMAND = str(os.getenv("FAST_START_COMMAND", "1")).strip().lower() not in {"0", "false", "no", "off"}
+FAST_SHEET_SETUP_RESPONSE = str(os.getenv("FAST_SHEET_SETUP_RESPONSE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _get_sidebar_mascot_data_uri() -> str:
+    global _SIDEBAR_MASCOT_DATA_URI
+    if _SIDEBAR_MASCOT_DATA_URI is not None:
+        return _SIDEBAR_MASCOT_DATA_URI
+    mascot_path = os.path.join(os.path.dirname(__file__), "Fanscom mascot-05.png")
+    try:
+        with open(mascot_path, "rb") as mascot_file:
+            encoded = base64.b64encode(mascot_file.read()).decode("ascii")
+        _SIDEBAR_MASCOT_DATA_URI = f"data:image/png;base64,{encoded}"
+    except Exception:
+        _SIDEBAR_MASCOT_DATA_URI = ""
+    return _SIDEBAR_MASCOT_DATA_URI
 
 
 @asynccontextmanager
@@ -75,6 +93,8 @@ DEFAULT_SHEET_NAME = os.getenv("DEFAULT_SHEET_NAME", "").strip()
 ACTIVE_SHEET_NAME = DEFAULT_SHEET_NAME
 ACTIVE_SHEET_GID = "0"
 ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE = os.getenv("ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE", "false").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_SUCCESS_METRIC_ZERO_CHECK = os.getenv("ENABLE_SUCCESS_METRIC_ZERO_CHECK", "false").strip().lower() in {"1", "true", "yes", "on"}
+RESET_STALE_SELENIUM_ON_START = os.getenv("RESET_STALE_SELENIUM_ON_START", "false").strip().lower() in {"1", "true", "yes", "on"}
 def save_sheet_tabs_cache(cache_data):
     try:
         with open(SHEET_TABS_CACHE_FILE, "w", encoding="utf-8") as f:
@@ -129,11 +149,32 @@ SHEET_TABS_CACHE_TTL_SECONDS = 600  # Increased to 10 minutes
 SHEET_DATA_CACHE_FILE = "sheet_data_cache.json"
 SHEET_DATA_CACHE = load_sheet_data_cache()  # Persistence for sheet.get_all_values()
 SHEET_DATA_CACHE_TTL_SECONDS = 300  # 5 minutes
+SHEET_COLUMN_CACHE = {}  # {sheet_id:sheet_name:col_idx -> {"updated_at": iso, "values": [...]}}
+SHEET_COLUMN_CACHE_TTL_SECONDS = 300
+SHEET_COLUMN_SCAN_MAX_ROWS = max(5000, int(os.getenv("SHEET_COLUMN_SCAN_MAX_ROWS", "30000")))
+SHEET_COLUMN_SCAN_CHUNK_SIZE = max(500, int(os.getenv("SHEET_COLUMN_SCAN_CHUNK_SIZE", "2000")))
+SHEET_COLUMN_SCAN_EMPTY_STREAK = max(50, int(os.getenv("SHEET_COLUMN_SCAN_EMPTY_STREAK", "400")))
 SHEET_LAYOUT_CACHE = {}  # {sheet_id:sheet_name -> {"updated_at": iso, "layout": {...}}}
 SHEET_LAYOUT_CACHE_TTL_SECONDS = 300
+SPREADSHEET_OBJECT_CACHE = {}  # {sheet_id -> {"updated_at": epoch, "spreadsheet": gspread.Spreadsheet}}
+SPREADSHEET_OBJECT_CACHE_TTL_SECONDS = max(120, int(os.getenv("SPREADSHEET_OBJECT_CACHE_TTL_SECONDS", "900")))
+WORKSHEET_OBJECT_CACHE = {}  # {sheet_id:sheet_name -> {"updated_at": epoch, "worksheet": gspread.Worksheet}}
+WORKSHEET_OBJECT_CACHE_TTL_SECONDS = max(120, int(os.getenv("WORKSHEET_OBJECT_CACHE_TTL_SECONDS", "900")))
+WORKSHEET_OBJECT_CACHE_LOCK = threading.RLock()
 DASHBOARD_CACHE_FILE = "dashboard_cache.json"
 DASHBOARD_CACHE = load_dashboard_cache()  # Memory cache mirrored by file
 DASHBOARD_CACHE_TTL_SECONDS = 300
+DASHBOARD_REFRESH_TTL_SECONDS = max(30, int(os.getenv("DASHBOARD_REFRESH_TTL_SECONDS", "120")))
+DASHBOARD_REFRESH_INFLIGHT = {}  # {f"{email}:{section}": started_at_epoch}
+DASHBOARD_REFRESH_LOCK = threading.Lock()
+DASHBOARD_CACHE_SAVE_LOCK = threading.Lock()
+DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS = max(1, int(os.getenv("DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS", "3")))
+DASHBOARD_CACHE_LAST_SAVE_AT = 0.0
+LINK_RESOLVE_CACHE = {}  # {raw_url: {"final_url": "...", "updated_at": iso}}
+LINK_RESOLVE_CACHE_TTL_SECONDS = 1800
+DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 2
+MAX_RUNTIME_LOG_LINES = max(100, int(os.getenv("MAX_RUNTIME_LOG_LINES", "400")))
+MAX_RUNTIME_LOG_RENDER_LINES = max(50, int(os.getenv("MAX_RUNTIME_LOG_RENDER_LINES", "160")))
 SHEET_TABS_REQUEST_LIMITER = {}  # {sheet_id: last_request_time}
 SHEET_TABS_MIN_INTERVAL_SECONDS = 5  # Minimum interval between requests for same sheet
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("AUTH_BOOTSTRAP_ADMIN_EMAIL", "").strip()
@@ -144,6 +185,7 @@ GMAIL_SMTP_APP_PASSWORD = "btqtzotpeyhnzzac"
 GMAIL_SMTP_FROM_EMAIL = "fanscom.ecom@gmail.com"
 YOUTUBE_API_KEY = "AIzaSyAbMDEzmIVpsVTASYhTaXI6oC7BudQWzlU"
 ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.0"))
+LOCAL_DRIVER_FAIL_FAST = str(os.getenv("SELENIUM_LOCAL_FAIL_FAST", "1")).strip().lower() not in {"0", "false", "no", "off"}
 try:
     START_ROW = max(2, int(os.getenv("START_ROW", "2")))
 except Exception:
@@ -639,6 +681,90 @@ def persist_auth_settings(settings):
     save_auth_settings(AUTH_SETTINGS)
     return AUTH_SETTINGS
 
+
+def _get_dashboard_cache_map():
+    global DASHBOARD_CACHE
+    if not DASHBOARD_CACHE:
+        DASHBOARD_CACHE = load_dashboard_cache()
+    return DASHBOARD_CACHE
+
+
+def get_dashboard_cached_section(user_email: str, section: str):
+    now = datetime.now()
+    cache_map = _get_dashboard_cache_map()
+    entry = cache_map.get(f"{user_email}:{section}") if isinstance(cache_map, dict) else None
+    if not isinstance(entry, dict):
+        return "", False
+    if section == "posts":
+        cached_format_version = int(entry.get("format_version", 0) or 0)
+        if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION:
+            return "", False
+    html_content = entry.get("html", "")
+    updated_raw = entry.get("updated_at", "")
+    try:
+        updated_at = datetime.fromisoformat(str(updated_raw or ""))
+        is_fresh = (now - updated_at).total_seconds() < DASHBOARD_CACHE_TTL_SECONDS
+    except Exception:
+        is_fresh = False
+    return (html_content if isinstance(html_content, str) else ""), is_fresh
+
+
+def schedule_dashboard_refresh(background_tasks: BackgroundTasks, user_email: str, section: str) -> bool:
+    key = f"{user_email}:{section}"
+    now_ts = time.time()
+    with DASHBOARD_REFRESH_LOCK:
+        started_ts = float(DASHBOARD_REFRESH_INFLIGHT.get(key) or 0.0)
+        if started_ts and (now_ts - started_ts) < DASHBOARD_REFRESH_TTL_SECONDS:
+            return False
+        DASHBOARD_REFRESH_INFLIGHT[key] = now_ts
+    try:
+        background_tasks.add_task(background_refresh_dashboard_data, user_email, section)
+        return True
+    except Exception:
+        with DASHBOARD_REFRESH_LOCK:
+            DASHBOARD_REFRESH_INFLIGHT.pop(key, None)
+        return False
+
+
+def release_dashboard_refresh(user_email: str, section: str):
+    key = f"{user_email}:{section}"
+    with DASHBOARD_REFRESH_LOCK:
+        DASHBOARD_REFRESH_INFLIGHT.pop(key, None)
+
+def persist_dashboard_cache_throttled(force: bool = False):
+    global DASHBOARD_CACHE_LAST_SAVE_AT
+    now_ts = time.time()
+    with DASHBOARD_CACHE_SAVE_LOCK:
+        if not force and (now_ts - float(DASHBOARD_CACHE_LAST_SAVE_AT or 0.0)) < DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS:
+            return
+        save_dashboard_cache(_get_dashboard_cache_map())
+        DASHBOARD_CACHE_LAST_SAVE_AT = now_ts
+
+
+def cache_dashboard_sections_for_user(user_email: str, sections: dict):
+    if not user_email or not isinstance(sections, dict):
+        return
+    section_key_by_payload = {
+        "overview_html": "overview",
+        "posts_html": "posts",
+        "config_html": "config",
+        "schedule_html": "schedule",
+    }
+    pending_updates = {}
+    now_str = datetime.now().isoformat()
+    for payload_key, cache_key in section_key_by_payload.items():
+        content = sections.get(payload_key)
+        if isinstance(content, str) and content.strip():
+            entry_payload = {"updated_at": now_str, "html": content}
+            if cache_key == "posts":
+                entry_payload["format_version"] = DASHBOARD_POSTS_CACHE_FORMAT_VERSION
+            pending_updates[f"{user_email}:{cache_key}"] = entry_payload
+    if not pending_updates:
+        return
+    cache_map = _get_dashboard_cache_map()
+    cache_map.update(pending_updates)
+    persist_dashboard_cache_throttled()
+
 def background_refresh_dashboard_data(user_email, section_type):
     """
     section_type: 'overview', 'posts', 'config', or 'schedule'
@@ -655,13 +781,14 @@ def background_refresh_dashboard_data(user_email, section_type):
         active_ws = None
         if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
             try:
-                time.sleep(0.5)  # Stagger API calls to stay within Google Sheets quota
+                if section_type in {"overview", "posts"}:
+                    time.sleep(0.2)
                 active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
             except Exception:
                 pass
         
         now_str = datetime.now().isoformat()
-        full_cache = load_dashboard_cache()
+        full_cache = _get_dashboard_cache_map()
         
         if section_type == "overview":
             html_content = build_overview_panel_for_state(runtime_state, sheet=active_ws)
@@ -675,19 +802,19 @@ def background_refresh_dashboard_data(user_email, section_type):
             status_payload = build_status_payload(runtime_state)
             snapshot_url = build_snapshot_url(state=runtime_state)
             metric_cols_html = f"""
-                <div class="bg-black/20 rounded-3xl p-6 mb-6 border border-white/5">
-                    <div class="mb-3 text-sm font-bold text-slate-500 uppercase">
-                        <span>Thiết lập quét</span>
+                <div class="bg-black/20 rounded-3xl p-4 mb-4 border border-white/5">
+                    <div class="mb-2 text-xs font-bold text-slate-500 uppercase">
+                        <span>Chuẩn bị quét</span>
                     </div>
                     <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1.16fr)_minmax(380px,0.84fr)] gap-4 items-start">
-                        <div class="space-y-4">
-                            <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10 mb-5">
-                                <div class="space-y-4">
+                        <div class="space-y-3">
+                            <div class="bg-slate-950/40 rounded-2xl p-3 border border-white/10 mb-3">
+                                <div class="space-y-3">
                                     <form action="/set-sheet" method="get" class="flex flex-col gap-3">
                                         <label class="text-xs font-black uppercase tracking-[0.16em] text-slate-400">Nhập link sheet</label>
                                         <div class="flex flex-col md:flex-row gap-2 md:items-center">
-                                            <input id="sheet-url-input" name="sheet_url" value="{snapshot_url}" placeholder="Nhập link Google Sheet hoặc Sheet ID" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-blue-400" />
-                                            <button type="submit" class="w-full md:w-auto md:shrink-0 px-4 py-3 rounded-xl border border-emerald-400/30 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 text-xs font-black tracking-[0.12em] uppercase transition-all">
+                                            <input id="sheet-url-input" name="sheet_url" value="{snapshot_url}" placeholder="Nhập link Google Sheet hoặc Sheet ID" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-2.5 border border-white/10 outline-none focus:border-blue-400" />
+                                            <button type="submit" class="w-full md:w-auto md:shrink-0 px-4 py-2.5 rounded-xl border border-emerald-400/30 bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-200 text-xs font-black tracking-[0.12em] uppercase transition-all">
                                                 Lưu sheet
                                             </button>
                                         </div>
@@ -698,7 +825,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                                     </form>
                                 </div>
                             </div>
-                            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2 mb-3 text-sm font-bold text-slate-500 uppercase">
+                            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-2 mb-2 text-sm font-bold text-slate-500 uppercase">
                                 <span>Cột nhập liệu</span>
                                 <div class="flex items-center gap-3">
                                     <button id="auto-fill-columns-btn" type="button" class="px-4 py-1.5 rounded-lg border border-cyan-400/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 text-xs font-black tracking-wider transition-all normal-case">AUTO</button>
@@ -708,7 +835,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                             <div id="col-config-apply-note" class="text-xs text-cyan-200/80 bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2 mb-3">
                                 Chọn nhiều tab ở danh sách phía trên để cấu hình từng tab riêng.
                             </div>
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-2.5 mb-3">
                                 {''.join([
                                     f'''
                                     <div>
@@ -738,7 +865,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                                             "VD: H hoặc 8" if field == "comment" else
                                             "VD: I hoặc 9" if field == "save" else
                                             "VD: 2"
-                                        }" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
+                                        }" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-2.5 border border-white/10 outline-none focus:border-cyan-400" />
                                     </div>
                                     ''' for field in ["date", "air_date", "link", "buzz", "view", "like", "share", "comment", "save"]
                                 ])}
@@ -747,21 +874,21 @@ def background_refresh_dashboard_data(user_email, section_type):
                                         <label class="block text-xs text-slate-400 uppercase tracking-wider">Dòng bắt đầu</label>
                                         <span class="text-[11px] text-slate-500 font-black uppercase tracking-[0.18em]">ĐANG DÙNG</span>
                                     </div>
-                                    <input name="start_row" form="set-columns-form" value="{runtime_state.get('start_row', 2)}" inputmode="numeric" placeholder="VD: 2" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-3 border border-white/10 outline-none focus:border-cyan-400" />
+                                    <input name="start_row" form="set-columns-form" value="{runtime_state.get('start_row', 2)}" inputmode="numeric" placeholder="VD: 2" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-2.5 border border-white/10 outline-none focus:border-cyan-400" />
                                 </div>
                             </div>
-                            <form id="set-columns-form" action="/set-columns" method="get" class="mb-4">
+                            <form id="set-columns-form" action="/set-columns" method="get" class="mb-2">
                                 <input id="col-config-active-tab-input" type="hidden" name="tab_name" value="" />
-                                <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu cấu hình nhập liệu</button>
+                                <button type="submit" class="w-full py-2.5 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-xs shadow-sm shadow-slate-900/10">Lưu cấu hình nhập liệu</button>
                             </form>
                         </div>
                         <div class="xl:sticky xl:top-6">
-                            <div class="bg-slate-900/55 rounded-2xl p-4 border border-white/10 mb-4">
+                            <div class="bg-slate-900/55 rounded-2xl p-3 border border-white/10 mb-3">
                                 <div class="flex justify-between items-center mb-2 text-xs font-bold text-slate-500 uppercase">
                                     <span>Quét dữ liệu</span><span class="text-blue-300">Thao tác nhanh</span>
                                 </div>
                                 <div class="text-xs uppercase tracking-[0.22em] font-bold text-slate-500 mb-2">Tiến trình hiện tại</div>
-                                <div id="current-task" class="text-lg font-black text-slate-100">{status_payload['current_task']}</div>
+                                <div id="current-task" class="text-base font-black text-slate-100">{status_payload['current_task']}</div>
                                 <div class="w-full bg-slate-800/80 rounded-full h-3 overflow-hidden mt-4 mb-4">
                                     <div id="progress-bar" class="bg-blue-500 h-full transition-all duration-1000" style="width: {status_payload['progress_width']}"></div>
                                 </div>
@@ -772,17 +899,28 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 <div id="tab-progress-section" class="hidden space-y-3 mb-4"></div>
                                 <div id="primary-action">{status_payload['primary_action_html']}</div>
                             </div>
-                            <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10">
+                            <div class="bg-slate-950/40 rounded-2xl p-3 border border-white/10">
                                 <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
                                     <span>Nhật ký hệ thống</span><span class="text-slate-400">Cập nhật realtime</span>
                                 </div>
-                                <div id="log-section" class="bg-black/40 rounded-2xl p-4 h-[42vh] min-h-[320px] max-h-[560px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
+                                <div id="log-section" class="bg-black/40 rounded-2xl p-3 h-[34vh] min-h-[240px] max-h-[460px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-xs">
                                     {build_log_html(runtime_state)}
                                 </div>
                             </div>
                             <div class="bg-slate-950/40 rounded-2xl p-4 border border-white/10 mt-4">
                                 <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
-                                    <span>Danh sách lỗi quét</span><span class="text-rose-300">Theo dõi nhanh</span>
+                                    <span>Danh sách lỗi quét</span>
+                                    <div class="flex items-center gap-2">
+                                        <span class="text-rose-300">Theo dõi nhanh</span>
+                                        <button
+                                            type="button"
+                                            data-rerun-failed-btn
+                                            {"disabled" if int(status_payload.get("failed_count", 0) or 0) <= 0 else ""}
+                                            class="px-3 py-1.5 rounded-lg border border-rose-400/35 bg-rose-500/10 hover:bg-rose-500/20 text-rose-200 text-[11px] font-black tracking-wider uppercase transition-all {"opacity-50 pointer-events-none" if int(status_payload.get("failed_count", 0) or 0) <= 0 else ""}"
+                                        >
+                                            Quét lại lỗi
+                                        </button>
+                                    </div>
                                 </div>
                                 <div id="failed-section" class="bg-black/40 rounded-2xl p-4 h-[24vh] min-h-[180px] max-h-[320px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
                                     {build_failed_html(runtime_state)}
@@ -871,76 +1009,17 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 <p class="mt-1 text-[11px] text-slate-500">Để trống nếu muốn lặp vô thời hạn. Nếu có ngày này thì lịch sẽ tự dừng sau ngày đã chọn.</p>
                             </div>
                         </div>
-                        <div class="text-xs text-cyan-200/80 bg-cyan-500/10 border border-cyan-500/20 rounded-xl px-3 py-2">
-                            Gợi ý: Chọn <b>Hằng ngày</b> nếu chỉ cần giờ chạy. Với <b>Hằng tuần</b>, lịch sẽ khoanh toàn bộ ngày đúng thứ bạn chọn. Với <b>Hằng tháng</b>, hệ thống lấy ngày 1-28 từ ô lịch.
-                        </div>
-                        <div class="rounded-2xl border border-white/10 bg-slate-950/35 px-4 py-4">
-                            <div class="flex items-center justify-between gap-3 mb-3">
-                                <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Theo dõi lần chạy</div>
-                                <div class="text-xs text-slate-500">Tự cập nhật theo lịch và khi bấm chạy tay</div>
-                            </div>
-                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3">
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Lần kế tiếp</div>
-                                    <div id="schedule-track-next" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('next_run_text', 'Chưa có')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Bắt đầu gần nhất</div>
-                                    <div id="schedule-track-started" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('last_started_text', 'Chưa có')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Kết thúc gần nhất</div>
-                                    <div id="schedule-track-finished" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('last_finished_text', 'Chưa có')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thời lượng</div>
-                                    <div id="schedule-track-duration" class="mt-2 text-sm font-black text-cyan-200">{schedule_config.get('last_duration_text', '0s')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Đang chạy từ</div>
-                                    <div id="schedule-track-running" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('is_running_text', 'Đang chờ')}</div>
-                                </div>
-                            </div>
-                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-3 mt-3">
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Trạng thái</div>
-                                    <div id="schedule-track-status" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('last_status_text', 'Chưa chạy')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Nguồn chạy</div>
-                                    <div id="schedule-track-source" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('last_source_text', 'Chưa có')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Tab đã chạy</div>
-                                    <div id="schedule-track-sheet" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('last_sheet_text', 'Chưa có')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Link đã quét</div>
-                                    <div id="schedule-track-processed" class="mt-2 text-sm font-black text-slate-100">{schedule_config.get('last_processed_text', '0')}</div>
-                                </div>
-                                <div class="bg-slate-900/60 rounded-xl px-3 py-3 border border-white/8">
-                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thành công / trượt</div>
-                                    <div class="mt-2 text-sm font-black text-slate-100"><span id="schedule-track-success">{schedule_config.get('last_success_text', '0')}</span> / <span id="schedule-track-failed">{schedule_config.get('last_failed_text', '0')}</span></div>
-                                </div>
-                            </div>
-                            <div class="mt-4">
-                                <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 font-black mb-2">Lịch sử gần nhất</div>
-                                <div id="schedule-track-history" class="grid gap-2">
-                                    {schedule_config.get('history_html', '<div class="schedule-history-empty">Chưa có lần chạy nào để theo dõi.</div>')}
-                                </div>
-                            </div>
-                        </div>
                         <button type="submit" class="w-full py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-sm shadow-sm shadow-slate-900/10">Lưu lịch</button>
                     </form>
                 </div>
             """
             full_cache[f"{user_email}:schedule"] = {"updated_at": now_str, "html": schedule_html}
             
-        save_dashboard_cache(full_cache)
-        global DASHBOARD_CACHE
-        DASHBOARD_CACHE.update(full_cache)
+        persist_dashboard_cache_throttled()
     except Exception as e:
         print(f"[REFR-ERR] Failed to background refresh {section_type} for {user_email}: {e}")
+    finally:
+        release_dashboard_refresh(str(user_email or "").strip(), str(section_type or "").strip())
 
 
 
@@ -1228,6 +1307,41 @@ def update_saved_sheet_metadata(
     persist_auth_settings(settings)
     return get_saved_sheet_entries(settings, owner_email=normalized_owner)
 
+def remove_saved_sheet_entry(sheet_id: str, sheet_name: str, owner_email: Optional[str] = None):
+    normalized_sheet_id = str(sheet_id or "").strip()
+    normalized_sheet_name = str(sheet_name or "").strip()
+    if not normalized_sheet_id or not normalized_sheet_name:
+        return []
+
+    normalized_owner = normalize_email_address(owner_email or "")
+    settings = get_auth_settings().copy()
+    existing_entries = get_saved_sheet_entries(settings, owner_email=normalized_owner)
+    normalized_target_name = unicodedata.normalize("NFC", normalized_sheet_name).casefold()
+
+    next_entries = []
+    removed = False
+    for item in existing_entries:
+        current_sheet_id = str(item.get("sheet_id", "") or "").strip()
+        current_sheet_name = str(item.get("sheet_name", "") or "").strip()
+        normalized_current_name = unicodedata.normalize("NFC", current_sheet_name).casefold()
+        if current_sheet_id == normalized_sheet_id and normalized_current_name == normalized_target_name:
+            removed = True
+            continue
+        next_entries.append(dict(item))
+
+    if not removed:
+        return []
+
+    if normalized_owner:
+        saved_by_user = dict(settings.get("saved_sheets_by_user", {}) or {})
+        saved_by_user[normalized_owner] = next_entries[:MAX_SAVED_SHEETS_PER_USER]
+        settings["saved_sheets_by_user"] = saved_by_user
+    else:
+        settings["saved_sheets"] = next_entries[:MAX_SAVED_SHEETS_PER_USER]
+
+    persist_auth_settings(settings)
+    return get_saved_sheet_entries(settings, owner_email=normalized_owner)
+
 
 def build_sheet_binding_key(sheet_id: str, sheet_name: str) -> str:
     return f"{str(sheet_id or '').strip()}::{str(sheet_name or '').strip()}"
@@ -1410,6 +1524,40 @@ def get_schedule_entry_by_key(key: str, state=None):
         if entry["key"] == lookup_key:
             return entry
     return None
+
+
+def remove_schedule_entry_by_key(key: str, state=None):
+    runtime_state = resolve_runtime_state(state)
+    lookup_key = str(key or "").strip()
+    if not lookup_key:
+        return None
+
+    entries = ensure_schedule_entries_migrated(runtime_state)
+    removed_entry = None
+    remaining_entries = []
+    for entry in entries:
+        if removed_entry is None and entry.get("key") == lookup_key:
+            removed_entry = entry
+            continue
+        remaining_entries.append(entry)
+
+    if removed_entry is None:
+        return None
+
+    runtime_state["schedule_entries"] = remaining_entries
+    if str(runtime_state.get("schedule_tracking_key", "") or "").strip() == lookup_key:
+        runtime_state["schedule_tracking_key"] = ""
+
+    if remaining_entries:
+        runtime_state["active_schedule_key"] = remaining_entries[0]["key"]
+        sync_runtime_state_from_schedule_entry(remaining_entries[0], runtime_state)
+    else:
+        runtime_state["active_schedule_key"] = ""
+        fallback_entry = build_schedule_entry()
+        for field in SCHEDULE_ENTRY_FIELDS:
+            runtime_state[field] = fallback_entry[field]
+
+    return removed_entry
 
 
 def upsert_schedule_entry(sheet_id: str, sheet_name: str, sheet_gid: str = "0", state=None):
@@ -2625,6 +2773,8 @@ def add_log(msg, state=None):
     timestamp = datetime.now().strftime("%H:%M:%S")
     # store full messages (trim list length), useful for debugging unicode/errors
     logs.insert(0, f"[{timestamp}] {msg}")
+    if len(logs) > MAX_RUNTIME_LOG_LINES:
+        del logs[MAX_RUNTIME_LOG_LINES:]
 
 def build_log_html(state=None):
     runtime_state = resolve_runtime_state(state)
@@ -2632,7 +2782,7 @@ def build_log_html(state=None):
     if not logs:
         return '<p class="system-log-empty">Đang chờ lệnh...</p>'
     parts = []
-    for item in logs:
+    for item in logs[:MAX_RUNTIME_LOG_RENDER_LINES]:
         raw_text = str(item or "")
         timestamp_part, separator, message_part = raw_text.partition("] ")
         timestamp_text = timestamp_part[1:] if separator and timestamp_part.startswith("[") else ""
@@ -2683,12 +2833,13 @@ def build_pending_html(state=None):
     """
 
 
-def add_failed_item(tab_name: str, row_idx: int, platform: str, url: str, reason: str, state=None):
+def add_failed_item(tab_name: str, row_idx: int, platform: str, url: str, reason: str, state=None, sheet_id: str = ""):
     runtime_state = resolve_runtime_state(state)
     failed_items = runtime_state.get("failed_items") or []
     timestamp = datetime.now().strftime("%H:%M:%S")
     failed_items.insert(0, {
         "time": timestamp,
+        "sheet_id": str(sheet_id or runtime_state.get("active_sheet_id", "") or "").strip(),
         "tab": str(tab_name or "").strip(),
         "row": int(row_idx or 0),
         "platform": str(platform or "").strip(),
@@ -2701,8 +2852,9 @@ def add_failed_item(tab_name: str, row_idx: int, platform: str, url: str, reason
 def build_failed_html(state=None):
     runtime_state = resolve_runtime_state(state)
     failed_items = runtime_state.get("failed_items") or []
+    header_html = f'<div class="text-xs text-slate-400 mb-2">Đang có {len(failed_items)} dòng lỗi</div>'
     if not failed_items:
-        return '<p class="system-log-empty">Chưa có dòng lỗi lấy số liệu.</p>'
+        return header_html + '<p class="system-log-empty">Chưa có dòng lỗi lấy số liệu.</p>'
     rows = []
     for item in failed_items[:30]:
         time_text = html.escape(str(item.get("time") or ""))
@@ -2719,7 +2871,7 @@ def build_failed_html(state=None):
             f'</div>'
             f'<div class="text-[11px] text-slate-400 break-all pl-2 pb-2">{url_text}</div>'
         )
-    return "".join(rows)
+    return header_html + "".join(rows)
 
 def set_run_progress(current: Optional[int] = None, total: Optional[int] = None, phase: Optional[str] = None, state=None):
     runtime_state = resolve_runtime_state(state)
@@ -2780,7 +2932,7 @@ def build_status_payload(state=None):
     current_task = runtime_state["current_task"]
     progress_payload = build_run_progress_payload(runtime_state)
     config_locked = (not is_running) and current_task == "Đã dừng thủ công"
-    status_badge_base_class = "py-2.5 px-5 rounded-full text-sm font-black uppercase tracking-[0.14em] leading-none"
+    status_badge_base_class = "py-2 px-4 rounded-full text-xs font-black uppercase tracking-[0.12em] leading-none"
     status_badge_class = f"{status_badge_base_class} bg-slate-700/60 text-slate-200 border border-slate-500/20"
     status_badge_text = "Sẵn sàng"
     if is_running:
@@ -2794,11 +2946,12 @@ def build_status_payload(state=None):
         status_badge_text = "Đã dừng"
 
     primary_action_html = (
-        """<a href="/stop" data-inline-action="stop" class="w-full flex items-center justify-center py-4 px-4 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-black text-base uppercase tracking-[0.18em] shadow-md shadow-rose-900/20 border-b border-rose-800 transition-all active:scale-95"><i class="fa-solid fa-circle-stop mr-3 text-lg"></i> Dừng</a>"""
+        """<a href="/stop" data-inline-action="stop" class="w-full flex items-center justify-center py-3 px-4 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-black text-sm uppercase tracking-[0.16em] shadow-md shadow-rose-900/20 border-b border-rose-800 transition-all active:scale-95"><i class="fa-solid fa-circle-stop mr-2.5 text-base"></i> Dừng</a>"""
         if is_running
-        else """<a href="/start" data-inline-action="start" class="w-full flex items-center justify-center py-4 px-4 bg-sky-600 hover:bg-sky-500 text-white rounded-xl font-black text-base uppercase tracking-[0.18em] shadow-md shadow-sky-900/20 border-b border-sky-700 transition-all active:scale-95"><i class="fa-solid fa-play mr-3 text-lg text-amber-200"></i> Bắt đầu</a>"""
+        else """<a href="/start" data-inline-action="start" class="w-full flex items-center justify-center py-3 px-4 bg-sky-600 hover:bg-sky-500 text-white rounded-xl font-black text-sm uppercase tracking-[0.16em] shadow-md shadow-sky-900/20 border-b border-sky-700 transition-all active:scale-95"><i class="fa-solid fa-play mr-2.5 text-base text-amber-200"></i> Bắt đầu</a>"""
     )
 
+    failed_count = len(runtime_state.get("failed_items") or [])
     return {
         "status_badge_class": status_badge_class,
         "status_badge_text": status_badge_text,
@@ -2806,6 +2959,7 @@ def build_status_payload(state=None):
         "progress_width": progress_payload["progress_width"],
         "progress_text": progress_payload["progress_text"],
         "primary_action_html": primary_action_html,
+        "failed_count": failed_count,
         "config_locked": config_locked,
         "config_lock_message": "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập hoặc lưu sheet." if config_locked else "",
     }
@@ -2880,6 +3034,7 @@ def build_ui_state(state=None):
     payload["schedule_config"] = build_schedule_config_payload(runtime_state)
     payload["schedule_tracking"] = build_schedule_tracking_payload(runtime_state)
     payload["tab_progress"] = dict(runtime_state.get("tab_progress") or {})
+    payload["selected_tabs"] = [str(item).strip() for item in (runtime_state.get("selected_tabs") or []) if str(item).strip()]
     payload["column_overrides_by_tab"] = {
         tab: {k: (col_to_a1(v) if v else "") for k, v in overrides.items()}
         for tab, overrides in (runtime_state.get("column_overrides_by_tab") or {}).items()
@@ -2887,9 +3042,11 @@ def build_ui_state(state=None):
     return payload
 
 def build_ui_json_response(message: str, level: str = "info", ok: bool = True, extra: Optional[dict] = None, state=None):
-    payload = build_ui_state(state)
+    runtime_state = resolve_runtime_state(state)
+    payload = build_ui_state(runtime_state)
     if extra:
         payload.update(extra)
+        cache_dashboard_sections_for_user(str(runtime_state.get("owner_email", "") or "").strip(), extra)
     payload.update({
         "ok": ok,
         "message": message,
@@ -3322,8 +3479,7 @@ def build_schedule_tracking_entries_html(state=None):
         active_class = "is-active" if is_active else ""
         entry_rows.append(
             f"""
-            <button
-                type="button"
+            <div
                 data-schedule-track-entry-key="{html.escape(entry['key'], quote=True)}"
                 class="schedule-track-list-row {active_class}"
             >
@@ -3341,9 +3497,19 @@ def build_schedule_tracking_entries_html(state=None):
                     <div class="schedule-track-list-main">{html.escape(target_text)}</div>
                 </div>
                 <div class="schedule-track-list-cell">
-                    <div class="schedule-track-list-main">{html.escape(next_run_text)}</div>
+                    <div class="schedule-track-list-last-run">
+                        <div class="schedule-track-list-main">{html.escape(next_run_text)}</div>
+                        <button
+                            type="button"
+                            class="schedule-track-delete-btn"
+                            data-schedule-delete-entry-key="{html.escape(entry['key'], quote=True)}"
+                            title="Xóa lịch sheet này"
+                        >
+                            Xóa
+                        </button>
+                    </div>
                 </div>
-            </button>
+            </div>
             """
         )
     return f"""
@@ -3468,6 +3634,83 @@ def build_schedule_tracking_payload(state=None):
         processed_count = int(item.get("processed", 0) or 0)
         success_count = int(item.get("success", 0) or 0)
         failed_count = int(item.get("failed", 0) or 0)
+        run_id = html.escape(str(item.get("run_id") or f"run-{started_text}-{finished_text}"), quote=True)
+        rows_snapshot = list(item.get("rows_snapshot") or [])
+        detail_rows_html = ""
+        for row in rows_snapshot[:80]:
+            if not isinstance(row, dict):
+                continue
+            row_status = str(row.get("status") or "").strip().lower()
+            status_label = "Đã quét" if row_status == "success" else "Lỗi"
+            status_class = "posts-status-done" if row_status == "success" else "posts-status-pending"
+            row_url = str(row.get("url") or "").strip()
+            row_platform = str(row.get("platform") or "").strip() or "Khác"
+            row_creator = infer_creator_name(row_url, row_platform)
+            safe_link = html.escape(row_url, quote=True)
+            safe_link_text = html.escape(shorten_text(row_url, 72))
+            safe_creator = html.escape(shorten_text(row_creator, 24))
+            safe_platform = html.escape(row_platform)
+            safe_tab = html.escape(str(row.get("tab") or "-"))
+            row_index = int(row.get("row") or 0)
+            date_text = html.escape(str(row.get("date") or "-"))
+            view_text = format_table_metric(row.get("view"))
+            like_text = format_table_metric(row.get("like"))
+            share_text = format_table_metric(row.get("share"))
+            comment_text = format_table_metric(row.get("comment"))
+            buzz_text = format_table_metric(row.get("buzz"))
+            reason_text = html.escape(str(row.get("reason") or ""))
+            detail_rows_html += f"""
+                <tr class="posts-table-row">
+                    <td class="posts-cell posts-cell-content">
+                        <div class="post-content-wrap">
+                            <a href="{safe_link}" target="_blank" rel="noreferrer" class="post-content-meta">{safe_link_text}</a>
+                            <div class="posts-sheet-list-sub">{safe_tab} · Dòng {row_index if row_index > 0 else "-"}</div>
+                            {f'<div class="posts-sheet-list-error"><i class="fa-solid fa-circle-exclamation"></i><span>{reason_text}</span></div>' if reason_text else ""}
+                        </div>
+                    </td>
+                    <td class="posts-cell">
+                        <div class="post-creator-name">{safe_creator}</div>
+                        <div class="post-creator-handle">{safe_platform}</div>
+                    </td>
+                    <td class="posts-cell"><span class="post-status-pill {status_class}">{status_label}</span></td>
+                    <td class="posts-cell posts-cell-date">{date_text}</td>
+                    <td class="posts-cell posts-cell-metric">{view_text}</td>
+                    <td class="posts-cell posts-cell-metric">{like_text}</td>
+                    <td class="posts-cell posts-cell-metric">{share_text}</td>
+                    <td class="posts-cell posts-cell-metric">{comment_text}</td>
+                    <td class="posts-cell posts-cell-metric">{buzz_text}</td>
+                </tr>
+            """
+        detail_table_html = (
+            f"""
+            <div class="schedule-history-detail-title">Chi tiết lần chạy</div>
+            <div class="overflow-x-auto border border-white/10 rounded-2xl bg-slate-950/35">
+                <table class="posts-table min-w-[980px]">
+                    <thead>
+                        <tr>
+                            <th class="posts-cell">Nội dung</th>
+                            <th class="posts-cell">Creator</th>
+                            <th class="posts-cell">Trạng thái</th>
+                            <th class="posts-cell">Ngày</th>
+                            <th class="posts-cell">View</th>
+                            <th class="posts-cell">Like</th>
+                            <th class="posts-cell">Share</th>
+                            <th class="posts-cell">Comment</th>
+                            <th class="posts-cell">Buzz</th>
+                        </tr>
+                    </thead>
+                    <tbody>{detail_rows_html}</tbody>
+                </table>
+            </div>
+            """
+            if detail_rows_html
+            else """
+            <div class="schedule-history-detail-title">Chi tiết lần chạy</div>
+            <div class="rounded-2xl border border-dashed border-white/10 bg-slate-950/35 px-4 py-5 text-sm text-slate-400">
+                Lần chạy này chưa có snapshot chi tiết từng dòng. Các lần chạy mới sẽ tự lưu dữ liệu để xem tại đây.
+            </div>
+            """
+        )
 
         history_cards.append(
             f"""
@@ -3483,6 +3726,14 @@ def build_schedule_tracking_payload(state=None):
                     <div class="schedule-history-meta">Thời lượng: {duration_text}</div>
                     <div class="schedule-history-meta">Đã quét: {processed_count} link</div>
                     <div class="schedule-history-meta">Thành công / trượt: {success_count}/{failed_count}</div>
+                </div>
+                <div class="schedule-history-footer">
+                    <button type="button" class="schedule-history-detail-btn" data-schedule-history-toggle="{run_id}" aria-expanded="false">
+                        Xem chi tiết lần chạy
+                    </button>
+                </div>
+                <div class="schedule-history-detail hidden" data-schedule-history-detail="{run_id}">
+                    {detail_table_html}
                 </div>
             </div>
             """
@@ -3696,6 +3947,7 @@ def extract_sheet_id(sheet_input: str) -> Optional[str]:
     return None
 
 def get_worksheet(sheet_name, sheet_id: Optional[str] = None, state=None):
+    global SPREADSHEET_OBJECT_CACHE, WORKSHEET_OBJECT_CACHE
     runtime_state = resolve_runtime_state(state)
     resolved_sheet_id = sheet_id or runtime_state["active_sheet_id"] or ACTIVE_SHEET_ID
     resolved_sheet_name = sheet_name
@@ -3705,13 +3957,42 @@ def get_worksheet(sheet_name, sheet_id: Optional[str] = None, state=None):
         and runtime_state.get("_cached_worksheet") is not None
     ):
         return runtime_state["_cached_worksheet"]
+
+    worksheet_cache_key = f"{resolved_sheet_id}:{resolved_sheet_name}"
+    now_epoch = time.time()
+    with WORKSHEET_OBJECT_CACHE_LOCK:
+        worksheet_entry = WORKSHEET_OBJECT_CACHE.get(worksheet_cache_key)
+        if worksheet_entry and (now_epoch - float(worksheet_entry.get("updated_at") or 0.0)) < WORKSHEET_OBJECT_CACHE_TTL_SECONDS:
+            cached_worksheet = worksheet_entry.get("worksheet")
+            if cached_worksheet is not None:
+                runtime_state["_cached_worksheet_id"] = resolved_sheet_id
+                runtime_state["_cached_worksheet_name"] = resolved_sheet_name
+                runtime_state["_cached_worksheet"] = cached_worksheet
+                return cached_worksheet
     
     def _open_worksheet():
-        gc = get_gspread_client()
-        spreadsheet = gc.open_by_key(resolved_sheet_id)
+        with WORKSHEET_OBJECT_CACHE_LOCK:
+            spreadsheet_entry = SPREADSHEET_OBJECT_CACHE.get(resolved_sheet_id)
+            if spreadsheet_entry and (time.time() - float(spreadsheet_entry.get("updated_at") or 0.0)) < SPREADSHEET_OBJECT_CACHE_TTL_SECONDS:
+                spreadsheet = spreadsheet_entry.get("spreadsheet")
+            else:
+                spreadsheet = None
+        if spreadsheet is None:
+            gc = get_gspread_client()
+            spreadsheet = gc.open_by_key(resolved_sheet_id)
+            with WORKSHEET_OBJECT_CACHE_LOCK:
+                SPREADSHEET_OBJECT_CACHE[resolved_sheet_id] = {
+                    "updated_at": time.time(),
+                    "spreadsheet": spreadsheet,
+                }
         return spreadsheet.worksheet(resolved_sheet_name)
     
     worksheet = retry_with_backoff(_open_worksheet, max_retries=4, base_delay=2, handle_quota=True)
+    with WORKSHEET_OBJECT_CACHE_LOCK:
+        WORKSHEET_OBJECT_CACHE[worksheet_cache_key] = {
+            "updated_at": now_epoch,
+            "worksheet": worksheet,
+        }
     runtime_state["_cached_worksheet_id"] = resolved_sheet_id
     runtime_state["_cached_worksheet_name"] = resolved_sheet_name
     runtime_state["_cached_worksheet"] = worksheet
@@ -3850,6 +4131,27 @@ def detect_platform(url):
     if "youtube.com" in url_lower or "youtu.be" in url_lower: return "YouTube"
     if "instagram.com" in url_lower: return "Instagram"
     return "Khác"
+
+def extract_scannable_url(raw_value: str) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    direct_match = re.search(r"(https?://[^\s\"'<>]+)", value, flags=re.IGNORECASE)
+    if direct_match:
+        return direct_match.group(1).strip()
+    formula_match = re.search(r'(?i)^=HYPERLINK\(\s*"([^"]+)"', value)
+    if formula_match:
+        return str(formula_match.group(1) or "").strip()
+    formula_match_single = re.search(r"(?i)^=HYPERLINK\(\s*'([^']+)'", value)
+    if formula_match_single:
+        return str(formula_match_single.group(1) or "").strip()
+    lowered = value.lower().strip()
+    if lowered.startswith("www."):
+        return f"https://{value}"
+    known_domains = ("facebook.com/", "fb.watch/", "tiktok.com/", "instagram.com/", "youtu.be/", "youtube.com/")
+    if any(domain in lowered for domain in known_domains):
+        return f"https://{value.lstrip('/')}"
+    return ""
 
 
 def is_optional_view_metric(url: str, platform: str = "") -> bool:
@@ -4084,6 +4386,69 @@ def get_sheet_records(sheet, layout=None, include_row_values: bool = False):
         records.append(record)
     return records, header_row, headers
 
+
+def get_sheet_column_values(
+    sheet,
+    col_idx: int,
+    use_cache: bool = True,
+    start_row: int = 1,
+    max_rows: Optional[int] = None,
+):
+    global SHEET_COLUMN_CACHE
+    safe_col_idx = max(1, int(col_idx or 1))
+    safe_start_row = max(1, int(start_row or 1))
+    sheet_id = getattr(getattr(sheet, "spreadsheet", None), "id", "") or ""
+    sheet_name = getattr(sheet, "title", "") or ""
+    cache_key = f"{sheet_id}:{sheet_name}:{safe_col_idx}:{safe_start_row}"
+    now = datetime.now()
+    cache_entry = SHEET_COLUMN_CACHE.get(cache_key)
+    if use_cache and cache_entry:
+        try:
+            updated_at = datetime.fromisoformat(cache_entry.get("updated_at", ""))
+            if (now - updated_at).total_seconds() < SHEET_COLUMN_CACHE_TTL_SECONDS:
+                return list(cache_entry.get("values") or [])
+        except Exception:
+            pass
+    stale_values = list((cache_entry or {}).get("values") or [])
+    col_a1 = col_to_a1(safe_col_idx)
+    scan_max_rows = max(1000, int(max_rows or SHEET_COLUMN_SCAN_MAX_ROWS))
+    chunk_size = max(200, int(SHEET_COLUMN_SCAN_CHUNK_SIZE))
+    empty_streak_limit = max(50, int(SHEET_COLUMN_SCAN_EMPTY_STREAK))
+    values = []
+    scanned_rows = 0
+    empty_streak = 0
+    current_row = safe_start_row
+    try:
+        while scanned_rows < scan_max_rows:
+            take_rows = min(chunk_size, scan_max_rows - scanned_rows)
+            end_row = current_row + take_rows - 1
+            range_a1 = f"{col_a1}{current_row}:{col_a1}{end_row}"
+            block = sheet.get(range_a1)
+            if not block:
+                break
+            for row in block:
+                cell_val = str((row[0] if row else "") or "").strip()
+                values.append(cell_val)
+                scanned_rows += 1
+                if cell_val:
+                    empty_streak = 0
+                else:
+                    empty_streak += 1
+                if empty_streak >= empty_streak_limit:
+                    break
+            if len(block) < take_rows or empty_streak >= empty_streak_limit:
+                break
+            current_row = end_row + 1
+    except Exception as exc:
+        if stale_values and is_quota_or_rate_limit_error(exc):
+            return stale_values
+        raise
+    SHEET_COLUMN_CACHE[cache_key] = {
+        "updated_at": now.isoformat(),
+        "values": values,
+    }
+    return list(values or [])
+
 def resolve_effective_start_row(header_row: int, state=None) -> int:
     runtime_state = resolve_runtime_state(state)
     return max(2, runtime_state["start_row"], int(header_row or 1) + 1)
@@ -4107,6 +4472,10 @@ def apply_column_overrides(columns, overrides=None, state=None):
     runtime_state = resolve_runtime_state(state)
     override_map = overrides if isinstance(overrides, dict) else runtime_state["column_overrides"]
     for field, col_idx in override_map.items():
+        # Buzz is opt-in only: if user leaves Buzz empty, do not auto-map it.
+        if field == "buzz" and not col_idx:
+            merged.pop("buzz", None)
+            continue
         if col_idx:
             merged[field] = col_idx
     return merged
@@ -4205,15 +4574,79 @@ def parse_metric_number(value) -> int:
     raw = str(value).strip()
     if not raw or raw.lower() == "nan":
         return 0
-    digits = re.sub(r"[^\d]", "", raw)
-    return int(digits) if digits else 0
+    raw_lower = raw.lower()
+    if any(marker in raw_lower for marker in ("http://", "https://", "www.", ".com/", ".vn/", ".net/")):
+        return 0
+
+    compact_match = re.fullmatch(r"\s*([+-]?\d+(?:[.,]\d+)?)\s*([kmbtpe])\s*", raw, flags=re.IGNORECASE)
+    if compact_match:
+        number_text = compact_match.group(1).replace(",", ".")
+        unit = compact_match.group(2).upper()
+        unit_multiplier = {
+            "K": 1_000,
+            "M": 1_000_000,
+            "B": 1_000_000_000,
+            "T": 1_000_000_000_000,
+            "P": 1_000_000_000_000_000,
+            "E": 1_000_000_000_000_000_000,
+        }.get(unit, 1)
+        try:
+            return int(float(number_text) * unit_multiplier)
+        except Exception:
+            return 0
+
+    number_token_match = re.search(r"[+-]?\d[\d.,]*", raw)
+    if not number_token_match:
+        return 0
+    token = number_token_match.group(0)
+    has_dot = "." in token
+    has_comma = "," in token
+
+    if has_dot and has_comma:
+        # Use the right-most separator as decimal separator, others as thousands separators.
+        decimal_sep = "." if token.rfind(".") > token.rfind(",") else ","
+        if decimal_sep == ".":
+            normalized = token.replace(",", "")
+        else:
+            normalized = token.replace(".", "").replace(",", ".")
+        try:
+            return int(float(normalized))
+        except Exception:
+            return 0
+
+    if has_dot or has_comma:
+        sep = "." if has_dot else ","
+        parts = token.split(sep)
+        if len(parts) > 2:
+            # Many separators => treat as thousands separators.
+            collapsed = "".join(parts)
+            return int(collapsed) if collapsed.isdigit() else 0
+        if len(parts) == 2:
+            left, right = parts
+            if right.isdigit() and len(right) == 3 and left.replace("+", "").replace("-", "").isdigit():
+                collapsed = left + right
+                collapsed = collapsed.replace("+", "")
+                return int(collapsed) if re.fullmatch(r"-?\d+", collapsed) else 0
+            normalized = token.replace(",", ".")
+            try:
+                return int(float(normalized))
+            except Exception:
+                return 0
+
+    digits = re.sub(r"[^\d-]", "", token)
+    if re.fullmatch(r"-?\d+", digits or ""):
+        try:
+            return int(digits)
+        except Exception:
+            return 0
+    return 0
 
 def format_metric_number(value) -> str:
     return f"{parse_metric_number(value):,}".replace(",", ".")
 
 def format_table_metric(value) -> str:
     number = parse_metric_number(value)
-    return format_metric_number(number) if number > 0 else "-"
+    return format_compact_metric(number) if number > 0 else "-"
 
 def shorten_text(text, limit: int = 88) -> str:
     value = re.sub(r"\s+", " ", str(text or "")).strip()
@@ -4242,6 +4675,54 @@ def infer_creator_name(link: str, platform: str) -> str:
             return "Facebook reel"
         return "Facebook page"
     return host or platform
+
+def _should_resolve_creator_link(url: str) -> bool:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if host.startswith("vt.tiktok.com") or host.startswith("vm.tiktok.com"):
+        return True
+    if host.endswith("facebook.com") and path.startswith("/share/"):
+        return True
+    if host == "fb.watch":
+        return True
+    return False
+
+def resolve_creator_link(url: str) -> str:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return ""
+
+    cached = LINK_RESOLVE_CACHE.get(raw_url)
+    now = datetime.now()
+    if cached:
+        try:
+            updated_at = datetime.fromisoformat(cached.get("updated_at", ""))
+            if (now - updated_at).total_seconds() < LINK_RESOLVE_CACHE_TTL_SECONDS:
+                return str(cached.get("final_url") or raw_url)
+        except Exception:
+            pass
+
+    if not _should_resolve_creator_link(raw_url):
+        LINK_RESOLVE_CACHE[raw_url] = {"final_url": raw_url, "updated_at": now.isoformat()}
+        return raw_url
+
+    final_url = raw_url
+    try:
+        resp = requests.head(raw_url, allow_redirects=True, timeout=8)
+        if resp.url:
+            final_url = str(resp.url).split("#")[0]
+    except Exception:
+        try:
+            resp = requests.get(raw_url, allow_redirects=True, timeout=8, stream=True)
+            if resp.url:
+                final_url = str(resp.url).split("#")[0]
+            resp.close()
+        except Exception:
+            final_url = raw_url
+
+    LINK_RESOLVE_CACHE[raw_url] = {"final_url": final_url, "updated_at": now.isoformat()}
+    return final_url
 
 
 def resolve_post_creator_name(normalized_record, link: str, platform: str) -> str:
@@ -4355,15 +4836,30 @@ def extract_brand_label_from_record(normalized_record) -> str:
 
 def format_compact_metric(value) -> str:
     number = parse_metric_number(value)
+    if number >= 1_000_000_000_000_000_000:
+        whole = number // 1_000_000_000_000_000_000
+        decimal = ((number % 1_000_000_000_000_000_000) * 10) // 1_000_000_000_000_000_000
+        return f"{whole},{decimal} E" if decimal else f"{whole} E"
+    if number >= 1_000_000_000_000_000:
+        whole = number // 1_000_000_000_000_000
+        decimal = ((number % 1_000_000_000_000_000) * 10) // 1_000_000_000_000_000
+        return f"{whole},{decimal} P" if decimal else f"{whole} P"
+    if number >= 1_000_000_000_000:
+        whole = number // 1_000_000_000_000
+        decimal = ((number % 1_000_000_000_000) * 10) // 1_000_000_000_000
+        return f"{whole},{decimal} T" if decimal else f"{whole} T"
     if number >= 1_000_000_000:
-        compact = f"{number / 1_000_000_000:.1f}".rstrip("0").rstrip(".")
-        return compact.replace(".", ",") + " B"
+        whole = number // 1_000_000_000
+        decimal = ((number % 1_000_000_000) * 10) // 1_000_000_000
+        return f"{whole},{decimal} B" if decimal else f"{whole} B"
     if number >= 1_000_000:
-        compact = f"{number / 1_000_000:.1f}".rstrip("0").rstrip(".")
-        return compact.replace(".", ",") + " M"
+        whole = number // 1_000_000
+        decimal = ((number % 1_000_000) * 10) // 1_000_000
+        return f"{whole},{decimal} M" if decimal else f"{whole} M"
     if number >= 1_000:
-        compact = f"{number / 1_000:.1f}".rstrip("0").rstrip(".")
-        return compact.replace(".", ",") + " K"
+        whole = number // 1_000
+        decimal = ((number % 1_000) * 10) // 1_000
+        return f"{whole},{decimal} K" if decimal else f"{whole} K"
     return format_metric_number(number)
 
 def build_dom_slug(value: str, fallback: str = "item") -> str:
@@ -4438,13 +4934,14 @@ def collect_posts_dataset_for_worksheet(
         if not link:
             continue
 
-        platform = detect_platform(link)
+        resolved_link = resolve_creator_link(link)
+        platform = detect_platform(resolved_link or link)
         platform_key = normalize_header(platform)
         if platform_key not in platform_counts:
             platform_key = "khac"
         platform_counts[platform_key] += 1
 
-        creator = resolve_post_creator_name(normalized_record, link, platform)
+        creator = resolve_post_creator_name(normalized_record, resolved_link or link, platform)
         brand_label = extract_brand_label_from_record(normalized_record)
         campaign = (
             resolved_campaign_override
@@ -4456,7 +4953,7 @@ def collect_posts_dataset_for_worksheet(
         )
         title = str(
             first_nonempty_value(normalized_record, "caption", "title", "content", "noidung", "post", "mota")
-        ).strip() or infer_post_title(link, platform)
+        ).strip() or infer_post_title(resolved_link or link, platform)
         raw_date_text = resolve_dashboard_air_date_value(record, normalized_record, col_map) or resolve_dashboard_date_value(record, normalized_record, col_map)
         date_text = format_dashboard_date_text(raw_date_text) if raw_date_text else "-"
         date_title = format_dashboard_date_text(raw_date_text, include_time=True) if raw_date_text else "-"
@@ -4479,7 +4976,7 @@ def collect_posts_dataset_for_worksheet(
         safe_title = html.escape(shorten_text(title, 88))
         safe_link = html.escape(link, quote=True)
         safe_creator = html.escape(shorten_text(creator, 24))
-        creator_handle = infer_creator_handle(link, creator, platform)
+        creator_handle = infer_creator_handle(resolved_link or link, creator, platform)
         safe_creator_handle = html.escape(shorten_text(creator_handle, 24))
         safe_platform = html.escape(platform)
         safe_campaign = html.escape(shorten_text(campaign, 28))
@@ -4519,7 +5016,6 @@ def collect_posts_dataset_for_worksheet(
                 </td>
                 <td class="posts-cell posts-cell-content" data-post-col="content">
                     <div class="post-content-wrap">
-                        <a href="{safe_link}" target="_blank" rel="noreferrer" class="post-title-link">{safe_title}</a>
                         <a href="{safe_link}" target="_blank" rel="noreferrer" class="post-content-meta">{safe_content_meta}</a>
                     </div>
                 </td>
@@ -4743,8 +5239,9 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             if not link:
                 continue
 
-            platform = detect_platform(link)
-            creator = resolve_post_creator_name(normalized_record, link, platform)
+            resolved_link = resolve_creator_link(link)
+            platform = detect_platform(resolved_link or link)
+            creator = resolve_post_creator_name(normalized_record, resolved_link or link, platform)
             brand_name = entry_brand_label or extract_brand_label_from_record(normalized_record) or "Chưa gắn"
             campaign_name = str(
                 entry_campaign_label
@@ -4972,10 +5469,6 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             <div class="overview-chart-card" data-overview-chart-card>
                 <script type="application/json" data-overview-chart-data>{chart_payload_json}</script>
                 <div class="overview-chart-head">
-                    <div>
-                        <div class="overview-control-title">Hiệu suất theo thương hiệu</div>
-                        <div class="overview-control-subtitle">{html.escape(chart_subtitle)}</div>
-                    </div>
                     <div class="overview-head-actions">
                         <button type="button" class="overview-filter-trigger" data-overview-filter-trigger aria-label="Mở bộ lọc biểu đồ thời gian">
                             <i class="fa-regular fa-calendar"></i>
@@ -5327,11 +5820,11 @@ def build_posts_panel_html(sheet=None, state=None):
             else '<div class="posts-sheet-list-brand-empty">-</div>'
         )
         posts_text = format_metric_number(dataset.get("total_posts", 0))
-        views_text = format_metric_number(dataset.get("total_views", 0))
-        reaction_text = format_metric_number(dataset.get("total_reaction", 0))
-        comment_text = format_metric_number(dataset.get("total_comment", 0))
-        share_text = format_metric_number(dataset.get("total_share", 0))
-        buzz_text = format_metric_number(dataset.get("total_buzz", 0))
+        views_text = format_compact_metric(dataset.get("total_views", 0))
+        reaction_text = format_compact_metric(dataset.get("total_reaction", 0))
+        comment_text = format_compact_metric(dataset.get("total_comment", 0))
+        share_text = format_compact_metric(dataset.get("total_share", 0))
+        buzz_text = format_compact_metric(dataset.get("total_buzz", 0))
         platform_summary = " • ".join(
             [
                 f"{platform_label_map.get(platform_key, platform_key.title())} {count}"
@@ -5387,6 +5880,16 @@ def build_posts_panel_html(sheet=None, state=None):
                             >
                                 <i class="fa-regular fa-pen-to-square"></i>
                                 <span>Chỉnh sửa thông tin</span>
+                            </button>
+                            <button
+                                type="button"
+                                class="posts-sheet-actions-item text-rose-300"
+                                data-posts-sheet-action="delete-sheet"
+                                data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}"
+                                data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}"
+                            >
+                                <i class="fa-regular fa-trash-can"></i>
+                                <span>Xóa sheet</span>
                             </button>
                             <a href="{html.escape(sheet_snapshot_url, quote=True)}" target="_blank" rel="noreferrer" class="posts-sheet-actions-item">
                                 <i class="fa-solid fa-up-right-from-square"></i>
@@ -5489,7 +5992,7 @@ def build_posts_panel_html(sheet=None, state=None):
                             <thead>
                                 <tr>
                                     <th class="posts-check-col"><input type="checkbox" class="posts-table-check posts-select-all" data-select-all-posts aria-label="Chọn tất cả" /></th>
-                                    <th data-post-col="content">Nội dung</th>
+                                    <th data-post-col="content">Link</th>
                                     <th data-post-col="creator">Creator</th>
                                     <th data-post-col="status">Trạng thái</th>
                                     <th data-post-col="plan">Plan</th>
@@ -5746,6 +6249,11 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
     runtime_state = resolve_runtime_state(state)
     add_log("⚙️ Đang khởi tạo bộ máy quét...", runtime_state)
     logger = lambda message: add_log(message, runtime_state)
+    if RESET_STALE_SELENIUM_ON_START:
+        try:
+            reset_stale_selenium_sessions(logger=logger)
+        except Exception:
+            pass
     run_binding_keys = set()
     started_at = datetime.now()
     runtime_state["run_started_at"] = started_at
@@ -5754,6 +6262,9 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
     processed_count = 0
     success_count = 0
     failed_count = 0
+    run_rows_snapshot = []
+    run_log_baseline = len(runtime_state.get("logs") or [])
+    run_failed_baseline = len(runtime_state.get("failed_items") or [])
     set_run_progress(current=0, total=0, phase="preparing", state=runtime_state)
     try:
         normalized_targets = normalize_schedule_targets(targets or [])
@@ -5800,57 +6311,70 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         now = datetime.now().strftime("%d/%m/%Y %H:%M")
         prepared_groups = []
         total_scannable_rows = 0
+        is_multi_group_scan = len(scan_groups) > 1
         for sheet_id, selected_sheet, selected_targets in scan_groups:
             logger(f"Đang kết nối Google Sheets: {selected_sheet}")
             sheet = get_worksheet(selected_sheet, sheet_id, runtime_state)
             layout = detect_sheet_layout(sheet)
             tab_overrides = runtime_state.get("column_overrides_by_tab", {}).get(selected_sheet)
-            col_map = apply_column_overrides(layout.get("columns"), overrides=tab_overrides) if tab_overrides else apply_column_overrides(layout.get("columns"), state=runtime_state)
+            if tab_overrides:
+                col_map = apply_column_overrides(layout.get("columns"), overrides=tab_overrides)
+            elif is_multi_group_scan:
+                # Multi-tab run: don't inherit global overrides from another tab.
+                col_map = dict(layout.get("columns") or {})
+            else:
+                col_map = apply_column_overrides(layout.get("columns"), state=runtime_state)
             had_date_column = bool(col_map.get("date"))
             col_map = ensure_dashboard_date_column(sheet, layout, col_map, runtime_state)
             if not had_date_column and col_map.get("date"):
                 logger(f"Tab '{selected_sheet}': đã thêm cột Ngày quét ở {col_to_a1(col_map['date'])}")
             link_col = col_map.get("link") or 4
-            # Log header names for debugging
-            try:
-                all_headers = sheet.row_values(max(1, int(layout.get("header_row") or 1)))
-                link_header_name = all_headers[link_col - 1] if link_col - 1 < len(all_headers) else "?"
+            # Ưu tiên header đã có sẵn từ detect_sheet_layout để tránh gọi API lặp lại.
+            all_headers = list(layout.get("headers") or [])
+            if not all_headers:
+                try:
+                    all_headers = sheet.row_values(max(1, int(layout.get("header_row") or 1)))
+                except Exception:
+                    all_headers = []
+            link_header_name = all_headers[link_col - 1] if link_col - 1 < len(all_headers) else "?"
+            if all_headers:
                 logger(f"Tab '{selected_sheet}': Header hàng {layout.get('header_row') or 1}: {', '.join(f'{col_to_a1(i+1)}={h}' for i, h in enumerate(all_headers) if h)}")
-            except Exception:
-                link_header_name = "?"
-                all_headers = []
             if not col_map.get("link"):
                 logger(f"Tab '{selected_sheet}': Không tìm thấy cột 'link', tạm dùng cột D (4) để quét")
             else:
                 logger(f"Tab '{selected_sheet}': Dùng cột link = {col_to_a1(link_col)} ({link_col}) | Header: \"{link_header_name}\"")
-            urls = sheet.col_values(link_col)
             header_row = max(1, int(layout.get("header_row") or 1))
             start_row = resolve_effective_start_row(header_row, runtime_state)
-            logger(f"Tab '{selected_sheet}': Đọc được {len(urls)} giá trị từ cột link, header dòng {header_row}, bắt đầu từ dòng {start_row}")
 
             if selected_targets:
                 row_plan = []
                 seen_rows = set()
                 for target in selected_targets:
-                    resolved_row = resolve_target_row_index(target, urls, min_row=start_row)
+                    resolved_row = parse_start_row_input(str(target.get("row_idx") or ""))
                     if resolved_row is None or resolved_row < start_row or resolved_row in seen_rows:
                         continue
-                    url = str(urls[resolved_row - 1] if resolved_row - 1 < len(urls) else "").strip()
-                    if (not url or "http" not in url.lower()) and target:
-                        url = str(target.get("link") or "").strip()
-                    if not url or "http" not in url.lower():
+                    url = extract_scannable_url(str(target.get("link") or "").strip())
+                    if not url:
                         continue
                     seen_rows.add(resolved_row)
                     row_plan.append((resolved_row, target, url))
                 row_plan.sort(key=lambda item: item[0])
+                logger(f"Tab '{selected_sheet}': dùng danh sách mục tiêu có sẵn, bỏ qua bước đọc toàn bộ cột link")
                 logger(f"Tab '{selected_sheet}': quét {len(row_plan)} bài đã chọn")
             else:
+                urls = get_sheet_column_values(sheet, link_col, use_cache=True, start_row=start_row)
+                logger(f"Tab '{selected_sheet}': Đọc được {len(urls)} giá trị từ cột link, header dòng {header_row}, bắt đầu từ dòng {start_row}")
                 row_plan = []
-                for row_idx in range(start_row, len(urls) + 1):
-                    url = str(urls[row_idx - 1] if row_idx - 1 < len(urls) else "").strip()
-                    if not url or "http" not in url.lower():
+                for offset, raw_url in enumerate(urls):
+                    row_idx = start_row + offset
+                    url = extract_scannable_url(raw_url)
+                    if not url:
                         continue
                     row_plan.append((row_idx, None, url))
+                if not row_plan:
+                    sample_values = [str(item or "").strip() for item in urls if str(item or "").strip()][:5]
+                    if sample_values:
+                        logger(f"Tab '{selected_sheet}': Cột {col_to_a1(link_col)} có dữ liệu nhưng chưa đúng định dạng URL. Mẫu: {sample_values}")
                 logger(f"Tab '{selected_sheet}': tìm thấy {len(row_plan)} bài có link hợp lệ từ dòng {start_row} (header dòng {header_row})")
 
             prepared_groups.append((sheet, selected_sheet, col_map, row_plan))
@@ -5868,7 +6392,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         state_lock = threading.Lock()
         shared = {"processed": 0, "success": 0, "failed": 0}
 
-        def scan_one_tab(ws, tab_name, col_map, row_plan):
+        def scan_one_tab(ws, tab_name, tab_sheet_id, col_map, row_plan):
             tab_driver = None
             tab_driver_failed = False
             now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -5893,14 +6417,21 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                             try:
                                 tab_driver = create_selenium_driver(logger=locked_log)
                             except Exception as driver_error:
-                                # Retry once after a short delay (parallel threads may compete for resources)
-                                locked_log(f"[{tab_name}] ⚠️ Driver tạo thất bại, thử lại sau 5s: {str(driver_error)[:80]}")
-                                time.sleep(5)
-                                try:
-                                    tab_driver = create_selenium_driver(logger=locked_log)
-                                except Exception as retry_err:
+                                if LOCAL_DRIVER_FAIL_FAST:
                                     tab_driver_failed = True
-                                    locked_log(f"[{tab_name}] ❌ Không tạo được driver sau 2 lần thử. {len(row_plan)} bài sẽ bị bỏ qua. Lỗi: {str(retry_err)[:100]}")
+                                    locked_log(
+                                        f"[{tab_name}] ❌ Driver fail-fast (local): {str(driver_error)[:120]}. "
+                                        f"Bỏ qua {len(row_plan)} bài của tab này để tránh chạy chập chờn."
+                                    )
+                                else:
+                                    # Retry once after a short delay (parallel threads may compete for resources)
+                                    locked_log(f"[{tab_name}] ⚠️ Driver tạo thất bại, thử lại sau 5s: {str(driver_error)[:80]}")
+                                    time.sleep(5)
+                                    try:
+                                        tab_driver = create_selenium_driver(logger=locked_log)
+                                    except Exception as retry_err:
+                                        tab_driver_failed = True
+                                        locked_log(f"[{tab_name}] ❌ Không tạo được driver sau 2 lần thử. {len(row_plan)} bài sẽ bị bỏ qua. Lỗi: {str(retry_err)[:100]}")
                         if not tab_driver_failed:
                             try:
                                 stats = get_social_stats(url, platform, driver=tab_driver, logger=locked_log)
@@ -5931,6 +6462,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         stats["v"] = 0
                     if stats and runtime_state["is_running"]:
                         row_updates = build_row_updates(col_map, platform, now_str, stats)
+                        update_values = {field: value for field, _, value in row_updates}
                         with state_lock:
                             set_pending_updates(i, row_updates, runtime_state)
                         sheet_requests = []
@@ -5981,20 +6513,54 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                                 max_retries=3,
                                 handle_quota=True
                             )
-                        red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
-                        update_metric_highlights(ws, i, col_map, red_fields)
+                        red_fields = []
+                        if ENABLE_SUCCESS_METRIC_ZERO_CHECK:
+                            red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
+                            update_metric_highlights(ws, i, col_map, red_fields)
                         with state_lock:
+                            run_rows_snapshot.append(
+                                {
+                                    "tab": tab_name,
+                                    "row": i,
+                                    "platform": platform,
+                                    "url": url,
+                                    "status": "success",
+                                    "reason": "",
+                                    "date": str(update_values.get("air_date") or update_values.get("date") or ""),
+                                    "view": parse_metric_number(update_values.get("view")),
+                                    "like": parse_metric_number(update_values.get("like")),
+                                    "share": parse_metric_number(update_values.get("share")),
+                                    "comment": parse_metric_number(update_values.get("comment")),
+                                    "buzz": parse_metric_number(update_values.get("buzz")),
+                                }
+                            )
                             if red_fields:
                                 logger(f"[{tab_name}] Dòng {i}: {', '.join(f.upper() for f in red_fields)} đang bằng 0/trống nên đã tô đỏ")
                             logger(f"[{tab_name}] Dòng {i}: Cập nhật thành công")
                             shared["success"] += 1
                     elif runtime_state["is_running"]:
-                        add_failed_item(tab_name, i, platform, url, "Không lấy được số liệu", runtime_state)
+                        add_failed_item(tab_name, i, platform, url, "Không lấy được số liệu", runtime_state, sheet_id=tab_sheet_id)
                         if ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE:
                             red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
                             update_metric_highlights(ws, i, col_map, red_fields)
                         locked_log(f"[{tab_name}] Dòng {i}: Không lấy được số liệu")
                         with state_lock:
+                            run_rows_snapshot.append(
+                                {
+                                    "tab": tab_name,
+                                    "row": i,
+                                    "platform": platform,
+                                    "url": url,
+                                    "status": "failed",
+                                    "reason": "Không lấy được số liệu",
+                                    "date": "",
+                                    "view": 0,
+                                    "like": 0,
+                                    "share": 0,
+                                    "comment": 0,
+                                    "buzz": 0,
+                                }
+                            )
                             shared["failed"] += 1
                     with state_lock:
                         shared["processed"] += 1
@@ -6023,8 +6589,12 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
 
         if len(prepared_groups) > 1:
             tab_threads = [
-                threading.Thread(target=scan_one_tab, args=(ws, tab_name, col_map, row_plan), daemon=True)
-                for ws, tab_name, col_map, row_plan in prepared_groups
+                threading.Thread(
+                    target=scan_one_tab,
+                    args=(ws, tab_name, scan_groups[idx][0], col_map, row_plan),
+                    daemon=True,
+                )
+                for idx, (ws, tab_name, col_map, row_plan) in enumerate(prepared_groups)
             ]
             for t in tab_threads:
                 t.start()
@@ -6032,7 +6602,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                 t.join()
         else:
             ws, tab_name, col_map, row_plan = prepared_groups[0]
-            scan_one_tab(ws, tab_name, col_map, row_plan)
+            scan_one_tab(ws, tab_name, scan_groups[0][0], col_map, row_plan)
 
         processed_count = shared["processed"]
         success_count = shared["success"]
@@ -6051,7 +6621,8 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         run_status = "error"
         runtime_state["pending_updates"] = []
         set_run_progress(phase="error", state=runtime_state)
-        runtime_state["is_running"], runtime_state["current_task"] = False, f"Lỗi: {str(e)[:20]}"
+        error_text = str(e).strip() or "Unknown error"
+        runtime_state["is_running"], runtime_state["current_task"] = False, f"Lỗi: {error_text[:160]}"
         logger(f"Lỗi hệ thống: {str(e)}")
     finally:
         finished_at = datetime.now()
@@ -6067,6 +6638,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
 
         push_schedule_run_history(
             {
+                "run_id": f"run-{int(time.time() * 1000)}",
                 "sheet_name": runtime_state["schedule_last_run_sheet_name"],
                 "started_text": format_datetime_display(runtime_state["schedule_last_run_started_at"]),
                 "finished_text": format_datetime_display(runtime_state["schedule_last_run_finished_at"]),
@@ -6076,6 +6648,13 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                 "processed": processed_count,
                 "success": success_count,
                 "failed": failed_count,
+                "log_excerpt": (
+                    (runtime_state.get("logs") or [])[: max(0, len(runtime_state.get("logs") or []) - run_log_baseline)]
+                )[:12],
+                "failed_items_snapshot": (
+                    (runtime_state.get("failed_items") or [])[: max(0, len(runtime_state.get("failed_items") or []) - run_failed_baseline)]
+                )[:8],
+                "rows_snapshot": run_rows_snapshot[:120],
             },
             runtime_state,
         )
@@ -6090,6 +6669,34 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         runtime_state["run_started_at"] = None
         runtime_state["run_source"] = "idle"
         # Drivers are closed inside scan_one_tab's finally block
+
+
+def launch_scraper_async(*, runtime_state, sheet_id=None, sheet_name=None, targets=None, source="manual", multi_tabs=None):
+    """
+    Start scraper in a dedicated daemon thread so execution is independent from request lifecycle.
+    Returns True when thread started successfully.
+    """
+    def _runner():
+        run_scraper_logic(
+            sheet_id=sheet_id,
+            sheet_name=sheet_name,
+            targets=targets,
+            source=source,
+            state=runtime_state,
+            multi_tabs=multi_tabs,
+        )
+
+    try:
+        worker = threading.Thread(target=_runner, daemon=True, name=f"scraper-run-{int(time.time())}")
+        worker.start()
+        return True
+    except Exception as exc:
+        runtime_state["is_running"] = False
+        runtime_state["is_finished"] = False
+        runtime_state["current_task"] = f"Lỗi khởi chạy: {str(exc)[:120]}"
+        set_run_progress(phase="error", state=runtime_state)
+        add_log(f"❌ Không thể khởi chạy luồng quét: {str(exc)}", runtime_state)
+        return False
 
 # --- API & UI ---
 @app.get("/login", response_class=HTMLResponse)
@@ -6289,6 +6896,8 @@ def start_task(
         return auth_response
     runtime_state = get_runtime_state(current_user)
     add_log("► Nhận lệnh Bắt đầu...", runtime_state)
+    parsed_tab_list = [t.strip() for t in (sheet_names or "").split(",") if t.strip()] if sheet_names else []
+    is_multi_tab_start = len(parsed_tab_list) > 1
     if any(val is not None for val in (date, air_date, link, view, like, share, comment, buzz, save)):
         try:
             parsed_columns = parse_column_override_candidates(
@@ -6304,7 +6913,10 @@ def start_task(
                     "save": save,
                 }
             )
-            runtime_state["column_overrides"].update(parsed_columns)
+            if is_multi_tab_start:
+                add_log("Bỏ qua cập nhật cột global vì đang chạy nhiều tab; sẽ dùng cấu hình riêng từng tab/AUTO theo từng tab.", runtime_state)
+            else:
+                runtime_state["column_overrides"].update(parsed_columns)
         except ValueError as exc:
             return build_ui_json_response(str(exc), level="error", ok=False, state=runtime_state)
     if start_row is not None:
@@ -6342,13 +6954,30 @@ def start_task(
             return HTMLResponse("<html><script>window.location.href='/?sheet_error=3';</script></html>")
 
     if requested_sheet:
-        try:
-            set_active_sheet(requested_sheet, requested_sheet_id, runtime_state)
-        except Exception as e:
-            add_log(f"Không tìm thấy sheet: {requested_sheet} ({str(e)[:60]})", runtime_state)
-            if is_fetch_request(request):
-                return build_ui_json_response("Không tìm thấy tab sheet. Kiểm tra lại tên tab và quyền truy cập.", level="error", ok=False, state=runtime_state)
-            return HTMLResponse("<html><script>window.location.href='/?sheet_error=1';</script></html>")
+        normalized_requested_id = (requested_sheet_id or runtime_state.get("active_sheet_id") or "").strip()
+        normalized_requested_name = requested_sheet.strip().lower()
+        normalized_active_id = str(runtime_state.get("active_sheet_id", "") or "").strip()
+        normalized_active_name = str(runtime_state.get("active_sheet_name", "") or "").strip().lower()
+        should_refresh_active_sheet = not (
+            normalized_requested_id
+            and normalized_active_id
+            and normalized_requested_id == normalized_active_id
+            and normalized_requested_name == normalized_active_name
+        )
+        if should_refresh_active_sheet:
+            if FAST_START_COMMAND:
+                runtime_state["active_sheet_id"] = (requested_sheet_id or runtime_state.get("active_sheet_id") or "").strip()
+                runtime_state["active_sheet_name"] = requested_sheet.strip()
+                runtime_state["active_sheet_gid"] = str(runtime_state.get("active_sheet_gid") or "0")
+                add_log("⚡ Fast start: bỏ qua kiểm tra sheet đồng bộ, sẽ kiểm tra trong luồng quét.", runtime_state)
+            else:
+                try:
+                    set_active_sheet(requested_sheet, requested_sheet_id, runtime_state)
+                except Exception as e:
+                    add_log(f"Không tìm thấy sheet: {requested_sheet} ({str(e)[:60]})", runtime_state)
+                    if is_fetch_request(request):
+                        return build_ui_json_response("Không tìm thấy tab sheet. Kiểm tra lại tên tab và quyền truy cập.", level="error", ok=False, state=runtime_state)
+                    return HTMLResponse("<html><script>window.location.href='/?sheet_error=1';</script></html>")
 
     if not runtime_state["active_sheet_id"] or not runtime_state["active_sheet_name"]:
         add_log("Chưa cài đặt sheet. Vui lòng nhập link/ID và tên tab trước khi chạy.", runtime_state)
@@ -6358,7 +6987,6 @@ def start_task(
 
     # Build multi-tab list if sheet_names provided (comma-separated tab names)
     resolved_sheet_id_for_run = (requested_sheet_id or runtime_state["active_sheet_id"] or "").strip()
-    parsed_tab_list = [t.strip() for t in (sheet_names or "").split(",") if t.strip()] if sheet_names else []
     if len(parsed_tab_list) > 1:
         multi_tabs_for_run = [(resolved_sheet_id_for_run, t) for t in parsed_tab_list]
         task_label = f"Chuẩn bị quét {len(parsed_tab_list)} tab song song"
@@ -6375,7 +7003,13 @@ def start_task(
     runtime_state["current_task"] = task_label
     set_run_progress(current=0, total=0, phase="preparing", state=runtime_state)
     add_log(log_label, runtime_state)
-    background_tasks.add_task(run_scraper_logic, state=runtime_state, multi_tabs=multi_tabs_for_run)
+    if not launch_scraper_async(runtime_state=runtime_state, source="manual", multi_tabs=multi_tabs_for_run):
+        return build_ui_json_response(
+            "Không khởi động được luồng quét. Vui lòng thử lại.",
+            level="error",
+            ok=False,
+            state=runtime_state,
+        )
     if is_fetch_request(request):
         return build_ui_json_response(
             "Đã bắt đầu quét dữ liệu.",
@@ -6383,8 +7017,8 @@ def start_task(
             extra={
                 "column_config": build_column_config_payload(state=runtime_state),
                 "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
-                "campaign_html": build_campaign_panel_html(runtime_state),
-                "overview_html": build_overview_panel_for_state(runtime_state),
+                # Keep start response lightweight so command dispatch returns fast.
+                "defer_panel_refresh": True,
             },
             state=runtime_state,
         )
@@ -6447,16 +7081,25 @@ def set_sheet(request: Request, sheet_name: str = "", sheet_url: str = ""):
         save_dashboard_cache(DASHBOARD_CACHE)
 
         if is_fetch_request(request):
+            extra_payload = {
+                "column_config": build_column_config_payload(ws, runtime_state),
+                "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
+            }
+            if FAST_SHEET_SETUP_RESPONSE:
+                # Keep set-sheet response lightweight so AUTO detect/start can run immediately.
+                extra_payload["defer_panel_refresh"] = True
+            else:
+                extra_payload.update(
+                    {
+                        "overview_html": build_overview_panel_for_state(runtime_state, sheet=ws),
+                        "posts_html": build_posts_panel_html(ws, runtime_state),
+                        "campaign_html": build_campaign_panel_html(runtime_state),
+                    }
+                )
             return build_ui_json_response(
                 f"Đã nhập sheet thành công. {detected_text}",
                 level="success",
-                extra={
-                    "overview_html": build_overview_panel_for_state(runtime_state, sheet=ws),
-                    "column_config": build_column_config_payload(ws, runtime_state),
-                    "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
-                    "posts_html": build_posts_panel_html(ws, runtime_state),
-                    "campaign_html": build_campaign_panel_html(runtime_state),
-                },
+                extra=extra_payload,
                 state=runtime_state,
             )
         return HTMLResponse("<html><script>window.location.href='/?sheet_ok=1';</script></html>")
@@ -6502,6 +7145,7 @@ async def save_selected_sheets(request: Request):
     saved_count = 0
     first_ws = None
     first_tab = tab_items[0]
+    selected_tab_titles = []
     for item in tab_items:
         tab_name = item["title"]
         tab_gid = item["gid"]
@@ -6522,24 +7166,35 @@ async def save_selected_sheets(request: Request):
             tab_gid,
             owner_email=runtime_state["owner_email"],
         )
+        selected_tab_titles.append(tab_name)
         saved_count += 1
 
     set_active_sheet(first_tab["title"], requested_sheet_id, runtime_state)
     runtime_state["active_sheet_gid"] = first_tab["gid"]
+    runtime_state["selected_tabs"] = selected_tab_titles
     add_log(f"Đã lưu {saved_count} tab sheet: {', '.join(item['title'] for item in tab_items)}", runtime_state)
     for item in tab_items:
         add_log(f"[{item['title']}] Đã thêm vào danh sách tab quét", runtime_state)
     return build_ui_json_response(
         f"Đã lưu {saved_count} tab sheet. Bạn có thể cấu hình từng tab rồi bấm Bắt đầu để quét cùng lúc.",
         level="success",
-        extra={
-            "overview_html": build_overview_panel_for_state(runtime_state, sheet=first_ws),
-            "column_config": build_column_config_payload(first_ws, runtime_state),
-            "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
-            "posts_html": build_posts_panel_html(first_ws, runtime_state),
-            "campaign_html": build_campaign_panel_html(runtime_state),
-            "schedule_config": build_schedule_config_payload(runtime_state),
-        },
+        extra=(
+            {
+                "column_config": build_column_config_payload(first_ws, runtime_state),
+                "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
+                "schedule_config": build_schedule_config_payload(runtime_state),
+                "defer_panel_refresh": True,
+            }
+            if FAST_SHEET_SETUP_RESPONSE
+            else {
+                "overview_html": build_overview_panel_for_state(runtime_state, sheet=first_ws),
+                "column_config": build_column_config_payload(first_ws, runtime_state),
+                "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
+                "posts_html": build_posts_panel_html(first_ws, runtime_state),
+                "campaign_html": build_campaign_panel_html(runtime_state),
+                "schedule_config": build_schedule_config_payload(runtime_state),
+            }
+        ),
         state=runtime_state,
     )
 
@@ -6638,6 +7293,107 @@ async def start_selected_posts(request: Request, background_tasks: BackgroundTas
         )
 
     primary_target = normalized_targets[0]
+    if FAST_START_COMMAND:
+        runtime_state["active_sheet_id"] = primary_target["sheet_id"]
+        runtime_state["active_sheet_name"] = primary_target["sheet_name"]
+        runtime_state["active_sheet_gid"] = str(primary_target.get("sheet_gid") or "0")
+        add_log("⚡ Fast start: nhận bài đã chọn và xếp hàng chạy ngay.", runtime_state)
+    else:
+        try:
+            set_active_sheet(primary_target["sheet_name"], primary_target["sheet_id"], runtime_state)
+        except Exception:
+            runtime_state["active_sheet_id"] = primary_target["sheet_id"]
+            runtime_state["active_sheet_name"] = primary_target["sheet_name"]
+            runtime_state["active_sheet_gid"] = str(primary_target.get("sheet_gid") or "0")
+
+    runtime_state["pending_updates"] = []
+    runtime_state["is_running"] = True
+    runtime_state["is_finished"] = False
+    runtime_state["current_task"] = f"Chuẩn bị quét lại {len(normalized_targets)} bài đã chọn"
+    set_run_progress(current=0, total=0, phase="preparing", state=runtime_state)
+    add_log(f"Bắt đầu quét lại {len(normalized_targets)} bài đã chọn", runtime_state)
+    if not launch_scraper_async(
+        runtime_state=runtime_state,
+        targets=normalized_targets,
+        source="manual-selected",
+    ):
+        return build_ui_json_response(
+            "Không khởi động được luồng quét lại bài đã chọn.",
+            level="error",
+            ok=False,
+            state=runtime_state,
+        )
+    return build_ui_json_response(
+        f"Đã bắt đầu quét lại {len(normalized_targets)} bài đã chọn.",
+        level="success",
+        extra={"column_config": build_column_config_payload(state=runtime_state)},
+        state=runtime_state,
+    )
+
+
+@app.post("/start-failed")
+async def start_failed_posts(request: Request, background_tasks: BackgroundTasks):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return auth_response
+    runtime_state = get_runtime_state(current_user)
+    if runtime_state["is_running"]:
+        add_log("Hệ thống đang chạy, chưa thể quét lại danh sách lỗi", runtime_state)
+        return build_ui_json_response(
+            "Hệ thống đang chạy rồi, chưa thể quét lại lỗi.",
+            level="warning",
+            ok=False,
+            state=runtime_state,
+        )
+
+    failed_items = list(runtime_state.get("failed_items") or [])
+    if not failed_items:
+        return build_ui_json_response(
+            "Chưa có dòng lỗi để quét lại.",
+            level="warning",
+            ok=False,
+            state=runtime_state,
+        )
+
+    normalized_targets = []
+    dedupe_keys = set()
+    fallback_sheet_id = str(runtime_state.get("active_sheet_id", "") or "").strip()
+    for item in failed_items:
+        if not isinstance(item, dict):
+            continue
+        sheet_id = str(item.get("sheet_id") or fallback_sheet_id or "").strip()
+        sheet_name = str(item.get("tab") or "").strip()
+        row_idx = int(item.get("row") or 0)
+        link = str(item.get("url") or "").strip()
+        platform = str(item.get("platform") or "").strip()
+        if not sheet_id or not sheet_name or row_idx < 2:
+            continue
+        dedupe_key = (sheet_id, sheet_name.lower(), row_idx)
+        if dedupe_key in dedupe_keys:
+            continue
+        dedupe_keys.add(dedupe_key)
+        normalized_targets.append(
+            {
+                "sheet_id": sheet_id,
+                "sheet_name": sheet_name,
+                "sheet_gid": "0",
+                "row_idx": row_idx,
+                "link": link,
+                "title": "",
+                "platform": platform,
+            }
+        )
+
+    normalized_targets = normalize_schedule_targets(normalized_targets, fallback_sheet_id)
+    if not normalized_targets:
+        return build_ui_json_response(
+            "Danh sách lỗi chưa đủ thông tin sheet/dòng để quét lại.",
+            level="warning",
+            ok=False,
+            state=runtime_state,
+        )
+
+    primary_target = normalized_targets[0]
     try:
         set_active_sheet(primary_target["sheet_name"], primary_target["sheet_id"], runtime_state)
     except Exception:
@@ -6648,17 +7404,22 @@ async def start_selected_posts(request: Request, background_tasks: BackgroundTas
     runtime_state["pending_updates"] = []
     runtime_state["is_running"] = True
     runtime_state["is_finished"] = False
-    runtime_state["current_task"] = f"Chuẩn bị quét lại {len(normalized_targets)} bài đã chọn"
+    runtime_state["current_task"] = f"Chuẩn bị quét lại {len(normalized_targets)} dòng lỗi"
     set_run_progress(current=0, total=0, phase="preparing", state=runtime_state)
-    add_log(f"Bắt đầu quét lại {len(normalized_targets)} bài đã chọn", runtime_state)
-    background_tasks.add_task(
-        run_scraper_logic,
+    add_log(f"Bắt đầu quét lại {len(normalized_targets)} dòng lỗi", runtime_state)
+    if not launch_scraper_async(
+        runtime_state=runtime_state,
         targets=normalized_targets,
-        source="manual-selected",
-        state=runtime_state,
-    )
+        source="manual-failed",
+    ):
+        return build_ui_json_response(
+            "Không khởi động được luồng quét lại danh sách lỗi.",
+            level="error",
+            ok=False,
+            state=runtime_state,
+        )
     return build_ui_json_response(
-        f"Đã bắt đầu quét lại {len(normalized_targets)} bài đã chọn.",
+        f"Đã bắt đầu quét lại {len(normalized_targets)} dòng lỗi.",
         level="success",
         extra={"column_config": build_column_config_payload(state=runtime_state)},
         state=runtime_state,
@@ -6820,11 +7581,46 @@ async def set_active_schedule(request: Request):
         state=runtime_state,
     )
 
+
+@app.post("/delete-schedule-entry")
+async def delete_schedule_entry(request: Request):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return auth_response
+    runtime_state = get_runtime_state(current_user)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    key = str((payload or {}).get("key", "") or "").strip()
+    if not key:
+        return build_ui_json_response("Thiếu lịch cần xóa.", level="warning", ok=False, state=runtime_state)
+
+    removed_entry = remove_schedule_entry_by_key(key, runtime_state)
+    if not removed_entry:
+        return build_ui_json_response("Không tìm thấy lịch để xóa.", level="warning", ok=False, state=runtime_state)
+
+    persist_runtime_schedule_entries(runtime_state)
+    ensure_scheduler_thread()
+    removed_name = str(removed_entry.get("schedule_sheet_name") or "Sheet").strip() or "Sheet"
+    add_log(f"Đã xóa lịch của sheet '{removed_name}'.", runtime_state)
+    return build_ui_json_response(
+        f"Đã xóa lịch của sheet '{removed_name}'.",
+        level="success",
+        extra={
+            "schedule_config": build_schedule_config_payload(runtime_state),
+            "schedule_tracking": build_schedule_tracking_payload(runtime_state),
+        },
+        state=runtime_state,
+    )
+
 _DETECT_TAB_COLUMNS_CACHE = {}  # key: (owner_email, sheet_id, tab_name) -> (timestamp, result)
 _DETECT_TAB_COLUMNS_TTL = 900   # 15 minutes
+AUTO_DETECT_BATCH_WORKERS = max(2, int(os.getenv("AUTO_DETECT_BATCH_WORKERS", "4")))
 
 @app.get("/detect-tab-columns")
-def detect_tab_columns(request: Request, tab_name: str = ""):
+def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effective"):
     current_user, auth_response = require_authenticated_user(request)
     if auth_response:
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
@@ -6834,7 +7630,8 @@ def detect_tab_columns(request: Request, tab_name: str = ""):
         return JSONResponse({"ok": False, "detected_inputs": {}, "tab_name": resolved_tab})
     owner_email = runtime_state.get("owner_email", "")
     sheet_id = runtime_state["active_sheet_id"]
-    cache_key = (owner_email, sheet_id, resolved_tab)
+    mode_key = "auto" if str(mode or "").strip().lower() == "auto" else "effective"
+    cache_key = (owner_email, sheet_id, resolved_tab, mode_key)
     now = time.time()
     cached_entry = _DETECT_TAB_COLUMNS_CACHE.get(cache_key)
     if cached_entry:
@@ -6846,7 +7643,10 @@ def detect_tab_columns(request: Request, tab_name: str = ""):
         layout = detect_sheet_layout(ws)
         raw_columns = layout.get("columns") or {}
         tab_overrides = runtime_state.get("column_overrides_by_tab", {}).get(resolved_tab)
-        col_map = apply_column_overrides(raw_columns, overrides=tab_overrides) if tab_overrides else apply_column_overrides(raw_columns, state=runtime_state)
+        if mode_key == "auto":
+            col_map = dict(raw_columns)
+        else:
+            col_map = apply_column_overrides(raw_columns, overrides=tab_overrides) if tab_overrides else apply_column_overrides(raw_columns, state=runtime_state)
         fields = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"]
         detected_inputs = {}
         for field in fields:
@@ -6875,6 +7675,114 @@ def detect_tab_columns(request: Request, tab_name: str = ""):
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)[:120], "tab_name": resolved_tab})
 
+@app.post("/detect-tab-columns-batch")
+async def detect_tab_columns_batch(request: Request):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
+    runtime_state = get_runtime_state(current_user)
+    if not runtime_state["active_sheet_id"]:
+        return JSONResponse({"ok": False, "message": "Chưa có sheet đang chọn.", "results": []})
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    raw_tabs = (payload or {}).get("tabs", [])
+    if not isinstance(raw_tabs, list):
+        raw_tabs = []
+    tabs = []
+    seen = set()
+    for item in raw_tabs:
+        tab = str(item or "").strip()
+        if not tab:
+            continue
+        key = tab.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tabs.append(tab)
+    if not tabs:
+        return JSONResponse({"ok": False, "message": "Chưa có tab nào để AUTO.", "results": []})
+
+    owner_email = runtime_state.get("owner_email", "")
+    sheet_id = runtime_state["active_sheet_id"]
+    now = time.time()
+    mode_key = "auto"
+    fields = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"]
+    results_map = {}
+    tabs_to_scan = []
+
+    for resolved_tab in tabs:
+        cache_key = (owner_email, sheet_id, resolved_tab, mode_key)
+        cached_entry = _DETECT_TAB_COLUMNS_CACHE.get(cache_key)
+        if cached_entry:
+            cached_at, cached_result = cached_entry
+            if now - cached_at < _DETECT_TAB_COLUMNS_TTL:
+                cached_payload = dict(cached_result or {})
+                cached_payload["from_cache"] = True
+                results_map[resolved_tab] = cached_payload
+                continue
+        tabs_to_scan.append(resolved_tab)
+
+    def _scan_one_tab(resolved_tab: str):
+        ws = get_worksheet(resolved_tab, sheet_id, runtime_state)
+        layout = detect_sheet_layout(ws)
+        raw_columns = layout.get("columns") or {}
+        tab_overrides = runtime_state.get("column_overrides_by_tab", {}).get(resolved_tab)
+        # AUTO mode must use raw detected columns only, without manual overrides.
+        col_map = dict(raw_columns)
+        detected_inputs = {}
+        for field in fields:
+            col_idx = col_map.get(field)
+            detected_inputs[field] = col_to_a1(col_idx) if col_idx else ""
+        saved_overrides = {}
+        if tab_overrides:
+            for field in fields:
+                col_idx = tab_overrides.get(field)
+                saved_overrides[field] = col_to_a1(col_idx) if col_idx else ""
+        header_row = max(1, int(layout.get("header_row") or 1))
+        start_row = resolve_effective_start_row(header_row, runtime_state)
+        detected_count = sum(1 for value in detected_inputs.values() if value)
+        return {
+            "ok": True,
+            "tab_name": resolved_tab,
+            "detected_inputs": detected_inputs,
+            "saved_overrides": saved_overrides,
+            "has_saved_overrides": bool(tab_overrides),
+            "start_row": start_row,
+            "header_row": header_row,
+            "from_cache": False,
+            "detected_count": detected_count,
+        }
+
+    if tabs_to_scan:
+        worker_count = max(1, min(AUTO_DETECT_BATCH_WORKERS, len(tabs_to_scan)))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_map = {executor.submit(_scan_one_tab, tab): tab for tab in tabs_to_scan}
+            for future, tab in future_map.items():
+                try:
+                    result = future.result()
+                    _DETECT_TAB_COLUMNS_CACHE[(owner_email, sheet_id, tab, mode_key)] = (time.time(), result)
+                    results_map[tab] = result
+                except Exception as exc:
+                    results_map[tab] = {
+                        "ok": False,
+                        "tab_name": tab,
+                        "error": str(exc)[:120],
+                        "detected_inputs": {},
+                    }
+
+    # Preserve requested tab order, and keep logs stable in order.
+    ordered_results = []
+    for tab in tabs:
+        result = dict(results_map.get(tab) or {"ok": False, "tab_name": tab, "detected_inputs": {}})
+        if result.get("ok"):
+            detected_count = int(result.pop("detected_count", 0) or 0)
+            header_row = int(result.get("header_row") or 1)
+            add_log(f"[{tab}] AUTO nhận {detected_count} cột ở header dòng {header_row}", runtime_state)
+        ordered_results.append(result)
+    return JSONResponse({"ok": True, "results": ordered_results})
+
 @app.get("/clear-tab-columns")
 def clear_tab_columns(request: Request, tab_name: str = ""):
     current_user, auth_response = require_authenticated_user(request)
@@ -6891,8 +7799,9 @@ def clear_tab_columns(request: Request, tab_name: str = ""):
     # Also clear cache for this tab
     owner_email = runtime_state.get("owner_email", "")
     sheet_id = runtime_state.get("active_sheet_id", "")
-    cache_key = (owner_email, sheet_id, resolved_tab)
-    _DETECT_TAB_COLUMNS_CACHE.pop(cache_key, None)
+    _DETECT_TAB_COLUMNS_CACHE.pop((owner_email, sheet_id, resolved_tab), None)  # backward compatibility
+    _DETECT_TAB_COLUMNS_CACHE.pop((owner_email, sheet_id, resolved_tab, "auto"), None)
+    _DETECT_TAB_COLUMNS_CACHE.pop((owner_email, sheet_id, resolved_tab, "effective"), None)
     return build_ui_json_response(
         f"Đã reset cấu hình tab '{resolved_tab}' về AUTO detect.",
         level="success",
@@ -6924,15 +7833,6 @@ def set_columns(
     if auth_response:
         return auth_response
     runtime_state = get_runtime_state(current_user)
-    if (not runtime_state["is_running"]) and runtime_state["current_task"] == "Đã dừng thủ công":
-        if is_fetch_request(request):
-            return build_ui_json_response(
-                "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy lưu sheet.",
-                level="warning",
-                ok=False,
-                state=runtime_state,
-            )
-        return HTMLResponse("<html><script>window.location.href='/?sheet_error=2';</script></html>")
     if runtime_state["is_running"]:
         if is_fetch_request(request):
             return build_ui_json_response("Đang quét dữ liệu nên chưa lưu cấu hình được.", level="warning", ok=False, state=runtime_state)
@@ -6973,6 +7873,11 @@ def set_columns(
             return HTMLResponse("<html><script>window.location.href='/?sheet_error=5';</script></html>")
 
     resolved_tab_name = (tab_name or "").strip()
+    if not resolved_tab_name:
+        selected_tabs = [str(item or "").strip() for item in (runtime_state.get("selected_tabs") or []) if str(item or "").strip()]
+        active_sheet_name = str(runtime_state.get("active_sheet_name", "") or "").strip()
+        if active_sheet_name and any(active_sheet_name.lower() == tab.lower() for tab in selected_tabs):
+            resolved_tab_name = active_sheet_name
     if resolved_tab_name:
         runtime_state.setdefault("column_overrides_by_tab", {})[resolved_tab_name] = parsed
     else:
@@ -7022,16 +7927,24 @@ def set_columns(
         runtime_state,
     )
     if is_fetch_request(request):
+        extra_payload = {
+            "column_config": build_column_config_payload(active_ws, runtime_state),
+            "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
+        }
+        if FAST_SHEET_SETUP_RESPONSE:
+            extra_payload["defer_panel_refresh"] = True
+        else:
+            extra_payload.update(
+                {
+                    "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
+                    "posts_html": build_posts_panel_html(active_ws, runtime_state),
+                    "campaign_html": build_campaign_panel_html(runtime_state),
+                }
+            )
         return build_ui_json_response(
             "Đã lưu sheet thành công.",
             level="success",
-            extra={
-                "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
-                "column_config": build_column_config_payload(active_ws, runtime_state),
-                "sheet_metadata": build_sheet_metadata_payload(state=runtime_state),
-                "posts_html": build_posts_panel_html(active_ws, runtime_state),
-                "campaign_html": build_campaign_panel_html(runtime_state),
-            },
+            extra=extra_payload,
             state=runtime_state,
         )
     return HTMLResponse("<html><script>window.location.href='/?col_ok=1';</script></html>")
@@ -7129,6 +8042,74 @@ async def api_update_sheet_metadata(request: Request):
         runtime_state,
     )
 
+    extra_payload = {}
+    try:
+        active_ws = None
+        if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
+            try:
+                active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
+            except Exception:
+                active_ws = None
+        extra_payload = {
+            "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
+            "posts_html": build_posts_panel_html(active_ws, runtime_state),
+            "campaign_html": build_campaign_panel_html(runtime_state),
+        }
+    except Exception as render_error:
+        # Không chặn thao tác lưu metadata nếu phần render realtime tạm thời lỗi.
+        add_log(f"Cảnh báo render sau khi lưu metadata: {render_error}", runtime_state)
+        extra_payload = {"needs_refresh": True}
+
+    return build_ui_json_response(
+        "Đã lưu thay đổi thông tin sheet.",
+        level="success",
+        extra=extra_payload,
+        state=runtime_state,
+    )
+
+@app.post("/api/delete-saved-sheet")
+async def api_delete_saved_sheet(request: Request):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return auth_response
+    runtime_state = get_runtime_state(current_user)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    sheet_id = str((payload or {}).get("sheet_id", "") or "").strip()
+    sheet_name = str((payload or {}).get("sheet_name", "") or "").strip()
+    if not sheet_id or not sheet_name:
+        return build_ui_json_response("Thiếu thông tin sheet để xóa.", level="error", ok=False, state=runtime_state)
+
+    existed_entry = get_saved_sheet_entry(sheet_id, sheet_name, owner_email=runtime_state["owner_email"])
+    if not existed_entry:
+        return build_ui_json_response("Không tìm thấy sheet để xóa.", level="warning", ok=False, state=runtime_state)
+
+    updated_entries = remove_saved_sheet_entry(
+        sheet_id=sheet_id,
+        sheet_name=sheet_name,
+        owner_email=runtime_state["owner_email"],
+    )
+
+    if runtime_state.get("active_sheet_id") == sheet_id and str(runtime_state.get("active_sheet_name", "")).strip().lower() == sheet_name.lower():
+        if updated_entries:
+            runtime_state["active_sheet_id"] = str(updated_entries[0].get("sheet_id", "") or "").strip()
+            runtime_state["active_sheet_name"] = str(updated_entries[0].get("sheet_name", "") or "").strip()
+            runtime_state["active_sheet_gid"] = str(updated_entries[0].get("sheet_gid", "") or "0").strip() or "0"
+            runtime_state["_cached_worksheet"] = None
+            runtime_state["_cached_worksheet_id"] = ""
+            runtime_state["_cached_worksheet_name"] = ""
+        else:
+            runtime_state["active_sheet_id"] = ""
+            runtime_state["active_sheet_name"] = ""
+            runtime_state["active_sheet_gid"] = "0"
+            runtime_state["_cached_worksheet"] = None
+            runtime_state["_cached_worksheet_id"] = ""
+            runtime_state["_cached_worksheet_name"] = ""
+
+    add_log(f"Đã xóa sheet khỏi danh sách lưu: {sheet_name}", runtime_state)
     active_ws = None
     if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
         try:
@@ -7137,7 +8118,7 @@ async def api_update_sheet_metadata(request: Request):
             active_ws = None
 
     return build_ui_json_response(
-        "Đã lưu thay đổi thông tin sheet.",
+        f"Đã xóa sheet '{sheet_name}'.",
         level="success",
         extra={
             "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
@@ -7375,26 +8356,23 @@ def api_dashboard_overview(background_tasks: BackgroundTasks, request: Request):
     current_user, auth_response = require_authenticated_user(request)
     if auth_response:
         return {"error": "Unauthorized", "html": ""}
-    
-    runtime_state = get_runtime_state(current_user)
-    active_ws = None
-    if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
-        try:
-            active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
-        except Exception:
-            active_ws = None
-
-    html_content = build_overview_panel_for_state(runtime_state, sheet=active_ws)
-    now_str = datetime.now().isoformat()
     user_email = current_user.get("email", "")
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "overview")
+    needs_refresh = not is_fresh
 
-    global DASHBOARD_CACHE
-    if not DASHBOARD_CACHE:
-        DASHBOARD_CACHE = load_dashboard_cache()
-    DASHBOARD_CACHE[f"{user_email}:overview"] = {"updated_at": now_str, "html": html_content}
-    save_dashboard_cache(DASHBOARD_CACHE)
+    if needs_refresh:
+        schedule_dashboard_refresh(background_tasks, user_email, "overview")
 
-    return {"ok": True, "status": "ready", "html": html_content, "cached": False, "refreshing": False}
+    if cached_html:
+        return {
+            "ok": True,
+            "status": "ready",
+            "html": cached_html,
+            "cached": True,
+            "refreshing": needs_refresh,
+        }
+
+    return {"ok": True, "status": "processing", "html": "", "cached": False, "refreshing": True}
 
 @app.get("/api/dashboard/posts")
 def api_dashboard_posts(background_tasks: BackgroundTasks, request: Request):
@@ -7403,24 +8381,11 @@ def api_dashboard_posts(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     
     user_email = current_user.get("email", "")
-    now = datetime.now()
-    
-    global DASHBOARD_CACHE
-    if not DASHBOARD_CACHE:
-        DASHBOARD_CACHE = load_dashboard_cache()
-        
-    cache_entry = DASHBOARD_CACHE.get(f"{user_email}:posts")
-    needs_refresh = True
-    cached_html = None
-    
-    if cache_entry:
-        updated_at = datetime.fromisoformat(cache_entry["updated_at"])
-        cached_html = cache_entry["html"]
-        if (now - updated_at).total_seconds() < DASHBOARD_CACHE_TTL_SECONDS:
-            needs_refresh = False
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "posts")
+    needs_refresh = not is_fresh
 
     if needs_refresh:
-        background_tasks.add_task(background_refresh_dashboard_data, user_email, "posts")
+        schedule_dashboard_refresh(background_tasks, user_email, "posts")
 
     if cached_html:
         return {"ok": True, "status": "ready", "html": cached_html, "cached": True, "refreshing": needs_refresh}
@@ -7435,24 +8400,11 @@ def api_dashboard_config(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     
     user_email = current_user.get("email", "")
-    now = datetime.now()
-    
-    global DASHBOARD_CACHE
-    if not DASHBOARD_CACHE:
-        DASHBOARD_CACHE = load_dashboard_cache()
-        
-    cache_entry = DASHBOARD_CACHE.get(f"{user_email}:config")
-    needs_refresh = True
-    cached_html = None
-    
-    if cache_entry:
-        updated_at = datetime.fromisoformat(cache_entry["updated_at"])
-        cached_html = cache_entry["html"]
-        if (now - updated_at).total_seconds() < DASHBOARD_CACHE_TTL_SECONDS:
-            needs_refresh = False
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "config")
+    needs_refresh = not is_fresh
 
     if needs_refresh:
-        background_tasks.add_task(background_refresh_dashboard_data, user_email, "config")
+        schedule_dashboard_refresh(background_tasks, user_email, "config")
 
     if cached_html:
         return {"ok": True, "status": "ready", "html": cached_html, "cached": True, "refreshing": needs_refresh}
@@ -7467,24 +8419,11 @@ def api_dashboard_schedule(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     
     user_email = current_user.get("email", "")
-    now = datetime.now()
-    
-    global DASHBOARD_CACHE
-    if not DASHBOARD_CACHE:
-        DASHBOARD_CACHE = load_dashboard_cache()
-        
-    cache_entry = DASHBOARD_CACHE.get(f"{user_email}:schedule")
-    needs_refresh = True
-    cached_html = None
-    
-    if cache_entry:
-        updated_at = datetime.fromisoformat(cache_entry["updated_at"])
-        cached_html = cache_entry["html"]
-        if (now - updated_at).total_seconds() < DASHBOARD_CACHE_TTL_SECONDS:
-            needs_refresh = False
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "schedule")
+    needs_refresh = not is_fresh
 
     if needs_refresh:
-        background_tasks.add_task(background_refresh_dashboard_data, user_email, "schedule")
+        schedule_dashboard_refresh(background_tasks, user_email, "schedule")
 
     if cached_html:
         return {"ok": True, "status": "ready", "html": cached_html, "cached": True, "refreshing": needs_refresh}
@@ -7501,7 +8440,7 @@ def api_dashboard_schedule(background_tasks: BackgroundTasks, request: Request):
 @app.get("/nhan-vien", response_class=HTMLResponse)
 @app.get("/lich-tu-dong", response_class=HTMLResponse)
 @app.get("/theo-doi-lan-chay", response_class=HTMLResponse)
-def home(request: Request):
+def home(request: Request, background_tasks: BackgroundTasks):
     current_user, auth_response = require_authenticated_user(request)
     if auth_response:
         return auth_response
@@ -7535,68 +8474,45 @@ def home(request: Request):
     initial_config_html = get_shell("config", "cau-hinh", "cấu hình")
     initial_posts_html = get_shell("posts", "bai-dang", "bài đăng")
     initial_schedule_html = get_shell("schedule", "lich-tu-dong", "lịch tự động")
+
+    for section_key in ("overview", "posts", "config", "schedule"):
+        cached_html, is_fresh = get_dashboard_cached_section(user_email, section_key)
+        if not is_fresh or not cached_html:
+            schedule_dashboard_refresh(background_tasks, user_email, section_key)
     
     settings_panel_html = build_settings_panel_html(current_user, runtime_state)
 
     # Initialize variables for the asynchronous dashboard content slots
     metric_cols_html = initial_config_html
-    schedule_text = "Đang tải lịch..."
-    schedule_config = {"sheet_options_html": ""}
-    mode_selected = {"off": "selected", "daily": "", "weekly": "", "monthly": ""}
-    weekday_options = ""
-    schedule_date_value = ""
-    schedule_end_value = ""
-    schedule_tracking = {
-        "entries_html": "<!-- loading -->",
-        "active_sheet_name": "Đang tải...",
-        "has_active_entry": False,
-        "next_run_text": "...",
-        "last_started_text": "...",
-        "last_finished_text": "...",
-        "last_duration_text": "...",
-        "is_running_text": "...",
-        "last_status_text": "...",
-        "last_source_text": "...",
-        "last_sheet_text": "...",
-        "last_processed_text": "...",
-        "last_success_text": "0",
-        "last_failed_text": "0",
-        "history_html": "",
-        "calendar_title": "...",
-        "calendar_subtext": "...",
-        "calendar_html": ""
+    schedule_text = schedule_label(runtime_state)
+    schedule_config = build_schedule_config_payload(runtime_state)
+    mode_selected = {
+        "off": "selected" if runtime_state["schedule_mode"] == "off" else "",
+        "daily": "selected" if runtime_state["schedule_mode"] == "daily" else "",
+        "weekly": "selected" if runtime_state["schedule_mode"] == "weekly" else "",
+        "monthly": "selected" if runtime_state["schedule_mode"] == "monthly" else "",
     }
+    weekday_options = "".join(
+        f'<option value="{idx}" {"selected" if runtime_state["schedule_weekday"] == idx else ""}>{name}</option>'
+        for idx, name in enumerate(WEEKDAY_NAMES)
+    )
+    schedule_date_value = runtime_state.get("schedule_monthdate", "")
+    schedule_end_value = runtime_state.get("schedule_enddate", "")
+    schedule_tracking = build_schedule_tracking_payload(runtime_state)
+    mascot_data_uri = _get_sidebar_mascot_data_uri()
+    mascot_html = (
+        f'<img src="{mascot_data_uri}" alt="Social mascot" style="width:30px;height:30px;object-fit:contain;" />'
+        if mascot_data_uri
+        else '<i class="fa-solid fa-robot"></i>'
+    )
 
-    overview_html = f"""
-    <section id="tong-quan" data-dashboard-section="tong-quan" class="dashboard-section dashboard-panel is-active mb-6">
-        <div class="overview-shell animate-pulse flex flex-col gap-4">
-            <div class="h-8 bg-slate-800 rounded w-1/4"></div>
-            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                <div class="h-24 bg-slate-800 rounded-2xl"></div>
-                <div class="h-24 bg-slate-800 rounded-2xl"></div>
-                <div class="h-24 bg-slate-800 rounded-2xl"></div>
-                <div class="h-24 bg-slate-800 rounded-2xl"></div>
-            </div>
-            <div class="h-64 bg-slate-800 rounded-2xl mt-4"></div>
-            <div class="text-center mt-2 text-slate-400 text-sm">Đang tải dữ liệu tổng quan, vui lòng chờ...</div>
-        </div>
-    </section>
-    """
-    posts_html = f"""
-    <section id="bai-dang" data-dashboard-section="bai-dang" class="dashboard-section dashboard-panel posts-board rounded-[2rem] p-6 md:p-8 mb-6 border border-white/5">
-        <div class="animate-pulse flex flex-col gap-4">
-             <div class="h-8 bg-slate-800 rounded w-1/4 mb-4"></div>
-             <div class="h-40 bg-slate-800 rounded-2xl"></div>
-             <div class="h-40 bg-slate-800 rounded-2xl"></div>
-             <div class="text-center mt-2 text-slate-400 text-sm">Đang tải dữ liệu bài đăng, vui lòng chờ...</div>
-        </div>
-    </section>
-    """
+    overview_html = initial_overview_html
+    posts_html = initial_posts_html
     return f"""
     <!DOCTYPE html>
     <html lang="vi">
     <head>
-        <meta charset="UTF-8"><title>Social Scraper v2.2</title>
+        <meta charset="UTF-8"><title>Social Scraper</title>
         <script>
             (() => {{
                 try {{
@@ -7709,6 +8625,7 @@ def home(request: Request):
                 align-items: flex-start;
                 justify-content: space-between;
                 gap: 14px;
+                flex-wrap: wrap;
                 padding: 14px 16px;
                 border-radius: 16px;
                 border: 1px solid rgba(255, 255, 255, 0.08);
@@ -7743,21 +8660,77 @@ def home(request: Request):
                 color: #94a3b8;
                 font-size: 13px;
             }}
+            .schedule-history-footer {{
+                width: 100%;
+                display: flex;
+                justify-content: flex-end;
+            }}
+            .schedule-history-detail-btn {{
+                border: 1px solid rgba(56, 189, 248, 0.35);
+                border-radius: 999px;
+                padding: 6px 12px;
+                background: rgba(8, 47, 73, 0.38);
+                color: #7dd3fc;
+                font-size: 11px;
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                transition: all 0.2s ease;
+            }}
+            .schedule-history-detail-btn:hover {{
+                border-color: rgba(56, 189, 248, 0.7);
+                color: #e0f2fe;
+            }}
+            .schedule-history-detail {{
+                width: 100%;
+                margin-top: 8px;
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                background: rgba(2, 6, 23, 0.6);
+                padding: 10px 12px;
+            }}
+            .schedule-history-detail-title {{
+                font-size: 11px;
+                color: #cbd5e1;
+                text-transform: uppercase;
+                letter-spacing: 0.12em;
+                font-weight: 800;
+                margin-bottom: 6px;
+            }}
+            .schedule-history-log-box,
+            .schedule-history-failed-box {{
+                display: grid;
+                gap: 4px;
+                margin-bottom: 10px;
+            }}
+            .schedule-history-failed-box {{
+                margin-bottom: 0;
+            }}
+            .schedule-history-log-line,
+            .schedule-history-failed-line {{
+                font-size: 12px;
+                color: #94a3b8;
+                word-break: break-word;
+            }}
+            .schedule-history-log-empty {{
+                color: #64748b;
+                font-style: italic;
+            }}
             .sheet-tabs-list {{
                 display: flex;
                 flex-wrap: wrap;
-                gap: 10px;
+                gap: 8px;
             }}
             .sheet-tab-chip {{
                 display: inline-flex;
                 align-items: center;
-                gap: 8px;
-                padding: 10px 14px;
+                gap: 7px;
+                padding: 8px 12px;
                 border-radius: 999px;
                 background: rgba(15, 23, 42, 0.72);
                 border: 1px solid rgba(148, 163, 184, 0.16);
                 color: #cbd5e1;
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 800;
                 transition: all 0.18s ease;
             }}
@@ -8108,7 +9081,7 @@ def home(request: Request):
             .overview-chart-head {{
                 display: flex;
                 align-items: flex-start;
-                justify-content: space-between;
+                justify-content: flex-end;
                 gap: 14px;
                 padding-right: 58px;
             }}
@@ -8118,6 +9091,7 @@ def home(request: Request):
                 gap: 8px;
                 flex-wrap: wrap;
                 justify-content: flex-end;
+                margin-left: auto;
             }}
             .overview-filter-trigger {{
                 display: inline-flex;
@@ -8463,9 +9437,9 @@ def home(request: Request):
             }}
             .overview-chart-tooltip {{
                 position: absolute;
-                width: min(252px, calc(100% - 32px));
-                padding: 13px 14px;
-                border-radius: 18px;
+                width: min(216px, calc(100% - 32px));
+                padding: 10px 11px;
+                border-radius: 14px;
                 border: 1px solid rgba(148, 163, 184, 0.14);
                 background: rgba(11, 18, 32, 0.96);
                 box-shadow: 0 22px 42px rgba(2, 6, 23, 0.36);
@@ -8474,7 +9448,7 @@ def home(request: Request):
                 z-index: 6;
             }}
             .overview-chart-tooltip-title {{
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 900;
                 color: #f8fafc;
             }}
@@ -8482,9 +9456,9 @@ def home(request: Request):
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                gap: 12px;
-                margin-top: 8px;
-                font-size: 12px;
+                gap: 8px;
+                margin-top: 6px;
+                font-size: 11px;
                 color: #cbd5e1;
             }}
             .overview-chart-tooltip-row strong {{
@@ -8884,13 +9858,14 @@ def home(request: Request):
             }}
             .schedule-track-list-table {{
                 display: grid;
-                min-width: 1100px;
+                min-width: 0;
+                width: 100%;
             }}
             .schedule-track-list-head,
             .schedule-track-list-row {{
                 display: grid;
-                grid-template-columns: minmax(260px, 1.25fr) minmax(260px, 1.1fr) 160px 180px minmax(210px, 0.95fr);
-                gap: 18px;
+                grid-template-columns: minmax(200px, 1.2fr) minmax(220px, 1fr) minmax(120px, 0.7fr) minmax(120px, 0.7fr) minmax(160px, 0.9fr);
+                gap: 12px;
                 align-items: center;
             }}
             .schedule-track-list-head {{
@@ -8910,7 +9885,8 @@ def home(request: Request):
                 border: 0;
                 background: transparent;
                 font: inherit;
-                padding: 16px;
+                cursor: pointer;
+                padding: 12px 14px;
                 border-top: 1px solid rgba(148, 163, 184, 0.08);
                 transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
             }}
@@ -8934,7 +9910,7 @@ def home(request: Request):
                 gap: 5px;
             }}
             .schedule-track-list-title {{
-                font-size: 16px;
+                font-size: 14px;
                 font-weight: 900;
                 color: #f8fafc;
                 line-height: 1.3;
@@ -8947,10 +9923,37 @@ def home(request: Request):
                 word-break: break-all;
             }}
             .schedule-track-list-main {{
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 800;
                 color: #e2e8f0;
                 line-height: 1.5;
+            }}
+            .schedule-track-list-last-run {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+            }}
+            .schedule-track-delete-btn {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 6px 10px;
+                border-radius: 10px;
+                border: 1px solid rgba(251, 113, 133, 0.35);
+                background: rgba(159, 18, 57, 0.22);
+                color: #fecdd3;
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                line-height: 1;
+                transition: all 0.16s ease;
+            }}
+            .schedule-track-delete-btn:hover {{
+                background: rgba(190, 24, 93, 0.32);
+                border-color: rgba(251, 113, 133, 0.5);
+                color: #ffe4e6;
             }}
             .schedule-track-status-pill {{
                 display: inline-flex;
@@ -9002,6 +10005,20 @@ def home(request: Request):
                 }}
                 .posts-detail-summary-grid {{
                     grid-template-columns: repeat(2, minmax(0, 1fr));
+                }}
+            }}
+            @media (max-width: 1360px) {{
+                .schedule-track-list-head,
+                .schedule-track-list-row {{
+                    grid-template-columns: minmax(180px, 1.15fr) minmax(200px, 1fr) minmax(110px, 0.65fr) minmax(110px, 0.65fr) minmax(140px, 0.8fr);
+                    gap: 10px;
+                }}
+                .schedule-track-list-head-cell {{
+                    font-size: 11px;
+                    letter-spacing: 0.14em;
+                }}
+                .schedule-track-list-row {{
+                    padding: 10px 12px;
                 }}
             }}
             .posts-tab-panels {{
@@ -9340,7 +10357,7 @@ def home(request: Request):
             .settings-layout {{
                 display: grid;
                 grid-template-columns: minmax(220px, 260px) minmax(0, 1fr);
-                gap: 20px;
+                gap: 16px;
                 align-items: start;
             }}
             .settings-nav-shell,
@@ -9350,7 +10367,7 @@ def home(request: Request):
                 background: linear-gradient(180deg, rgba(15, 23, 42, 0.78), rgba(20, 28, 45, 0.82));
             }}
             .settings-nav-shell {{
-                padding: 16px;
+                padding: 12px;
             }}
             .settings-nav-title {{
                 margin-bottom: 12px;
@@ -9362,15 +10379,15 @@ def home(request: Request):
             }}
             .settings-nav-list {{
                 display: grid;
-                gap: 10px;
+                gap: 8px;
             }}
             .settings-nav-item {{
                 width: 100%;
                 display: flex;
-                align-items: flex-start;
-                gap: 12px;
-                padding: 14px 12px;
-                border-radius: 18px;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 12px;
+                border-radius: 14px;
                 border: 1px solid transparent;
                 background: transparent;
                 color: #e2e8f0;
@@ -9386,9 +10403,9 @@ def home(request: Request):
                 border-color: rgba(148, 163, 184, 0.16);
             }}
             .settings-nav-item-icon {{
-                width: 34px;
-                height: 34px;
-                border-radius: 12px;
+                width: 30px;
+                height: 30px;
+                border-radius: 10px;
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
@@ -9399,18 +10416,18 @@ def home(request: Request):
             }}
             .settings-nav-item-copy {{
                 display: grid;
-                gap: 3px;
+                gap: 2px;
                 min-width: 0;
             }}
             .settings-nav-item-copy strong {{
-                font-size: 15px;
+                font-size: 13px;
                 font-weight: 900;
                 color: #f8fafc;
             }}
             .settings-nav-item-copy span {{
-                font-size: 13px;
+                font-size: 12px;
                 color: #94a3b8;
-                line-height: 1.45;
+                line-height: 1.35;
             }}
             .settings-content-shell {{
                 min-width: 0;
@@ -9419,30 +10436,30 @@ def home(request: Request):
                 display: none !important;
             }}
             .settings-pane-shell {{
-                padding: 24px;
+                padding: 18px;
             }}
             .settings-pane-title {{
-                font-size: 18px;
+                font-size: 16px;
                 font-weight: 900;
                 color: #f8fafc;
             }}
             .settings-pane-sub {{
-                margin-top: 8px;
-                font-size: 14px;
+                margin-top: 6px;
+                font-size: 13px;
                 color: #94a3b8;
-                line-height: 1.6;
+                line-height: 1.5;
             }}
             .settings-notify-list {{
                 display: grid;
-                gap: 18px;
-                margin-top: 24px;
+                gap: 14px;
+                margin-top: 16px;
             }}
             .settings-toggle-row {{
                 display: flex;
                 align-items: center;
                 justify-content: space-between;
-                gap: 18px;
-                padding-bottom: 18px;
+                gap: 12px;
+                padding-bottom: 12px;
                 border-bottom: 1px solid rgba(148, 163, 184, 0.12);
             }}
             .settings-toggle-row:last-child {{
@@ -9455,12 +10472,12 @@ def home(request: Request):
                 min-width: 0;
             }}
             .settings-toggle-copy strong {{
-                font-size: 15px;
+                font-size: 14px;
                 font-weight: 900;
                 color: #f8fafc;
             }}
             .settings-toggle-copy span {{
-                font-size: 14px;
+                font-size: 13px;
                 color: #94a3b8;
             }}
             .settings-toggle-switch {{
@@ -9506,19 +10523,19 @@ def home(request: Request):
                 align-items: center;
                 justify-content: space-between;
                 gap: 14px;
-                margin-top: 28px;
-                padding-top: 18px;
+                margin-top: 18px;
+                padding-top: 12px;
                 border-top: 1px solid rgba(148, 163, 184, 0.12);
             }}
             .settings-save-btn {{
                 display: inline-flex;
                 align-items: center;
                 gap: 10px;
-                padding: 12px 16px;
-                border-radius: 14px;
+                padding: 10px 14px;
+                border-radius: 12px;
                 background: rgba(248, 250, 252, 0.96);
                 color: #0f172a;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 900;
             }}
             .settings-inline-feedback {{
@@ -10061,8 +11078,8 @@ def home(request: Request):
             }}
             .dashboard-shell {{
                 display: grid;
-                grid-template-columns: 280px minmax(0, 1fr);
-                gap: 16px;
+                grid-template-columns: 252px minmax(0, 1fr);
+                gap: 12px;
                 align-items: start;
                 width: 100%;
                 max-width: none;
@@ -10072,8 +11089,8 @@ def home(request: Request):
                 position: sticky;
                 top: 8px;
                 min-height: calc(100vh - 16px);
-                padding: 22px 18px;
-                border-radius: 28px;
+                padding: 16px 14px;
+                border-radius: 24px;
                 background:
                     radial-gradient(circle at top, rgba(148, 163, 184, 0.1), transparent 36%),
                     linear-gradient(180deg, rgba(18, 24, 37, 0.96), rgba(24, 33, 52, 0.94));
@@ -10093,7 +11110,7 @@ def home(request: Request):
                 min-width: 0;
             }}
             .sidebar-brand-title {{
-                font-size: 28px;
+                font-size: 24px;
                 font-weight: 900;
                 line-height: 1;
                 color: #f8fafc;
@@ -10136,9 +11153,11 @@ def home(request: Request):
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                background: linear-gradient(135deg, rgba(71, 85, 105, 0.95), rgba(100, 116, 139, 0.92));
-                color: #eff6ff;
-                box-shadow: 0 12px 24px rgba(51, 65, 85, 0.18);
+                background: linear-gradient(145deg, rgba(30, 41, 59, 0.96), rgba(51, 65, 85, 0.92));
+                border: 1px solid rgba(148, 163, 184, 0.18);
+                color: #93c5fd;
+                box-shadow: 0 10px 22px rgba(15, 23, 42, 0.28);
+                font-size: 20px;
             }}
             .theme-toggle-btn {{
                 width: 42px;
@@ -10311,7 +11330,7 @@ def home(request: Request):
             .dashboard-main {{
                 min-width: 0;
                 min-height: calc(100vh - 16px);
-                border-radius: 32px;
+                border-radius: 26px;
                 background:
                     radial-gradient(circle at top left, rgba(148, 163, 184, 0.06), transparent 24%),
                     linear-gradient(180deg, rgba(18, 24, 37, 0.94), rgba(24, 33, 52, 0.94));
@@ -10353,7 +11372,7 @@ def home(request: Request):
                 margin: 0;
             }}
             .dashboard-main-inner {{
-                padding: 20px 24px 28px;
+                padding: 14px 18px 20px;
             }}
             .dashboard-section {{
                 scroll-margin-top: 24px;
@@ -10451,6 +11470,22 @@ def home(request: Request):
             html[data-theme="light"] .dashboard-card-title,
             html[data-theme="light"] .overview-subtitle,
             html[data-theme="light"] .overview-stat-label,
+            /* Prevent browser autofill from forcing white input backgrounds in dark mode. */
+            html:not([data-theme="light"]) input:-webkit-autofill,
+            html:not([data-theme="light"]) input:-webkit-autofill:hover,
+            html:not([data-theme="light"]) input:-webkit-autofill:focus,
+            html:not([data-theme="light"]) textarea:-webkit-autofill,
+            html:not([data-theme="light"]) textarea:-webkit-autofill:hover,
+            html:not([data-theme="light"]) textarea:-webkit-autofill:focus,
+            html:not([data-theme="light"]) select:-webkit-autofill,
+            html:not([data-theme="light"]) select:-webkit-autofill:hover,
+            html:not([data-theme="light"]) select:-webkit-autofill:focus {{
+                -webkit-text-fill-color: #e2e8f0 !important;
+                -webkit-box-shadow: 0 0 0 1000px rgba(15, 23, 42, 0.95) inset !important;
+                box-shadow: 0 0 0 1000px rgba(15, 23, 42, 0.95) inset !important;
+                transition: background-color 9999s ease-out 0s;
+            }}
+
             html[data-theme="light"] .overview-campaign-start,
             html[data-theme="light"] .overview-control-subtitle,
             html[data-theme="light"] .posts-page-subtitle,
@@ -10579,6 +11614,16 @@ def home(request: Request):
             }}
             html[data-theme="light"] .schedule-track-list-row:hover {{
                 background: rgba(226, 232, 240, 0.56);
+            }}
+            html[data-theme="light"] .schedule-track-delete-btn {{
+                background: rgba(254, 226, 226, 0.9);
+                border-color: rgba(239, 68, 68, 0.32);
+                color: #b91c1c;
+            }}
+            html[data-theme="light"] .schedule-track-delete-btn:hover {{
+                background: rgba(254, 202, 202, 0.95);
+                border-color: rgba(220, 38, 38, 0.45);
+                color: #991b1b;
             }}
             html[data-theme="light"] .posts-sheet-list-row.is-active {{
                 background: rgba(59, 130, 246, 0.08);
@@ -11385,6 +12430,19 @@ def home(request: Request):
                     }}
                 }};
 
+                const applySelectedTabsState = (tabs) => {{
+                    if (!Array.isArray(tabs)) return;
+                    const nextSet = new Set(
+                        tabs
+                            .map((item) => String(item || "").trim())
+                            .filter(Boolean)
+                    );
+                    selectedSheetTabs = nextSet;
+                    if (latestSheetTabs.length) {{
+                        renderSheetTabs(latestSheetTabs);
+                    }}
+                }};
+
                 let colConfigActiveTab = "";
                 // Cache of per-tab input values keyed by tab name: {{ tabName: {{ link:"C", like:"F", ... }} }}
                 let tabColConfigCache = {{}};
@@ -11415,13 +12473,14 @@ def home(request: Request):
                 }};
 
                 const AUTO_COLUMN_FIELDS = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"];
+                const AUTO_DETECT_CONCURRENCY = 3;
                 const fetchAutoColumnConfigForTab = async (tabName) => {{
                     const resolvedTabName = String(tabName || "").trim();
                     if (!resolvedTabName) {{
                         return null;
                     }}
                     try {{
-                        const response = await fetch(`/detect-tab-columns?tab_name=${{encodeURIComponent(resolvedTabName)}}`, {{
+                        const response = await fetch(`/detect-tab-columns?tab_name=${{encodeURIComponent(resolvedTabName)}}&mode=auto`, {{
                             headers: {{"X-Requested-With": "fetch"}},
                             cache: "no-store",
                         }});
@@ -11443,6 +12502,47 @@ def home(request: Request):
                             detectedInputs: normalizedConfig,
                             startRow: normalizedConfig.start_row || "",
                         }};
+                    }} catch (_) {{
+                        return null;
+                    }}
+                }};
+                const fetchAutoColumnConfigBatch = async (tabNames) => {{
+                    if (!Array.isArray(tabNames) || !tabNames.length) {{
+                        return null;
+                    }}
+                    try {{
+                        const response = await fetch("/detect-tab-columns-batch", {{
+                            method: "POST",
+                            headers: {{ "Content-Type": "application/json", "X-Requested-With": "fetch" }},
+                            cache: "no-store",
+                            body: JSON.stringify({{ tabs: tabNames }}),
+                        }});
+                        const data = await response.json();
+                        if (!data.ok || !Array.isArray(data.results)) {{
+                            return null;
+                        }}
+                        const resultByTab = {{}};
+                        data.results.forEach((item) => {{
+                            const tabName = String(item?.tab_name || "").trim();
+                            if (!tabName || !item?.ok || !item?.detected_inputs) {{
+                                return;
+                            }}
+                            const normalizedConfig = {{}};
+                            AUTO_COLUMN_FIELDS.forEach((field) => {{
+                                normalizedConfig[field] = String((item.detected_inputs || {{}})[field] || "").trim();
+                            }});
+                            if (item.start_row) {{
+                                normalizedConfig.start_row = String(item.start_row);
+                            }}
+                            tabColConfigCache[tabName] = normalizedConfig;
+                            serverColConfigByTab[tabName] = normalizedConfig;
+                            resultByTab[tabName] = {{
+                                tabName,
+                                detectedInputs: normalizedConfig,
+                                startRow: normalizedConfig.start_row || "",
+                            }};
+                        }});
+                        return resultByTab;
                     }} catch (_) {{
                         return null;
                     }}
@@ -11485,11 +12585,30 @@ def home(request: Request):
                     let activeDetected = null;
                     let activeStartRow = "";
                     const activeTabForForm = String(colConfigActiveTab || tabsForAuto[0] || "").trim();
-                    for (const tabName of tabsForAuto) {{
-                        const detected = await fetchAutoColumnConfigForTab(tabName);
+                    const detectResults = new Array(tabsForAuto.length).fill(null);
+                    const batchedResults = await fetchAutoColumnConfigBatch(tabsForAuto);
+                    if (batchedResults && typeof batchedResults === "object") {{
+                        tabsForAuto.forEach((tabName, idx) => {{
+                            detectResults[idx] = batchedResults[tabName] || null;
+                        }});
+                    }} else {{
+                        let detectCursor = 0;
+                        const workerCount = Math.max(1, Math.min(AUTO_DETECT_CONCURRENCY, tabsForAuto.length));
+                        const workers = Array.from({{ length: workerCount }}, async () => {{
+                            while (true) {{
+                                const idx = detectCursor++;
+                                if (idx >= tabsForAuto.length) break;
+                                const tabName = tabsForAuto[idx];
+                                detectResults[idx] = await fetchAutoColumnConfigForTab(tabName);
+                            }}
+                        }});
+                        await Promise.all(workers);
+                    }}
+                    detectResults.forEach((detected, idx) => {{
+                        const tabName = tabsForAuto[idx];
                         if (!detected || !detected.detectedInputs) {{
                             void pushRealtimeLog(`[${{tabName}}] AUTO không nhận được cột.`);
-                            continue;
+                            return;
                         }}
                         scannedTabs += 1;
                         const filledForTab = AUTO_COLUMN_FIELDS.reduce((sum, field) => sum + (detected.detectedInputs[field] ? 1 : 0), 0);
@@ -11499,7 +12618,7 @@ def home(request: Request):
                             activeStartRow = detected.startRow || "";
                         }}
                         void pushRealtimeLog(`[${{tabName}}] AUTO nhận ${{filledForTab}} cột.`);
-                    }}
+                    }});
                     autoButton.disabled = false;
                     autoButton.textContent = "AUTO";
                     if (!scannedTabs) {{
@@ -11952,20 +13071,35 @@ def home(request: Request):
                 snapshotScheduleSheetOptions();
                 rebuildScheduleSheetSelectOptions(scheduleSheetSelect?.value || "");
                 renderScheduleSheetOptions("", scheduleSheetSelect?.value || "");
+                const tryOpenScheduleSheetSuggestions = () => {{
+                    if (!scheduleSheetSearch || !scheduleSheetOptionItems.length) return;
+                    try {{
+                        if (typeof scheduleSheetSearch.showPicker === "function") {{
+                            scheduleSheetSearch.showPicker();
+                        }}
+                    }} catch (_) {{
+                    }}
+                }};
                 if (scheduleSheetSearch) {{
                     scheduleSheetSearch.addEventListener("input", () => {{
                         renderScheduleSheetOptions(scheduleSheetSearch.value, scheduleSheetSelect?.value || "");
                     }});
                     scheduleSheetSearch.addEventListener("focus", () => {{
                         renderScheduleSheetOptions("", scheduleSheetSelect?.value || "");
+                        tryOpenScheduleSheetSuggestions();
                     }});
                     scheduleSheetSearch.addEventListener("click", () => {{
                         renderScheduleSheetOptions("", scheduleSheetSelect?.value || "");
+                        tryOpenScheduleSheetSuggestions();
                     }});
                     scheduleSheetSearch.addEventListener("change", async () => {{
                         await commitScheduleSheetSearch(false);
                     }});
                     scheduleSheetSearch.addEventListener("keydown", async (event) => {{
+                        if (event.key === "ArrowDown") {{
+                            tryOpenScheduleSheetSuggestions();
+                            return;
+                        }}
                         if (event.key !== "Enter") return;
                         event.preventDefault();
                         await commitScheduleSheetSearch(false);
@@ -11997,6 +13131,10 @@ def home(request: Request):
 
                     const cachedTabs = sheetTabsCache[rawValue];
                     if (cachedTabs) {{
+                        const allowedTitles = new Set((cachedTabs.tabs || []).map((tab) => String(tab?.title || "").trim()));
+                        selectedSheetTabs = new Set(
+                            Array.from(selectedSheetTabs).filter((title) => allowedTitles.has(String(title || "").trim()))
+                        );
                         renderSheetTabs(cachedTabs.tabs);
                         setSheetTabsMessage(cachedTabs.message, "success");
                         return;
@@ -12035,6 +13173,10 @@ def home(request: Request):
                             tabs,
                             message: data.message || `Tìm thấy ${{tabs.length}} tab trong spreadsheet.`,
                         }};
+                        const allowedTitles = new Set((tabs || []).map((tab) => String(tab?.title || "").trim()));
+                        selectedSheetTabs = new Set(
+                            Array.from(selectedSheetTabs).filter((title) => allowedTitles.has(String(title || "").trim()))
+                        );
                         renderSheetTabs(tabs);
                         const tabMsgStyle = data.stale ? "warning" : "success";
                         setSheetTabsMessage(data.message || "Đã tải danh sách tab.", tabMsgStyle);
@@ -12096,19 +13238,108 @@ def home(request: Request):
                 window.bindSheetTabLookupControls = bindSheetTabLookupControls;
                 bindSheetTabLookupControls();
 
-                const applyConfigLockState = (locked, message = "") => {{
-                    configLocked = Boolean(locked);
-                    [setSheetSubmitBtn, setColumnsSubmitBtn].forEach((btn) => {{
-                        if (!btn) return;
-                        btn.disabled = configLocked;
-                        btn.classList.toggle("opacity-50", configLocked);
-                        btn.classList.toggle("cursor-not-allowed", configLocked);
-                        if (configLocked && message) {{
-                            btn.setAttribute("title", message);
-                        }} else {{
-                            btn.removeAttribute("title");
+                const bindSetColumnsFormInline = () => {{
+                    const activeSetColumnsForm = document.querySelector("form[action='/set-columns']");
+                    if (!activeSetColumnsForm || activeSetColumnsForm.dataset.inlineBound === "1") return;
+                    activeSetColumnsForm.dataset.inlineBound = "1";
+                    activeSetColumnsForm.addEventListener("submit", async (event) => {{
+                        event.preventDefault();
+                        void pushRealtimeLog("Bắt đầu lưu cấu hình cột nhập liệu...");
+                        const params = new URLSearchParams();
+                        document.querySelectorAll("[form='set-columns-form'][name]").forEach((field) => {{
+                            const rawValue = (field.value || "").trim();
+                            if (field.matches("[data-column-input]")) {{
+                                if (!rawValue) {{
+                                    params.set(field.name, "");
+                                }} else {{
+                                    params.set(field.name, rawValue);
+                                }}
+                                return;
+                            }}
+                            params.set(field.name, rawValue);
+                        }});
+                        if (!String(params.get("tab_name") || "").trim() && colConfigActiveTab) {{
+                            params.set("tab_name", String(colConfigActiveTab || "").trim());
+                        }}
+                        try {{
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), 8000);
+                            const response = await fetch(`/set-columns?${{params.toString()}}`, {{
+                                headers: {{ "X-Requested-With": "fetch" }},
+                                cache: "no-store",
+                                signal: controller.signal,
+                            }});
+                            clearTimeout(timeoutId);
+                            const data = await response.json();
+                            applyStatusState(data);
+                            applyScheduleConfigState(data);
+                            applyScheduleTrackingState(data);
+                            if (data.ok) {{
+                                applyColumnConfigState(data);
+                                pendingSheetMetadataReveal = true;
+                                applySheetMetadataState(data);
+                                if (typeof data.overview_html === "string") {{
+                                    replaceOverviewPanelHtml(data.overview_html);
+                                }}
+                                if (typeof data.posts_html === "string") {{
+                                    replacePostsPanelHtml(data.posts_html);
+                                }}
+                                if (typeof data.campaign_html === "string") {{
+                                    replaceCampaignPanelHtml(data.campaign_html);
+                                }}
+                                if (data.defer_panel_refresh) {{
+                                    setTimeout(() => {{
+                                        try {{ loadAsyncDashboardData(); }} catch (_) {{}}
+                                    }}, 0);
+                                }}
+                            }}
+                            showNotice(
+                                data.message || (data.ok ? "Đã lưu sheet thành công." : "Không lưu được sheet."),
+                                data.level || (data.ok ? "success" : "error")
+                            );
+                            if (data.ok) {{
+                                void pushRealtimeLog(data.message || "Đã lưu cấu hình cột nhập liệu thành công.");
+                            }} else {{
+                                void pushRealtimeLog(data.message || "Không lưu được cấu hình cột nhập liệu.");
+                            }}
+                            await refreshStatusNow();
+                        }} catch (err) {{
+                            const isTimeout = err?.name === "AbortError";
+                            showNotice(
+                                isTimeout
+                                    ? "Lưu cấu hình cột quá lâu, tạm dừng để tránh treo. Bạn thử bấm Lưu lại."
+                                    : "Không lưu được sheet. Vui lòng thử lại.",
+                                isTimeout ? "warning" : "error"
+                            );
+                            void pushRealtimeLog(
+                                isTimeout
+                                    ? "Lưu cấu hình cột quá lâu, đã timeout để tránh treo. Bạn thử bấm Lưu lại."
+                                    : "Lưu cấu hình cột thất bại. Vui lòng thử lại."
+                            );
                         }}
                     }});
+                }};
+                window.bindSetColumnsFormInline = bindSetColumnsFormInline;
+                bindSetColumnsFormInline();
+
+                const applyConfigLockState = (locked, message = "") => {{
+                    configLocked = Boolean(locked);
+                    if (setSheetSubmitBtn) {{
+                        setSheetSubmitBtn.disabled = configLocked;
+                        setSheetSubmitBtn.classList.toggle("opacity-50", configLocked);
+                        setSheetSubmitBtn.classList.toggle("cursor-not-allowed", configLocked);
+                        if (configLocked && message) {{
+                            setSheetSubmitBtn.setAttribute("title", message);
+                        }} else {{
+                            setSheetSubmitBtn.removeAttribute("title");
+                        }}
+                    }}
+                    if (setColumnsSubmitBtn) {{
+                        // Cho phép lưu cấu hình cột ngay cả khi trạng thái đang "Đã dừng".
+                        setColumnsSubmitBtn.disabled = false;
+                        setColumnsSubmitBtn.classList.remove("opacity-50", "cursor-not-allowed");
+                        setColumnsSubmitBtn.removeAttribute("title");
+                    }}
                 }};
 
                 const submitSheetFormInline = async () => {{
@@ -12129,17 +13360,22 @@ def home(request: Request):
                             gid: tabsByTitle[title]?.gid || "0",
                         }}));
                         try {{
+                            const controller = new AbortController();
+                            const timeoutId = setTimeout(() => controller.abort(), 8000);
                             const response = await fetch("/save-selected-sheets", {{
                                 method: "POST",
                                 headers: {{ "Content-Type": "application/json", "X-Requested-With": "fetch" }},
                                 cache: "no-store",
+                                signal: controller.signal,
                                 body: JSON.stringify({{
                                     sheet_url: sheetUrlInput?.value || "",
                                     tabs: selectedTabsPayload,
                                 }}),
                             }});
+                            clearTimeout(timeoutId);
                             const data = await response.json();
                             if (data.ok) {{
+                                applySelectedTabsState(data.selected_tabs || []);
                                 sessionStorage.removeItem("draft_sheet_url");
                                 sessionStorage.removeItem("draft_sheet_name");
                                 applyActiveSheetMeta(data, true);
@@ -12147,6 +13383,11 @@ def home(request: Request):
                                 applySheetMetadataState(data);
                                 applyScheduleConfigState(data);
                                 applyScheduleTrackingState(data);
+                                if (data.defer_panel_refresh) {{
+                                    setTimeout(() => {{
+                                        try {{ loadAsyncDashboardData(); }} catch (_) {{}}
+                                    }}, 0);
+                                }}
                                 if (typeof data.overview_html === "string") {{
                                     replaceOverviewPanelHtml(data.overview_html);
                                 }}
@@ -12167,19 +13408,30 @@ def home(request: Request):
 	                            );
 	                            await refreshStatusNow();
 	                            return data;
-                        }} catch (_) {{
-                            showNotice("Không lưu được các tab sheet. Vui lòng thử lại.", "error");
+                        }} catch (err) {{
+                            const isTimeout = err?.name === "AbortError";
+                            showNotice(
+                                isTimeout
+                                    ? "Lưu tab sheet quá lâu, tạm bỏ qua để tránh treo. Bạn có thể bấm Lưu Sheet lại sau."
+                                    : "Không lưu được các tab sheet. Vui lòng thử lại.",
+                                isTimeout ? "warning" : "error"
+                            );
                             return null;
                         }}
                     }}
                     const params = new URLSearchParams(new FormData(activeSetSheetForm));
                     try {{
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 8000);
                         const response = await fetch(`/set-sheet?${{params.toString()}}`, {{
                             headers: {{ "X-Requested-With": "fetch" }},
                             cache: "no-store",
+                            signal: controller.signal,
                         }});
+                        clearTimeout(timeoutId);
                         const data = await response.json();
                         if (data.ok) {{
+                            applySelectedTabsState(data.selected_tabs || []);
                             sessionStorage.removeItem("draft_sheet_url");
                             sessionStorage.removeItem("draft_sheet_name");
                             applyActiveSheetMeta(data, true);
@@ -12187,6 +13439,11 @@ def home(request: Request):
                             applySheetMetadataState(data);
                             applyScheduleConfigState(data);
                             applyScheduleTrackingState(data);
+                            if (data.defer_panel_refresh) {{
+                                setTimeout(() => {{
+                                    try {{ loadAsyncDashboardData(); }} catch (_) {{}}
+                                }}, 0);
+                            }}
                             if (typeof data.overview_html === "string") {{
                                 replaceOverviewPanelHtml(data.overview_html);
                             }}
@@ -12207,8 +13464,14 @@ def home(request: Request):
 	                        );
 	                        await refreshStatusNow();
 	                        return data;
-                    }} catch (_) {{
-                        showNotice("Không nhập được sheet. Vui lòng thử lại.", "error");
+                    }} catch (err) {{
+                        const isTimeout = err?.name === "AbortError";
+                        showNotice(
+                            isTimeout
+                                ? "Nhập sheet quá lâu, tạm dừng để tránh treo. Bạn thử lại hoặc bấm Bắt đầu trực tiếp."
+                                : "Không nhập được sheet. Vui lòng thử lại.",
+                            isTimeout ? "warning" : "error"
+                        );
                         return null;
                     }}
                 }};
@@ -12220,77 +13483,8 @@ def home(request: Request):
                     }});
                 }}
 
-                if (setColumnsForm) {{
-                    setColumnsForm.addEventListener("submit", async (event) => {{
-                        event.preventDefault();
-                        void pushRealtimeLog("Bắt đầu lưu cấu hình cột nhập liệu...");
-                        if (configLocked) {{
-                            showNotice("Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy lưu sheet.", "warning");
-                            return;
-                        }}
-                        const setColumnsDraftValues = {{}};
-                        document.querySelectorAll("[form='set-columns-form'][name]").forEach((field) => {{
-                            setColumnsDraftValues[field.name] = field.value || "";
-                        }});
-                        const sheetData = await submitSheetFormInline();
-                        if (!sheetData || !sheetData.ok) {{
-                            return;
-                        }}
-                        document.querySelectorAll("[form='set-columns-form'][name]").forEach((field) => {{
-                            if (Object.prototype.hasOwnProperty.call(setColumnsDraftValues, field.name)) {{
-                                field.value = setColumnsDraftValues[field.name];
-                            }}
-                        }});
-                        const params = new URLSearchParams();
-                        document.querySelectorAll("[form='set-columns-form'][name]").forEach((field) => {{
-                            const rawValue = (field.value || "").trim();
-                            if (field.matches("[data-column-input]")) {{
-                                const detectedValue = String(field.dataset.detectedValue || "").trim().toUpperCase();
-                                const manualValue = String(field.dataset.manualValue || "").trim().toUpperCase();
-                                const normalizedRawValue = rawValue.toUpperCase();
-                                if (!rawValue) {{
-                                    params.set(field.name, "");
-                                }} else if (!manualValue && detectedValue && normalizedRawValue === detectedValue) {{
-                                    params.set(field.name, "");
-                                }} else {{
-                                    params.set(field.name, rawValue);
-                                }}
-                                return;
-                            }}
-                            params.set(field.name, rawValue);
-                        }});
-                        try {{
-                            const response = await fetch(`/set-columns?${{params.toString()}}`, {{
-                                headers: {{ "X-Requested-With": "fetch" }},
-                                cache: "no-store",
-                            }});
-                            const data = await response.json();
-                            applyStatusState(data);
-                            applyScheduleConfigState(data);
-                            applyScheduleTrackingState(data);
-                            if (data.ok) {{
-                                applyColumnConfigState(data);
-                                pendingSheetMetadataReveal = true;
-                                applySheetMetadataState(data);
-                                if (typeof data.overview_html === "string") {{
-                                    replaceOverviewPanelHtml(data.overview_html);
-                                }}
-                                if (typeof data.posts_html === "string") {{
-                                    replacePostsPanelHtml(data.posts_html);
-                                }}
-                                if (typeof data.campaign_html === "string") {{
-                                    replaceCampaignPanelHtml(data.campaign_html);
-                                }}
-                            }}
-	                            showNotice(
-	                                data.message || (data.ok ? "Đã lưu sheet thành công." : "Không lưu được sheet."),
-	                                data.level || (data.ok ? "success" : "error")
-	                            );
-	                            await refreshStatusNow();
-	                        }} catch (_) {{
-                            showNotice("Không lưu được sheet. Vui lòng thử lại.", "error");
-                        }}
-                    }});
+                if (typeof window.bindSetColumnsFormInline === "function") {{
+                    window.bindSetColumnsFormInline();
                 }}
 
                 if (saveAccessPolicyBtn && authPolicyText) {{
@@ -12345,11 +13539,96 @@ def home(request: Request):
                 }}
 
                 document.addEventListener("click", async (event) => {{
+                    const rerunFailedButton = event.target.closest("[data-rerun-failed-btn]");
+                    if (rerunFailedButton) {{
+                        event.preventDefault();
+                        if (pendingInlineAction) {{
+                            showNotice("Đang gửi lệnh, vui lòng chờ một chút.", "info");
+                            return;
+                        }}
+                        rerunFailedButton.disabled = true;
+                        rerunFailedButton.classList.add("opacity-60", "pointer-events-none");
+                        try {{
+                            const response = await fetch("/start-failed", {{
+                                method: "POST",
+                                headers: {{ "X-Requested-With": "fetch" }},
+                                cache: "no-store",
+                            }});
+                            const data = await response.json();
+                            applyStatusState(data);
+                            applyActiveSheetMeta(data);
+                            applyColumnConfigState(data);
+                            applyScheduleConfigState(data);
+                            applyScheduleTrackingState(data);
+                            showNotice(
+                                data.message || (data.ok ? "Đã bắt đầu quét lại danh sách lỗi." : "Không quét lại được danh sách lỗi."),
+                                data.level || (data.ok ? "success" : "error")
+                            );
+                        }} catch (_) {{
+                            showNotice("Không quét lại được danh sách lỗi. Vui lòng thử lại.", "error");
+                        }} finally {{
+                            rerunFailedButton.disabled = false;
+                            rerunFailedButton.classList.remove("opacity-60", "pointer-events-none");
+                        }}
+                        return;
+                    }}
+
+                    const scheduleDeleteButton = event.target.closest("[data-schedule-delete-entry-key]");
+                    if (scheduleDeleteButton) {{
+                        event.preventDefault();
+                        event.stopPropagation();
+                        const entryKey = String(scheduleDeleteButton.dataset.scheduleDeleteEntryKey || "").trim();
+                        if (!entryKey) return;
+                        if (!window.confirm("Xóa lịch của sheet này?")) {{
+                            return;
+                        }}
+                        scheduleDeleteButton.disabled = true;
+                        scheduleDeleteButton.classList.add("opacity-60", "pointer-events-none");
+                        try {{
+                            const response = await fetch("/delete-schedule-entry", {{
+                                method: "POST",
+                                headers: {{ "Content-Type": "application/json", "X-Requested-With": "fetch" }},
+                                cache: "no-store",
+                                body: JSON.stringify({{ key: entryKey }}),
+                            }});
+                            const data = await response.json();
+                            applyStatusState(data);
+                            applyScheduleConfigState(data);
+                            applyScheduleTrackingState(data);
+                            showNotice(
+                                data.message || (data.ok ? "Đã xóa lịch." : "Không xóa được lịch."),
+                                data.level || (data.ok ? "success" : "error")
+                            );
+                            void pushRealtimeLog(data.message || (data.ok ? "Đã xóa lịch sheet." : "Không xóa được lịch sheet."));
+                        }} catch (_) {{
+                            showNotice("Không xóa được lịch. Vui lòng thử lại.", "error");
+                            void pushRealtimeLog("Không xóa được lịch sheet. Vui lòng thử lại.");
+                        }} finally {{
+                            scheduleDeleteButton.disabled = false;
+                            scheduleDeleteButton.classList.remove("opacity-60", "pointer-events-none");
+                        }}
+                        return;
+                    }}
+
                     const scheduleTrackButton = event.target.closest("[data-schedule-track-entry-key]");
                     if (scheduleTrackButton) {{
                         event.preventDefault();
                         const isActiveScheduleTrack = scheduleTrackButton.classList.contains("is-active");
                         await selectScheduleEntry(isActiveScheduleTrack ? "" : (scheduleTrackButton.dataset.scheduleTrackEntryKey || ""), "tracking", false);
+                        return;
+                    }}
+
+                    const historyToggleButton = event.target.closest("[data-schedule-history-toggle]");
+                    if (historyToggleButton) {{
+                        event.preventDefault();
+                        const runId = historyToggleButton.dataset.scheduleHistoryToggle || "";
+                        if (!runId) return;
+                        const detailNode = document.querySelector(`[data-schedule-history-detail="${{runId}}"]`);
+                        if (!detailNode) return;
+                        const willOpen = detailNode.classList.contains("hidden");
+                        detailNode.classList.toggle("hidden", !willOpen);
+                        historyToggleButton.setAttribute("aria-expanded", willOpen ? "true" : "false");
+                        historyToggleButton.textContent = willOpen ? "Ẩn chi tiết" : "Xem chi tiết lần chạy";
                         return;
                     }}
 
@@ -12364,9 +13643,20 @@ def home(request: Request):
                     }}
                     pendingInlineAction = action || "action";
                     actionLink.classList.add("opacity-60", "pointer-events-none");
+                    const primaryActionContainer = document.getElementById("primary-action");
+                    const originalPrimaryActionHtml = primaryActionContainer ? primaryActionContainer.innerHTML : "";
+                    const originalActionLinkHtml = actionLink.innerHTML;
                     const baseUrl = actionLink.getAttribute("href") || (action === "stop" ? "/stop" : "/start");
                     let requestUrl = baseUrl;
                     if (action === "start") {{
+                        const optimisticTaskEl = document.getElementById("current-task");
+                        const optimisticProgressBar = document.getElementById("progress-bar");
+                        const optimisticProgressText = document.getElementById("progress-text");
+                        if (optimisticTaskEl) optimisticTaskEl.textContent = "Đang gửi lệnh chạy...";
+                        if (optimisticProgressBar) optimisticProgressBar.style.width = "4%";
+                        if (optimisticProgressText) optimisticProgressText.textContent = "Đang chuẩn bị";
+                        actionLink.setAttribute("aria-disabled", "true");
+                        actionLink.innerHTML = `<i class="fa-solid fa-hourglass-half mr-2.5 text-base"></i> Đang gửi lệnh...`;
                         const params = new URLSearchParams();
                         const draftSheetUrl = (sheetUrlInput?.value || "").trim();
                         const draftSheetName = (sheetNameInput?.value || "").trim();
@@ -12392,10 +13682,15 @@ def home(request: Request):
                     }}
 
                     try {{
+                        const controller = new AbortController();
+                        const inlineActionTimeoutMs = action === "start" ? 12000 : 25000;
+                        const timeoutId = setTimeout(() => controller.abort(), inlineActionTimeoutMs);
                         const response = await fetch(requestUrl, {{
                             headers: {{ "X-Requested-With": "fetch" }},
                             cache: "no-store",
+                            signal: controller.signal,
                         }});
+                        clearTimeout(timeoutId);
                         const data = await response.json();
                         applyStatusState(data);
                         applyScheduleConfigState(data);
@@ -12431,16 +13726,33 @@ def home(request: Request):
                                 }} catch (_) {{}}
                             }}, 800);
                         }}
-                    }} catch (_) {{
+                    }} catch (error) {{
+                        const isTimeout = error?.name === "AbortError";
+                        if (isTimeout && action === "start") {{
+                            showNotice("Lệnh đã gửi, server phản hồi chậm. Đang tự đồng bộ trạng thái chạy...", "warning");
+                            setTimeout(async () => {{
+                                try {{
+                                    await refreshStatusNow();
+                                }} catch (_) {{}}
+                            }}, 600);
+                            return;
+                        }}
                         showNotice(
-                            action === "stop"
-                                ? "Không dừng được tác vụ. Vui lòng thử lại."
-                                : "Không bắt đầu được tác vụ. Vui lòng thử lại.",
-                            "error"
+                            isTimeout
+                                ? "Yêu cầu quá lâu chưa phản hồi. Server có thể đang bận, bạn thử lại sau vài giây."
+                                : (action === "stop"
+                                    ? "Không dừng được tác vụ. Vui lòng thử lại."
+                                    : "Không bắt đầu được tác vụ. Vui lòng thử lại."),
+                            isTimeout ? "warning" : "error"
                         );
                     }} finally {{
                         pendingInlineAction = "";
                         actionLink.classList.remove("opacity-60", "pointer-events-none");
+                        actionLink.removeAttribute("aria-disabled");
+                        actionLink.innerHTML = originalActionLinkHtml;
+                        if (primaryActionContainer && primaryActionContainer.innerHTML.includes("Đang gửi lệnh")) {{
+                            primaryActionContainer.innerHTML = originalPrimaryActionHtml;
+                        }}
                     }}
                 }});
 
@@ -12669,6 +13981,15 @@ def home(request: Request):
                 let overviewCampaignOpenBound = false;
                 let lastSheetTabsLogKey = "";
                 let lastSheetTabsLogAt = 0;
+                let lastScheduleConfigSignature = "";
+                let lastScheduleTrackingSignature = "";
+
+                const setHtmlIfChanged = (node, nextHtml) => {{
+                    if (!node || typeof nextHtml !== "string") return;
+                    if (node.dataset.lastHtml === nextHtml) return;
+                    node.innerHTML = nextHtml;
+                    node.dataset.lastHtml = nextHtml;
+                }};
 
                 const showNotice = (_message = "", _level = "info") => {{}};
                 const pushRealtimeLog = async (message = "") => {{
@@ -12711,6 +14032,69 @@ def home(request: Request):
                     postsMasterCampaignChips = Array.from(document.querySelectorAll("[data-master-campaign]"));
                     postsMasterEmptyPanel = document.querySelector(".posts-master-empty-panel");
                     campaignSheetList = document.getElementById("campaign-sheet-list");
+                }};
+                const parseMetricCellNumber = (rawText) => {{
+                    const raw = String(rawText || "").trim();
+                    if (!raw || raw === "-") return null;
+                    const normalized = raw.replace(/\s+/g, "");
+                    const alreadyCompact = normalized.match(/^(\d+)(,\d+)?(K|M|B|T)$/i);
+                    if (alreadyCompact) return null;
+                    const digits = normalized.replace(/[^\d]/g, "");
+                    if (!digits) return null;
+                    try {{
+                        return BigInt(digits);
+                    }} catch (_) {{
+                        return null;
+                    }}
+                }};
+                const formatCompactBigInt = (value) => {{
+                    if (value === null || value === undefined) return "-";
+                    if (value < 1000n) return value.toString();
+                    const UNITS = [
+                        {{ v: 1_000_000_000_000_000_000n, s: "E" }},
+                        {{ v: 1_000_000_000_000_000n, s: "P" }},
+                        {{ v: 1_000_000_000_000n, s: "T" }},
+                        {{ v: 1_000_000_000n, s: "B" }},
+                        {{ v: 1_000_000n, s: "M" }},
+                        {{ v: 1_000n, s: "K" }},
+                    ];
+                    for (const unit of UNITS) {{
+                        if (value >= unit.v) {{
+                            const whole = value / unit.v;
+                            const dec = ((value % unit.v) * 10n) / unit.v;
+                            return dec > 0n ? `${{whole.toString()}},${{dec.toString()}} ${{unit.s}}` : `${{whole.toString()}} ${{unit.s}}`;
+                        }}
+                    }}
+                    return value.toString();
+                }};
+                const compactPostsMetricCells = () => {{
+                    document.querySelectorAll(".posts-sheet-list-row").forEach((row) => {{
+                        const metricCells = Array.from(row.querySelectorAll(".posts-sheet-list-cell-metric"));
+                        metricCells.forEach((cell, index) => {{
+                            // Cột "Bài đăng" giữ nguyên số chi tiết; các cột còn lại rút gọn.
+                            if (index === 0) return;
+                            const parsed = parseMetricCellNumber(cell.textContent || "");
+                            if (parsed === null) return;
+                            cell.textContent = formatCompactBigInt(parsed);
+                        }});
+                    }});
+                    document.querySelectorAll(".posts-detail-summary-grid").forEach((grid) => {{
+                        const valueEls = Array.from(grid.querySelectorAll(".posts-detail-summary-card .posts-detail-summary-value"));
+                        valueEls.forEach((el, index) => {{
+                            // Card đầu là "Bài đăng" nên giữ nguyên.
+                            if (index === 0) return;
+                            const parsed = parseMetricCellNumber(el.textContent || "");
+                            if (parsed === null) return;
+                            el.textContent = formatCompactBigInt(parsed);
+                        }});
+                    }});
+                    document.querySelectorAll(".post-row").forEach((row) => {{
+                        row.querySelectorAll(".posts-cell-metric").forEach((cell) => {{
+                            const parsed = parseMetricCellNumber(cell.textContent || "");
+                            if (parsed === null) return;
+                            cell.textContent = formatCompactBigInt(parsed);
+                        }});
+                    }});
                 }};
                 const closePostsSheetActionMenus = (exceptMenu = null) => {{
                     document.querySelectorAll("[data-posts-sheet-action-menu]").forEach((menu) => {{
@@ -13068,6 +14452,10 @@ def home(request: Request):
                     }});
                     // Re-apply active tab's per-tab overrides on top of the global defaults
                     if (colConfigActiveTab) {{
+                        const latestByTab = data?.column_overrides_by_tab;
+                        if (latestByTab && typeof latestByTab === "object" && latestByTab[colConfigActiveTab]) {{
+                            serverColConfigByTab[colConfigActiveTab] = latestByTab[colConfigActiveTab];
+                        }}
                         const tabCfg = serverColConfigByTab[colConfigActiveTab] || tabColConfigCache[colConfigActiveTab];
                         if (tabCfg) writeColConfigInputs(tabCfg);
                     }}
@@ -13113,6 +14501,9 @@ def home(request: Request):
                 const applyScheduleConfigState = (data) => {{
                     const scheduleConfig = data?.schedule_config;
                     if (!scheduleConfig) return;
+                    const scheduleConfigSignature = JSON.stringify(scheduleConfig);
+                    if (scheduleConfigSignature === lastScheduleConfigSignature) return;
+                    lastScheduleConfigSignature = scheduleConfigSignature;
                     const label = scheduleConfig.label || "Chưa bật";
                     scheduleLabelEls.forEach((el) => {{
                         el.textContent = label;
@@ -13157,8 +14548,11 @@ def home(request: Request):
                 const applyScheduleTrackingState = (data) => {{
                     const tracking = data?.schedule_tracking;
                     if (!tracking) return;
+                    const scheduleTrackingSignature = JSON.stringify(tracking);
+                    if (scheduleTrackingSignature === lastScheduleTrackingSignature) return;
+                    lastScheduleTrackingSignature = scheduleTrackingSignature;
                     if (scheduleTrackList && typeof tracking.entries_html === "string") {{
-                        scheduleTrackList.innerHTML = tracking.entries_html;
+                        setHtmlIfChanged(scheduleTrackList, tracking.entries_html);
                     }}
                     if (scheduleTrackDetailBody) {{
                         scheduleTrackDetailBody.classList.toggle("hidden", !tracking.has_active_entry);
@@ -13176,7 +14570,7 @@ def home(request: Request):
                         scheduleTrackCalendarSubtext.textContent = tracking.calendar_subtext || "";
                     }}
                     if (scheduleTrackCalendar && typeof tracking.calendar_html === "string") {{
-                        scheduleTrackCalendar.innerHTML = tracking.calendar_html;
+                        setHtmlIfChanged(scheduleTrackCalendar, tracking.calendar_html);
                     }}
                     if (scheduleTrackNext) {{
                         scheduleTrackNext.textContent = tracking.next_run_text || "Chưa có";
@@ -13212,7 +14606,7 @@ def home(request: Request):
                         scheduleTrackFailed.textContent = tracking.last_failed_text || "0";
                     }}
                     if (scheduleTrackHistory && typeof tracking.history_html === "string") {{
-                        scheduleTrackHistory.innerHTML = tracking.history_html;
+                        setHtmlIfChanged(scheduleTrackHistory, tracking.history_html);
                     }}
                 }};
 
@@ -13452,9 +14846,10 @@ def home(request: Request):
                         bucket.views += item.views;
                         bucket.buzz += item.buzz;
                         if (item.brand) {{
-                            const currentBrand = bucket.brandStats.get(item.brand) || {{ views: 0, posts: 0 }};
+                            const currentBrand = bucket.brandStats.get(item.brand) || {{ views: 0, posts: 0, buzz: 0 }};
                             currentBrand.views += item.views;
                             currentBrand.posts += 1;
+                            currentBrand.buzz += item.buzz;
                             bucket.brandStats.set(item.brand, currentBrand);
                         }}
                         if (item.sheetName) {{
@@ -13547,6 +14942,7 @@ def home(request: Request):
                                     name,
                                     views: Number(stat?.views || 0) || 0,
                                     posts: Number(stat?.posts || 0) || 0,
+                                    buzz: Number(stat?.buzz || 0) || 0,
                                 }}));
                             const allSheets = Array.from(bucket.sheetStats.entries())
                                 .sort((a, b) => (b[1].views - a[1].views) || (b[1].posts - a[1].posts))
@@ -13694,29 +15090,69 @@ def home(request: Request):
                                 const totalBuzz = points.reduce((sum, b) => sum + (b.buzz || 0), 0);
                                 const totalViews = points.reduce((sum, b) => sum + (b.views || 0), 0);
                                 const fBuzz = new Intl.NumberFormat("vi-VN").format(totalBuzz);
+                                const brandOrder = Array.from(
+                                    points.reduce((acc, point) => {{
+                                        const brands = Array.isArray(point.topBrands) ? point.topBrands : [];
+                                        brands.forEach((brandItem) => {{
+                                            const name = String(brandItem?.name || "").trim();
+                                            if (!name) return;
+                                            const current = acc.get(name) || 0;
+                                            acc.set(name, current + (Number(brandItem?.buzz || 0) || 0));
+                                        }});
+                                        return acc;
+                                    }}, new Map()).entries()
+                                )
+                                .sort((a, b) => b[1] - a[1])
+                                .map((entry) => entry[0]);
+                                const fallbackBrand = "Chưa gắn";
+                                if (!brandOrder.length) brandOrder.push(fallbackBrand);
+                                const brandPalette = [
+                                    "#f59e0b", "#10b981", "#38bdf8", "#a78bfa", "#f43f5e",
+                                    "#22d3ee", "#84cc16", "#fb7185", "#f97316", "#6366f1"
+                                ];
+                                const brandColorByName = new Map(
+                                    brandOrder.map((name, idx) => [name, brandPalette[idx % brandPalette.length]])
+                                );
                                 const firstPoint = points[0];
                                 const lastPoint = points[points.length - 1];
                                 const spanText = firstPoint && lastPoint
                                     ? `${{formatOverviewLongDate(firstPoint.date)}} - ${{formatOverviewLongDate(lastPoint.date)}}`
                                     : "";
                                 if (periodLabel) periodLabel.textContent = "Tổng cộng " + fBuzz + " buzz, " + formatMetric(totalViews) + " views" + (spanText ? (" | " + spanText) : "");
+                                if (brandLegend) {{
+                                    brandLegend.innerHTML = brandOrder
+                                        .map((name) => {{
+                                            const color = brandColorByName.get(name) || "#f59e0b";
+                                            return `<span class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:${{color}};"></span><span>${{name}}</span></span>`;
+                                        }})
+                                        .join("");
+                                }}
                                 const showTooltip = (event, pointData) => {{
                                     if (!tooltip || !pointData) return;
-                                    const topBrands = Array.isArray(pointData.topBrands) ? pointData.topBrands : [];
-                                    const topSheets = Array.isArray(pointData.topSheets) ? pointData.topSheets : [];
+                                    const topBrands = (Array.isArray(pointData.topBrands) ? pointData.topBrands : []).slice(0, 2);
+                                    const topSheets = (Array.isArray(pointData.topSheets) ? pointData.topSheets : []).slice(0, 2);
                                     const topBrandHtml = topBrands.length
-                                        ? topBrands.map((item, idx) => `<div style="color:#93c5fd;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
+                                        ? topBrands.map((item, idx) => `<div style="color:#93c5fd;font-size:11px;line-height:1.35;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
                                         : '<div style="color:#64748b;">Chưa có dữ liệu thương hiệu</div>';
                                     const topSheetHtml = topSheets.length
-                                        ? topSheets.map((item, idx) => `<div style="color:#a5b4fc;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
+                                        ? topSheets.map((item, idx) => `<div style="color:#a5b4fc;font-size:11px;line-height:1.35;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
                                         : '<div style="color:#64748b;">Chưa có dữ liệu sheet</div>';
+                                    const brandDetailBlock = pointData.__brandName
+                                        ? `
+                                            <div style="margin-top:6px;color:${{pointData.__brandColor || "#f59e0b"}};font-weight:800;font-size:11px;">
+                                                Thương hiệu: ${{pointData.__brandName}}
+                                            </div>
+                                            <div style="color:#cbd5e1;font-size:11px;">Buzz (brand): <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.__brandBuzz || 0)}}</strong></div>
+                                        `
+                                        : "";
                                     tooltip.innerHTML = `
-                                        <div style="font-weight:800;color:#f8fafc;">${{pointData.label || pointData.key || "N/A"}}</div>
-                                        <div style="margin-top:4px;color:#cbd5e1;">Buzz: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.buzz || 0)}}</strong></div>
-                                        <div style="color:#cbd5e1;">Lượt xem: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.views || 0)}}</strong></div>
-                                        <div style="margin-top:8px;color:#94a3b8;font-weight:700;">Thương hiệu (${{topBrands.length}}):</div>
+                                        <div style="font-weight:800;color:#f8fafc;font-size:12px;">${{pointData.label || pointData.key || "N/A"}}</div>
+                                        <div style="margin-top:3px;color:#cbd5e1;font-size:11px;">Buzz: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.buzz || 0)}}</strong></div>
+                                        <div style="color:#cbd5e1;font-size:11px;">Lượt xem: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.views || 0)}}</strong></div>
+                                        ${{brandDetailBlock}}
+                                        <div style="margin-top:6px;color:#94a3b8;font-weight:700;font-size:11px;">Thương hiệu (${{topBrands.length}}):</div>
                                         <div style="margin-top:2px;">${{topBrandHtml}}</div>
-                                        <div style="margin-top:8px;color:#94a3b8;font-weight:700;">Sheet (${{topSheets.length}}):</div>
+                                        <div style="margin-top:6px;color:#94a3b8;font-weight:700;font-size:11px;">Sheet (${{topSheets.length}}):</div>
                                         <div style="margin-top:2px;">${{topSheetHtml}}</div>
                                     `;
                                     tooltip.classList.remove("hidden");
@@ -13740,7 +15176,14 @@ def home(request: Request):
                                 const innerWidth = width - padding.left - padding.right;
                                 const innerHeight = height - padding.top - padding.bottom;
                                 
-                                const rawMaxBuzz = Math.max(1, ...points.map(b => b.buzz || 0));
+                                const rawMaxBuzz = Math.max(
+                                    1,
+                                    ...points.map((bucket) => {{
+                                        const brands = Array.isArray(bucket.topBrands) ? bucket.topBrands : [];
+                                        const maxBrandBuzz = Math.max(0, ...brands.map((brandItem) => Number(brandItem?.buzz || 0) || 0));
+                                        return maxBrandBuzz || Number(bucket.buzz || 0) || 0;
+                                    }})
+                                );
                                 const rawMaxViews = Math.max(1, ...points.map(b => b.views || 0));
                                 const maxBuzz = Math.max(1, Math.ceil(rawMaxBuzz * 1.15));
                                 const maxViews = Math.max(1, Math.ceil(rawMaxViews * 1.15));
@@ -13749,15 +15192,20 @@ def home(request: Request):
                                 const tentativeStep = points.length <= 1
                                     ? innerWidth
                                     : innerWidth / Math.max(1, points.length - 1);
-                                const barW = Math.min(34, Math.max(18, (tentativeStep || 96) * 0.22));
-                                const edgeGap = Math.max(12, Math.ceil(barW / 2) + 4);
+                                const brandCount = Math.max(1, brandOrder.length);
+                                const barGap = Math.max(2, Math.min(6, Math.round((tentativeStep || 96) * 0.04)));
+                                const maxClusterWidth = Math.max(22, (tentativeStep || 96) * 0.72);
+                                const barW = Math.max(
+                                    6,
+                                    Math.min(18, Math.floor((maxClusterWidth - barGap * Math.max(0, brandCount - 1)) / brandCount))
+                                );
+                                const clusterWidth = barW * brandCount + barGap * Math.max(0, brandCount - 1);
+                                const edgeGap = Math.max(12, Math.ceil(clusterWidth / 2) + 4);
                                 const effectiveInnerWidth = Math.max(1, innerWidth - edgeGap * 2);
                                 const groupStep = points.length <= 1
                                     ? 0
                                     : effectiveInnerWidth / Math.max(1, points.length - 1);
                                 const firstGroupX = padding.left + edgeGap;
-                                const buzzColor = "#f59e0b";
-                                if (brandLegend) brandLegend.innerHTML = "";
                                 const xAt = (index) => {{
                                     if (points.length === 1) return padding.left + innerWidth / 2;
                                     return firstGroupX + (groupStep * index);
@@ -13815,22 +15263,35 @@ def home(request: Request):
                                 const xLabelStep = Math.max(1, Math.ceil(points.length / 10));
                                 points.forEach((b, i) => {{
                                     const x = xAt(i);
-                                    const buzzY = yBuzz(b.buzz);
-                                    const buzzH = Math.max(4, innerHeight - (buzzY - padding.top));
                                     const viewY = yViews(b.views);
-                                    const buzzX = x - barW / 2;
-
-                                    const pointBuzz = Number(b?.buzz || 0) || 0;
-                                    if (pointBuzz > 0) {{
+                                    const brandBuzzMap = new Map(
+                                        (Array.isArray(b.topBrands) ? b.topBrands : []).map((brandItem) => [
+                                            String(brandItem?.name || "").trim(),
+                                            Number(brandItem?.buzz || 0) || 0
+                                        ])
+                                    );
+                                    const clusterStartX = x - clusterWidth / 2;
+                                    brandOrder.forEach((brandName, brandIndex) => {{
+                                        const brandBuzz = brandBuzzMap.get(brandName) || 0;
+                                        if (brandBuzz <= 0) return;
+                                        const barX = clusterStartX + (brandIndex * (barW + barGap));
+                                        const barY = yBuzz(brandBuzz);
+                                        const barH = Math.max(4, innerHeight - (barY - padding.top));
+                                        const barColor = brandColorByName.get(brandName) || "#f59e0b";
                                         const bar = createSvgNode("rect", {{
-                                            x: buzzX, y: buzzY, width: barW, height: buzzH + 20, 
-                                            rx: 6, fill: buzzColor, stroke: "rgba(15, 23, 42, 0.5)", "stroke-width": 1,
+                                            x: barX, y: barY, width: barW, height: barH + 20,
+                                            rx: 4, fill: barColor, stroke: "rgba(15, 23, 42, 0.5)", "stroke-width": 1,
                                             style: "transition: all 0.3s ease; clip-path: inset(0 0 20px 0);"
                                         }});
-                                        bar.addEventListener("mouseenter", (e) => showTooltip(e, b));
+                                        bar.addEventListener("mouseenter", (e) => showTooltip(e, {{
+                                            ...b,
+                                            __brandName: brandName,
+                                            __brandBuzz: brandBuzz,
+                                            __brandColor: barColor,
+                                        }}));
                                         bar.addEventListener("mouseleave", hideTooltip);
                                         svg.appendChild(bar);
-                                    }}
+                                    }});
                                     viewLinePoints.push({{ x, y: viewY, data: b }});
 
                                     if (i % xLabelStep === 0 || i === points.length - 1) {{
@@ -13861,6 +15322,42 @@ def home(request: Request):
                                         opacity: "0.95"
                                     }});
                                     svg.appendChild(linePath);
+
+                                    const findNearestPointData = (evt) => {{
+                                        if (!viewLinePoints.length) return null;
+                                        const svgRect = svg.getBoundingClientRect();
+                                        const x = (evt?.clientX || 0) - svgRect.left;
+                                        let nearest = viewLinePoints[0];
+                                        let minDist = Math.abs(x - nearest.x);
+                                        for (let i = 1; i < viewLinePoints.length; i += 1) {{
+                                            const dist = Math.abs(x - viewLinePoints[i].x);
+                                            if (dist < minDist) {{
+                                                minDist = dist;
+                                                nearest = viewLinePoints[i];
+                                            }}
+                                        }}
+                                        return nearest?.data || null;
+                                    }};
+
+                                    const lineHoverPath = createSvgNode("path", {{
+                                        d: linePathData,
+                                        fill: "none",
+                                        stroke: "transparent",
+                                        "stroke-width": 18,
+                                        "stroke-linecap": "round",
+                                        "stroke-linejoin": "round",
+                                        style: "cursor:pointer;"
+                                    }});
+                                    lineHoverPath.addEventListener("mousemove", (e) => {{
+                                        const nearestData = findNearestPointData(e);
+                                        if (nearestData) showTooltip(e, nearestData);
+                                    }});
+                                    lineHoverPath.addEventListener("mouseenter", (e) => {{
+                                        const nearestData = findNearestPointData(e);
+                                        if (nearestData) showTooltip(e, nearestData);
+                                    }});
+                                    lineHoverPath.addEventListener("mouseleave", hideTooltip);
+                                    svg.appendChild(lineHoverPath);
 
                                     viewLinePoints.forEach((pt) => {{
                                         const pointViews = Number(pt.data?.views || 0) || 0;
@@ -13997,13 +15494,20 @@ def home(request: Request):
                         currentProgressText.textContent = data.progress_text || "";
                     }}
                     if (currentLogSection && typeof data.log_html === "string") {{
-                        currentLogSection.innerHTML = data.log_html;
+                        setHtmlIfChanged(currentLogSection, data.log_html);
                     }}
                     if (currentFailedSection && typeof data.failed_html === "string") {{
-                        currentFailedSection.innerHTML = data.failed_html;
+                        setHtmlIfChanged(currentFailedSection, data.failed_html);
+                    }}
+                    const rerunFailedHeaderBtn = document.querySelector('[data-rerun-failed-btn]');
+                    if (rerunFailedHeaderBtn) {{
+                        const canRerunFailed = Number(data.failed_count || 0) > 0;
+                        rerunFailedHeaderBtn.disabled = !canRerunFailed;
+                        rerunFailedHeaderBtn.classList.toggle("opacity-50", !canRerunFailed);
+                        rerunFailedHeaderBtn.classList.toggle("pointer-events-none", !canRerunFailed);
                     }}
                     if (currentPrimaryAction && typeof data.primary_action_html === "string") {{
-                        currentPrimaryAction.innerHTML = data.primary_action_html;
+                        setHtmlIfChanged(currentPrimaryAction, data.primary_action_html);
                     }}
                     applyConfigLockState(Boolean(data.config_locked), data.config_lock_message || "");
                     // Merge server-saved per-tab column overrides into our local reference dict
@@ -14014,6 +15518,11 @@ def home(request: Request):
                         if (colConfigActiveTab && !hadConfig && serverColConfigByTab[colConfigActiveTab]) {{
                             writeColConfigInputs(serverColConfigByTab[colConfigActiveTab]);
                         }}
+                    }}
+                    if (Array.isArray(data.selected_tabs) && selectedSheetTabs.size === 0) {{
+                        // Only hydrate once when local UI has no selection yet.
+                        // Avoid overriding user's in-progress tab selection from background polling.
+                        applySelectedTabsState(data.selected_tabs);
                     }}
                     applyTabProgressState(data);
                 }};
@@ -14075,7 +15584,6 @@ def home(request: Request):
                         if (!response.ok) return;
                         const data = await response.json();
                         applyStatusState(data);
-                        applyTabProgressState(data);
                         applyActiveSheetMeta(data);
                         applyColumnConfigState(data);
                         applyScheduleConfigState(data);
@@ -14286,6 +15794,13 @@ def home(request: Request):
                     }}
                 }};
 
+                const closeEditMetadataModal = () => {{
+                    const modal = document.getElementById("edit-metadata-modal");
+                    if (!modal) return;
+                    modal.classList.add("hidden");
+                    modal.classList.remove("flex");
+                }};
+
                 const editMetaForm = document.getElementById("edit-metadata-form");
                 if (editMetaForm) {{
                     editMetaForm.addEventListener("submit", async (e) => {{
@@ -14293,6 +15808,8 @@ def home(request: Request):
                         const formData = new FormData(editMetaForm);
                         const p = Object.fromEntries(formData.entries());
                         const modal = document.getElementById("edit-metadata-modal");
+                        const submitBtn = editMetaForm.querySelector('button[type="submit"]');
+                        if (submitBtn) submitBtn.disabled = true;
                         
                         try {{
                             const res = await fetch("/api/update-sheet-metadata", {{
@@ -14303,27 +15820,44 @@ def home(request: Request):
                                 }},
                                 body: JSON.stringify(p)
                             }});
-                            const data = await res.json();
-                            if (data?.ok) {{
-                                if (modal) {{
-                                    modal.classList.add("hidden");
-                                    modal.classList.remove("flex");
-                                }}
-                                showNotice(data.message || "Cập nhật thành công", "success");
+                            let data = null;
+                            try {{
+                                data = await res.json();
+                            }} catch (_) {{
+                                data = null;
+                            }}
+                            const isSuccess = Boolean(data?.ok || (res?.ok && data?.ok !== false));
+                            if (isSuccess) {{
+                                closeEditMetadataModal();
+                                showNotice(data?.message || "Cập nhật thành công", "success");
+                                let hasPatchedUi = false;
                                 if (typeof data.overview_html === "string") {{
                                     replaceOverviewPanelHtml(data.overview_html);
+                                    hasPatchedUi = true;
                                 }}
                                 if (typeof data.posts_html === "string") {{
                                     replacePostsPanelHtml(data.posts_html);
+                                    hasPatchedUi = true;
                                 }}
                                 if (typeof data.campaign_html === "string") {{
                                     replaceCampaignPanelHtml(data.campaign_html);
+                                    hasPatchedUi = true;
                                 }}
+                                if (!hasPatchedUi || data?.needs_refresh) {{
+                                    try {{
+                                        refreshDashboard();
+                                    }} catch (_) {{}}
+                                }}
+                                // Safety close in case DOM update keeps modal state stale
+                                setTimeout(() => closeEditMetadataModal(), 0);
+                                setTimeout(() => closeEditMetadataModal(), 120);
                             }} else {{
                                 showNotice(data?.message || "Lỗi cập nhật", "error");
                             }}
                         }} catch (err) {{
                             showNotice("Lỗi kết nối server", "error");
+                        }} finally {{
+                            if (submitBtn) submitBtn.disabled = false;
                         }}
                     }});
                 }}
@@ -14422,6 +15956,68 @@ def home(request: Request):
                             modal.classList.add("flex");
                         }});
                     }});
+
+                    document.querySelectorAll("[data-posts-sheet-action='delete-sheet']").forEach((button) => {{
+                        button.addEventListener("click", async (event) => {{
+                            event.preventDefault();
+                            event.stopPropagation();
+                            closePostsSheetActionMenus();
+                            closePostsColumnMenus();
+
+                            const sheetId = button.dataset.postsSheetId || "";
+                            const sheetName = button.dataset.postsSheetName || "";
+                            if (!sheetId || !sheetName) {{
+                                showNotice("Thiếu thông tin sheet để xóa.", "error");
+                                return;
+                            }}
+                            const confirmed = window.confirm(`Xóa sheet "${{sheetName}}" khỏi danh sách đã lưu?`);
+                            if (!confirmed) return;
+
+                            try {{
+                                const response = await fetch("/api/delete-saved-sheet", {{
+                                    method: "POST",
+                                    headers: {{
+                                        "Content-Type": "application/json",
+                                        "X-Requested-With": "fetch",
+                                    }},
+                                    body: JSON.stringify({{
+                                        sheet_id: sheetId,
+                                        sheet_name: sheetName,
+                                    }}),
+                                }});
+                                const data = await response.json();
+                                if (data?.ok) {{
+                                    showNotice(data.message || "Đã xóa sheet.", "success");
+                                    if (typeof data.overview_html === "string") {{
+                                        replaceOverviewPanelHtml(data.overview_html);
+                                    }}
+                                    if (typeof data.posts_html === "string") {{
+                                        replacePostsPanelHtml(data.posts_html);
+                                    }}
+                                    if (typeof data.campaign_html === "string") {{
+                                        replaceCampaignPanelHtml(data.campaign_html);
+                                    }}
+                                }} else {{
+                                    showNotice(data?.message || "Không xóa được sheet.", "error");
+                                }}
+                            }} catch (_) {{
+                                showNotice("Lỗi kết nối khi xóa sheet.", "error");
+                            }}
+                        }});
+                    }});
+
+                    const editMetaModal = document.getElementById("edit-metadata-modal");
+                    if (editMetaModal && !editMetaModal.dataset.boundClose) {{
+                        editMetaModal.addEventListener("click", (event) => {{
+                            if (event.target === editMetaModal) {{
+                                closeEditMetadataModal();
+                            }}
+                        }});
+                        document.addEventListener("keydown", (event) => {{
+                            if (event.key === "Escape") closeEditMetadataModal();
+                        }});
+                        editMetaModal.dataset.boundClose = "1";
+                    }}
 
                     document.querySelectorAll("[data-posts-sheet-action-menu]").forEach((menu) => {{
                         menu.addEventListener("click", (event) => {{
@@ -14608,6 +16204,7 @@ def home(request: Request):
                     currentPostsSection.innerHTML = nextPostsSection.innerHTML;
                     console.log("[DASH] Posts panel updated. Initializing events...");
                     syncPostsDomRefs();
+                    compactPostsMetricCells();
                     initializePostsPanel();
                 }};
 
@@ -14754,6 +16351,9 @@ def home(request: Request):
                     if (cleaned === "chien-dich" || cleaned === "nhan-vien") {{
                         return "cai-dat";
                     }}
+                    if (cleaned === "theo-doi-lan-chay") {{
+                        return "lich-tu-dong";
+                    }}
                     return cleaned;
                 }};
 
@@ -14761,13 +16361,18 @@ def home(request: Request):
                     const updateHistory = options.updateHistory !== false;
                     const historyMode = options.historyMode || "replace";
                     const availableIds = dashboardSections.map((section) => section.dataset.dashboardSection);
-                    const targetId = availableIds.includes(sectionId) ? sectionId : "tong-quan";
+                    const normalizedId = sectionId === "theo-doi-lan-chay" ? "lich-tu-dong" : sectionId;
+                    const targetId = availableIds.includes(normalizedId) ? normalizedId : "tong-quan";
 
                     sidebarLinks.forEach((link) => {{
                         link.classList.toggle("is-active", link.dataset.navLink === targetId);
                     }});
                     dashboardSections.forEach((section) => {{
-                        section.classList.toggle("is-active", section.dataset.dashboardSection === targetId);
+                        const sectionId = section.dataset.dashboardSection;
+                        const shouldShow = targetId === "lich-tu-dong"
+                            ? (sectionId === "lich-tu-dong" || sectionId === "theo-doi-lan-chay")
+                            : (sectionId === targetId);
+                        section.classList.toggle("is-active", shouldShow);
                     }});
 
                     if (updateHistory) {{
@@ -14799,14 +16404,27 @@ def home(request: Request):
                             const el = document.getElementById("cau-hinh");
                             if (el) el.innerHTML = html;
                             window.bindSheetTabLookupControls?.();
+                            window.bindSetColumnsFormInline?.();
                         }} }},
                         {{ id: "schedule", url: "/api/dashboard/schedule", replacer: (html) => {{
                             const el = document.getElementById("lich-tu-dong");
                             if (el) el.innerHTML = html;
                         }} }}
                     ];
+                    const panelSectionIdMap = {{
+                        overview: "tong-quan",
+                        posts: "bai-dang",
+                        config: "cau-hinh",
+                        schedule: "lich-tu-dong",
+                    }};
+                    const activePanelIdNow = initialDashboardSection || getPanelIdFromPath(window.location.pathname);
+                    const prioritizedPanels = [...panels].sort((a, b) => {{
+                        const aActive = panelSectionIdMap[a.id] === activePanelIdNow ? 1 : 0;
+                        const bActive = panelSectionIdMap[b.id] === activePanelIdNow ? 1 : 0;
+                        return bActive - aActive;
+                    }});
 
-                    panels.forEach(async (panel) => {{
+                    prioritizedPanels.forEach((panel, panelIndex) => {{
                         let attempts = 0;
                         const fetchData = async () => {{
                             try {{
@@ -14817,11 +16435,12 @@ def home(request: Request):
                                 
                                 if (data.status === "processing") {{
                                     attempts++;
-                                    if (attempts < 15) {{ // Retry for up to ~1 minute
-                                        console.log(`[DASH] ${{panel.id}} is processing, retrying in 5s...`);
-                                        setTimeout(fetchData, 5000);
+                                    if (attempts < 45) {{
+                                        const retryDelay = panel.id === "config" ? 700 : (panel.id === "overview" ? 1000 : 1400);
+                                        console.log(`[DASH] ${{panel.id}} is processing, retrying in ${{retryDelay}}ms...`);
+                                        setTimeout(fetchData, retryDelay);
                                     }} else {{
-                                        console.warn(`[DASH] ${{panel.id}} timed out after 15 attempts.`);
+                                        console.warn(`[DASH] ${{panel.id}} timed out after 45 attempts.`);
                                     }}
                                     return;
                                 }}
@@ -14834,7 +16453,8 @@ def home(request: Request):
                                 console.error(`[DASH] ${{panel.id}} load error:`, e);
                             }}
                         }};
-                        fetchData();
+                        const startDelay = panelIndex === 0 ? 0 : Math.min(2200, panelIndex * 450);
+                        setTimeout(fetchData, startDelay);
                     }});
                 }};
 
@@ -14849,6 +16469,7 @@ def home(request: Request):
                 }}
 
                 try {{
+                    compactPostsMetricCells();
                     initializePostsPanel();
                 }} catch (e) {{
                     console.warn("[DASH] initializePostsPanel failed on skeleton:", e);
@@ -14862,7 +16483,7 @@ def home(request: Request):
 
                 // 3. Start polling
                 refreshDashboard();
-                setInterval(refreshDashboard, 1200);
+                setInterval(refreshDashboard, 2200);
             }});
         </script>
     </head>
@@ -14874,7 +16495,7 @@ def home(request: Request):
                         <div class="sidebar-brand-title">Social Monitor</div>
                     </div>
                     <div class="sidebar-brand-actions">
-                        <div class="sidebar-pulse"><i class="fa-solid fa-compass-drafting"></i></div>
+                        <div class="sidebar-pulse">{mascot_html}</div>
                         <button type="button" id="sidebar-collapse-toggle" class="sidebar-collapse-btn" title="Thu gọn menu" aria-label="Thu gọn menu">
                             <span id="sidebar-collapse-icon"><i class="fa-solid fa-angles-left"></i></span>
                         </button>
@@ -14882,10 +16503,9 @@ def home(request: Request):
                 </div>
                 <nav class="sidebar-nav">
                     <a href="/tong-quan" class="sidebar-link is-active" data-nav-link="tong-quan" title="Tổng quan"><span class="sidebar-link-icon"><i class="fa-solid fa-gauge-high"></i></span><span class="sidebar-link-label">Tổng quan</span></a>
-                    <a href="/cau-hinh" class="sidebar-link" data-nav-link="cau-hinh" title="Cấu hình"><span class="sidebar-link-icon"><i class="fa-solid fa-sliders"></i></span><span class="sidebar-link-label">Cấu hình</span></a>
+                    <a href="/cau-hinh" class="sidebar-link" data-nav-link="cau-hinh" title="Chuẩn bị"><span class="sidebar-link-icon"><i class="fa-solid fa-sliders"></i></span><span class="sidebar-link-label">Chuẩn bị</span></a>
                     <a href="/bai-dang" class="sidebar-link" data-nav-link="bai-dang" title="Bài đăng"><span class="sidebar-link-icon"><i class="fa-regular fa-newspaper"></i></span><span class="sidebar-link-label">Bài đăng</span></a>
                     <a href="/lich-tu-dong" class="sidebar-link" data-nav-link="lich-tu-dong" title="Lịch tự động"><span class="sidebar-link-icon"><i class="fa-regular fa-calendar-days"></i></span><span class="sidebar-link-label">Lịch tự động</span></a>
-                    <a href="/theo-doi-lan-chay" class="sidebar-link" data-nav-link="theo-doi-lan-chay" title="Theo dõi lần chạy"><span class="sidebar-link-icon"><i class="fa-solid fa-wave-square"></i></span><span class="sidebar-link-label">Theo dõi lần chạy</span></a>
                     <a href="/cai-dat" class="sidebar-link" data-nav-link="cai-dat" title="Cài đặt"><span class="sidebar-link-icon"><i class="fa-solid fa-gear"></i></span><span class="sidebar-link-label">Cài đặt</span></a>
                 </nav>
             </aside>
@@ -15019,50 +16639,6 @@ def home(request: Request):
                                     </div>
                                     <div id="schedule-track-detail-body" class="grid grid-cols-1 2xl:grid-cols-[minmax(0,1fr),340px] gap-4 items-start {'hidden' if not schedule_tracking['has_active_entry'] else ''}">
                                         <div>
-                                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-2">
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Lần kế tiếp</div>
-                                                    <div id="schedule-track-next" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["next_run_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Bắt đầu gần nhất</div>
-                                                    <div id="schedule-track-started" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_started_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Kết thúc gần nhất</div>
-                                                    <div id="schedule-track-finished" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_finished_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thời lượng</div>
-                                                    <div id="schedule-track-duration" class="mt-2 text-sm font-black text-cyan-200">{html.escape(schedule_tracking["last_duration_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Đang chạy từ</div>
-                                                    <div id="schedule-track-running" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["is_running_text"])}</div>
-                                                </div>
-                                            </div>
-                                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-2 mt-2">
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Trạng thái</div>
-                                                    <div id="schedule-track-status" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_status_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Nguồn chạy</div>
-                                                    <div id="schedule-track-source" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_source_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Tab đã chạy</div>
-                                                    <div id="schedule-track-sheet" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_sheet_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Link đã quét</div>
-                                                    <div id="schedule-track-processed" class="mt-2 text-sm font-black text-slate-100">{html.escape(schedule_tracking["last_processed_text"])}</div>
-                                                </div>
-                                                <div class="bg-slate-900/60 rounded-xl px-3 py-2 border border-white/8">
-                                                    <div class="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-bold">Thành công / trượt</div>
-                                                    <div class="mt-2 text-sm font-black text-slate-100"><span id="schedule-track-success">{html.escape(schedule_tracking["last_success_text"])}</span> / <span id="schedule-track-failed">{html.escape(schedule_tracking["last_failed_text"])}</span></div>
-                                                </div>
-                                            </div>
                                             <div class="mt-3">
                                                 <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 font-black mb-2">Lịch sử gần nhất</div>
                                                 <div id="schedule-track-history" class="grid gap-2">
@@ -15083,6 +16659,7 @@ def home(request: Request):
                             </div>
                         </div>
                     </section>
+
                 </div>
 
                 <div id="edit-metadata-modal" class="fixed inset-0 z-[100] hidden items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
@@ -15111,7 +16688,7 @@ def home(request: Request):
                             </div>
 
                             <div class="flex gap-3 pt-4">
-                                <button type="button" onclick="document.getElementById('edit-metadata-modal').classList.add('hidden'); document.getElementById('edit-metadata-modal').classList.remove('flex');" class="flex-1 py-4 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-2xl font-bold transition-all">Hủy</button>
+                                <button type="button" onclick="(function(){{const m=document.getElementById('edit-metadata-modal'); if(m){{m.classList.add('hidden'); m.classList.remove('flex');}}}})()" class="flex-1 py-4 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-2xl font-bold transition-all">Hủy</button>
                                 <button type="submit" class="flex-[2] py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black shadow-lg shadow-emerald-900/20 transition-all">Lưu thay đổi</button>
                             </div>
                         </form>
