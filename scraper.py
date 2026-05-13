@@ -27,7 +27,19 @@ import uvicorn
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats, reset_stale_selenium_sessions
+from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
+try:
+    from social_selenium import reset_stale_selenium_sessions
+except ImportError:
+    # Backward compatibility: allow app boot even when deploy still uses old social_selenium.py
+    # that does not export reset_stale_selenium_sessions yet.
+    def reset_stale_selenium_sessions(logger=None):
+        if callable(logger):
+            try:
+                logger("[LOCAL-STABLE] social_selenium chưa có reset_stale_selenium_sessions, bỏ qua reset stale session.")
+            except Exception:
+                pass
+        return False, "missing_reset_function"
 
 
 def _configure_process_timezone() -> str:
@@ -2144,6 +2156,12 @@ def send_otp_email(target_email: str, otp_code: str, settings=None):
                 server.login(active_user, active_password)
             server.send_message(msg)
 
+    def _is_network_unreachable_error(error: Exception) -> bool:
+        text = str(error).lower()
+        if isinstance(error, OSError) and getattr(error, "errno", None) == 101:
+            return True
+        return "network is unreachable" in text or "no route to host" in text
+
     try:
         _send_with_mail_config(mail)
         return
@@ -2151,12 +2169,28 @@ def send_otp_email(target_email: str, otp_code: str, settings=None):
         error_text = str(exc).lower()
         current_host = str(mail.get("smtp_host", "") or "").strip().lower()
         is_host_resolution_error = isinstance(exc, socket.gaierror) or "getaddrinfo failed" in error_text
-        if not (is_host_resolution_error and gmail_fallback_enabled and current_host != "smtp.gmail.com"):
-            raise
-        fallback_mail = dict(mail)
-        fallback_mail.update(gmail_mail_fallback)
-        _send_with_mail_config(fallback_mail)
-        return
+
+        # DNS lỗi: fallback về Gmail config nếu config hiện tại không phải Gmail.
+        if is_host_resolution_error and gmail_fallback_enabled and current_host != "smtp.gmail.com":
+            fallback_mail = dict(mail)
+            fallback_mail.update(gmail_mail_fallback)
+            _send_with_mail_config(fallback_mail)
+            return
+
+        # Lỗi network unreachable khi dùng Gmail: thử đổi transport 587/TLS <-> 465/SSL.
+        if _is_network_unreachable_error(exc) and current_host == "smtp.gmail.com":
+            alt_mail = dict(mail)
+            if int(alt_mail.get("smtp_port", 587) or 587) == 587:
+                alt_mail["smtp_port"] = 465
+                alt_mail["use_ssl"] = True
+                alt_mail["use_tls"] = False
+            else:
+                alt_mail["smtp_port"] = 587
+                alt_mail["use_ssl"] = False
+                alt_mail["use_tls"] = True
+            _send_with_mail_config(alt_mail)
+            return
+        raise
 
 def describe_smtp_error(exc: Exception) -> str:
     if isinstance(exc, smtplib.SMTPAuthenticationError):
@@ -2168,6 +2202,11 @@ def describe_smtp_error(exc: Exception) -> str:
     if isinstance(exc, socket.gaierror) or "getaddrinfo failed" in str(exc).lower():
         return (
             "Không kết nối được SMTP host. Nếu bạn vừa đổi cấu hình mail trong code thì hãy restart app rồi thử lại."
+        )
+    if (isinstance(exc, OSError) and getattr(exc, "errno", None) == 101) or "network is unreachable" in str(exc).lower():
+        return (
+            "Server đang không đi ra được mạng SMTP (Errno 101). "
+            "Kiểm tra outbound network của môi trường deploy và thử lại."
         )
     return str(exc)
 
