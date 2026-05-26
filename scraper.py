@@ -197,6 +197,9 @@ GMAIL_SMTP_APP_PASSWORD = "btqtzotpeyhnzzac"
 GMAIL_SMTP_FROM_EMAIL = "fanscom.ecom@gmail.com"
 YOUTUBE_API_KEY = "AIzaSyAbMDEzmIVpsVTASYhTaXI6oC7BudQWzlU"
 ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.0"))
+POSTS_TAB_BUILD_STAGGER_SECONDS = max(0.0, float(os.getenv("POSTS_TAB_BUILD_STAGGER_SECONDS", "0.0")))
+POSTS_LAYOUT_SAMPLE_ROWS = max(10, int(os.getenv("POSTS_LAYOUT_SAMPLE_ROWS", "24")))
+POSTS_LAYOUT_USE_CACHE = str(os.getenv("POSTS_LAYOUT_USE_CACHE", "true")).strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_DRIVER_FAIL_FAST = str(os.getenv("SELENIUM_LOCAL_FAIL_FAST", "1")).strip().lower() not in {"0", "false", "no", "off"}
 try:
     START_ROW = max(2, int(os.getenv("START_ROW", "2")))
@@ -1870,8 +1873,21 @@ def get_policy_user(email: str, settings=None):
     return None
 
 def is_mail_configured(settings=None):
-    mail = (settings or get_auth_settings()).get("mail", {})
-    return bool(str(mail.get("smtp_host", "") or "").strip() and str(mail.get("smtp_from_email", "") or "").strip())
+    auth_settings = settings or get_auth_settings()
+    mail = auth_settings.get("mail", {})
+    smtp_ready = bool(str(mail.get("smtp_host", "") or "").strip() and str(mail.get("smtp_from_email", "") or "").strip())
+    resend_api_key = str(
+        os.getenv("AUTH_RESEND_API_KEY", "")
+        or os.getenv("RESEND_API_KEY", "")
+        or ""
+    ).strip()
+    resend_from_email = normalize_email_address(
+        os.getenv("AUTH_RESEND_FROM_EMAIL", "")
+        or os.getenv("RESEND_FROM_EMAIL", "")
+        or mail.get("smtp_from_email", "")
+    )
+    resend_ready = bool(resend_api_key and resend_from_email)
+    return smtp_ready or resend_ready
 
 def encode_token_payload(payload: dict) -> str:
     raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -2094,18 +2110,98 @@ def build_otp_email_html(brand_name: str, target_email: str, otp_code: str, ttl_
 def send_otp_email(target_email: str, otp_code: str, settings=None):
     auth_settings = settings or get_auth_settings()
     mail = dict(auth_settings.get("mail", {}) or {})
+    brand_name = str(mail.get("smtp_from_name", "") or "Social Monitor").strip() or "Social Monitor"
+    ttl_seconds = int(auth_settings.get("otp_ttl_seconds", 300))
+    ttl_minutes = max(1, ttl_seconds // 60)
+
+    def _get_resend_config():
+        api_key = str(
+            os.getenv("AUTH_RESEND_API_KEY", "")
+            or os.getenv("RESEND_API_KEY", "")
+            or ""
+        ).strip()
+        from_email_value = normalize_email_address(
+            os.getenv("AUTH_RESEND_FROM_EMAIL", "")
+            or os.getenv("RESEND_FROM_EMAIL", "")
+            or mail.get("smtp_from_email", "")
+        )
+        from_name_value = str(
+            os.getenv("AUTH_RESEND_FROM_NAME", "")
+            or os.getenv("RESEND_FROM_NAME", "")
+            or brand_name
+        ).strip() or brand_name
+        reply_to_value = normalize_email_address(
+            os.getenv("AUTH_RESEND_REPLY_TO", "")
+            or os.getenv("RESEND_REPLY_TO", "")
+        )
+        return {
+            "api_key": api_key,
+            "from_email": from_email_value,
+            "from_name": from_name_value,
+            "reply_to": reply_to_value,
+        }
+
+    def _is_resend_ready() -> bool:
+        cfg = _get_resend_config()
+        return bool(cfg["api_key"] and cfg["from_email"])
+
+    def _send_with_resend_api():
+        cfg = _get_resend_config()
+        if not cfg["api_key"] or not cfg["from_email"]:
+            raise ValueError("Thiếu cấu hình Resend API (AUTH_RESEND_API_KEY/AUTH_RESEND_FROM_EMAIL).")
+
+        subject = f"Mã OTP đăng nhập {brand_name}"
+        text_body = build_otp_email_text(brand_name, target_email, otp_code, ttl_minutes)
+        html_body = build_otp_email_html(brand_name, target_email, otp_code, ttl_minutes)
+        payload = {
+            "from": f'{cfg["from_name"]} <{cfg["from_email"]}>',
+            "to": [normalize_email_address(target_email)],
+            "subject": subject,
+            "text": text_body,
+            "html": html_body,
+        }
+        if cfg["reply_to"]:
+            payload["reply_to"] = cfg["reply_to"]
+        try:
+            response = requests.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f'Bearer {cfg["api_key"]}',
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=20,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Gọi Resend API thất bại: {str(exc)}") from exc
+        if int(response.status_code) >= 400:
+            detail = response.text
+            try:
+                parsed = response.json()
+                detail = str(parsed.get("message") or parsed.get("error") or detail)
+            except Exception:
+                pass
+            raise RuntimeError(f"Resend API trả về lỗi {response.status_code}: {detail}")
+
+    preferred_mail_provider = str(os.getenv("AUTH_MAIL_PROVIDER", "") or "").strip().lower()
+    if preferred_mail_provider in {"resend", "api"}:
+        if _is_resend_ready():
+            _send_with_resend_api()
+            return
+        raise ValueError("AUTH_MAIL_PROVIDER=resend nhưng thiếu AUTH_RESEND_API_KEY hoặc AUTH_RESEND_FROM_EMAIL.")
+
     host = str(mail.get("smtp_host", "") or "").strip()
     from_email = normalize_email_address(mail.get("smtp_from_email", ""))
     if not host or not from_email:
-        raise ValueError("Chưa cấu hình mail gửi OTP. Admin cần nhập SMTP trước.")
+        if _is_resend_ready():
+            _send_with_resend_api()
+            return
+        raise ValueError("Chưa cấu hình mail gửi OTP. Admin cần nhập SMTP hoặc cấu hình Resend API.")
 
-    brand_name = str(mail.get("smtp_from_name", "") or "Social Monitor").strip() or "Social Monitor"
     msg = EmailMessage()
     msg["Subject"] = f"Mã OTP đăng nhập {brand_name}"
     msg["From"] = f"{brand_name} <{from_email}>"
     msg["To"] = normalize_email_address(target_email)
-    ttl_seconds = int(auth_settings.get("otp_ttl_seconds", 300))
-    ttl_minutes = max(1, ttl_seconds // 60)
     msg.set_content(build_otp_email_text(brand_name, target_email, otp_code, ttl_minutes))
     msg.add_alternative(build_otp_email_html(brand_name, target_email, otp_code, ttl_minutes), subtype="html")
 
@@ -2188,7 +2284,16 @@ def send_otp_email(target_email: str, otp_code: str, settings=None):
                 alt_mail["smtp_port"] = 587
                 alt_mail["use_ssl"] = False
                 alt_mail["use_tls"] = True
-            _send_with_mail_config(alt_mail)
+            try:
+                _send_with_mail_config(alt_mail)
+                return
+            except Exception:
+                # Continue to Resend fallback if configured.
+                pass
+
+        # SMTP bị chặn ở môi trường deploy: fallback qua HTTPS API (Resend) nếu có cấu hình.
+        if _is_network_unreachable_error(exc) and _is_resend_ready():
+            _send_with_resend_api()
             return
         raise
 
@@ -2206,7 +2311,8 @@ def describe_smtp_error(exc: Exception) -> str:
     if (isinstance(exc, OSError) and getattr(exc, "errno", None) == 101) or "network is unreachable" in str(exc).lower():
         return (
             "Server đang không đi ra được mạng SMTP (Errno 101). "
-            "Kiểm tra outbound network của môi trường deploy và thử lại."
+            "Nếu deploy trên Render Free, hãy chuyển sang Resend API qua HTTPS "
+            "(set AUTH_MAIL_PROVIDER=resend, AUTH_RESEND_API_KEY, AUTH_RESEND_FROM_EMAIL)."
         )
     return str(exc)
 
@@ -2535,7 +2641,7 @@ def build_admin_panel_html(current_user):
     settings = get_auth_settings()
     policy_text = build_access_policy_text(settings.get("users", []))
     mail = settings.get("mail", {})
-    mail_status = "SMTP đã sẵn sàng gửi OTP." if is_mail_configured(settings) else "Chưa cấu hình mail gửi OTP."
+    mail_status = "Mail OTP đã sẵn sàng (SMTP/API)." if is_mail_configured(settings) else "Chưa cấu hình mail gửi OTP."
     mail_status_class = "text-emerald-300" if is_mail_configured(settings) else "text-amber-300"
     return f"""
         <div class="bg-black/20 rounded-3xl p-6 border border-white/5 mt-6">
@@ -4171,6 +4277,15 @@ def detect_platform(url):
     if "instagram.com" in url_lower: return "Instagram"
     return "Khác"
 
+
+def compute_buzz_value(platform: str, share: int, comment: int) -> int:
+    platform_key = str(platform or "").strip().lower()
+    if platform_key == "tiktok":
+        return int(comment or 0)
+    if platform_key == "facebook":
+        return int(share or 0) + int(comment or 0)
+    return int(share or 0) + int(comment or 0)
+
 def extract_scannable_url(raw_value: str) -> str:
     value = str(raw_value or "").strip()
     if not value:
@@ -4932,7 +5047,7 @@ def collect_posts_dataset_for_worksheet(
     error = ""
 
     try:
-        layout = detect_sheet_layout(ws, sample_rows=40, use_cache=False)
+        layout = detect_sheet_layout(ws, sample_rows=POSTS_LAYOUT_SAMPLE_ROWS, use_cache=POSTS_LAYOUT_USE_CACHE)
         col_map = apply_column_overrides_for_tab(layout.get("columns"), sheet_title, state=runtime_state)
         records, header_row, headers = get_sheet_records(ws, layout, include_row_values=True)
         link_header = resolve_header_from_column(headers, col_map.get("link"))
@@ -5005,7 +5120,7 @@ def collect_posts_dataset_for_worksheet(
             read_record_value_from_column(record, col_map.get("buzz"))
             or first_nonempty_value(normalized_record, "buzz", "buzzcount", "totalbuzz", "tongbuzz")
         )
-        buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else (share + comment)
+        buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else compute_buzz_value(platform, share, comment)
         plan = str(first_nonempty_value(normalized_record, "plan", "nam", "period", "fiscalyear") or "-").strip()
         line_product = str(first_nonempty_value(normalized_record, "line_product", "lineproduct", "sanpham", "nhanhang", "line", "product") or "-").strip()
         kol_tier = str(first_nonempty_value(normalized_record, "kol_tier", "koltier", "tier", "phanloaikol", "kolevel") or "-").strip()
@@ -5210,12 +5325,12 @@ def format_dashboard_date_text(value, include_time: bool = False) -> str:
 def format_air_date_text(value) -> str:
     parsed = parse_dashboard_date(value)
     if parsed:
-        return f"{parsed.day}-{parsed.month}"
+        return f"{parsed.day}/{parsed.month}"
     raw = str(value or "").strip()
     token_match = re.fullmatch(r"([01]?\d)\s*[-/.]\s*([0-3]?\d)", raw)
     if token_match:
         month_token, day_token = token_match.groups()
-        return f"{int(day_token)}-{int(month_token)}"
+        return f"{int(day_token)}/{int(month_token)}"
     return raw
 
 def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule_text: str, state=None):
@@ -5296,7 +5411,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                 read_record_value_from_column(record, col_map.get("buzz"))
                 or first_nonempty_value(normalized_record, "buzz", "buzzcount", "totalbuzz", "tongbuzz")
             )
-            buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else share + comment
+            buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else compute_buzz_value(platform, share, comment)
             air_date_value = resolve_dashboard_air_date_value(record, normalized_record, col_map)
             aired_at = parse_dashboard_date(air_date_value)
 
@@ -5761,10 +5876,9 @@ def build_posts_panel_html(sheet=None, state=None):
         entry_slug = f"{build_dom_slug(entry_sheet_name, 'sheet')}-{entry_index}"
         
         try:
-            # Check if this sheet is already in SHEET_DATA_CACHE (handled inside get_sheet_records)
-            # but we still want to stagger the calls to get_worksheet/get_sheet_records
-            if entry_index > 0:
-                time.sleep(0.3)
+            # Optional stagger between sheets to reduce burst traffic to Google APIs.
+            if entry_index > 0 and POSTS_TAB_BUILD_STAGGER_SECONDS > 0:
+                time.sleep(POSTS_TAB_BUILD_STAGGER_SECONDS)
                 
             ws = sheet if (
                 sheet is not None
@@ -6148,8 +6262,12 @@ def build_row_updates(col_map, platform, now, stats):
         if stat_key not in stats or stats.get(stat_key) is None:
             continue
         row_updates.append((field, col_map[field], int(stats.get(stat_key, 0))))
-    if col_map.get("buzz") and ("s" in stats or "c" in stats):
-        buzz_value = int(stats.get("s") or 0) + int(stats.get("c") or 0)
+    has_share_metric = "s" in stats and stats.get("s") is not None
+    has_comment_metric = "c" in stats and stats.get("c") is not None
+    platform_key = str(platform or "").strip().lower()
+    should_write_buzz = has_comment_metric if platform_key == "tiktok" else (has_share_metric or has_comment_metric)
+    if col_map.get("buzz") and should_write_buzz:
+        buzz_value = compute_buzz_value(platform, int(stats.get("s") or 0), int(stats.get("c") or 0))
         row_updates.append(("buzz", col_map["buzz"], buzz_value))
     return row_updates
 
@@ -6937,6 +7055,12 @@ def start_task(
     add_log("► Nhận lệnh Bắt đầu...", runtime_state)
     parsed_tab_list = [t.strip() for t in (sheet_names or "").split(",") if t.strip()] if sheet_names else []
     is_multi_tab_start = len(parsed_tab_list) > 1
+    single_tab_for_start = ""
+    if not is_multi_tab_start:
+        if len(parsed_tab_list) == 1:
+            single_tab_for_start = parsed_tab_list[0]
+        else:
+            single_tab_for_start = (sheet_name or runtime_state.get("active_sheet_name") or "").strip()
     if any(val is not None for val in (date, air_date, link, view, like, share, comment, buzz, save)):
         try:
             parsed_columns = parse_column_override_candidates(
@@ -6956,6 +7080,10 @@ def start_task(
                 add_log("Bỏ qua cập nhật cột global vì đang chạy nhiều tab; sẽ dùng cấu hình riêng từng tab/AUTO theo từng tab.", runtime_state)
             else:
                 runtime_state["column_overrides"].update(parsed_columns)
+                if single_tab_for_start:
+                    # Keep single-tab Start behavior consistent with Set Columns:
+                    # an empty Buzz here must also clear Buzz for this tab.
+                    runtime_state.setdefault("column_overrides_by_tab", {})[single_tab_for_start] = dict(parsed_columns)
         except ValueError as exc:
             return build_ui_json_response(str(exc), level="error", ok=False, state=runtime_state)
     if start_row is not None:
