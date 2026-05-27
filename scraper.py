@@ -184,7 +184,8 @@ DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS = max(1, int(os.getenv("DASHBOARD_CACHE_SA
 DASHBOARD_CACHE_LAST_SAVE_AT = 0.0
 LINK_RESOLVE_CACHE = {}  # {raw_url: {"final_url": "...", "updated_at": iso}}
 LINK_RESOLVE_CACHE_TTL_SECONDS = 1800
-DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 2
+# Bump khi thay đổi markup dashboard để invalidate cache HTML cũ (overview/posts/config/schedule).
+DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 5
 MAX_RUNTIME_LOG_LINES = max(100, int(os.getenv("MAX_RUNTIME_LOG_LINES", "400")))
 MAX_RUNTIME_LOG_RENDER_LINES = max(50, int(os.getenv("MAX_RUNTIME_LOG_RENDER_LINES", "160")))
 SHEET_TABS_REQUEST_LIMITER = {}  # {sheet_id: last_request_time}
@@ -710,10 +711,9 @@ def get_dashboard_cached_section(user_email: str, section: str):
     entry = cache_map.get(f"{user_email}:{section}") if isinstance(cache_map, dict) else None
     if not isinstance(entry, dict):
         return "", False
-    if section == "posts":
-        cached_format_version = int(entry.get("format_version", 0) or 0)
-        if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION:
-            return "", False
+    cached_format_version = int(entry.get("format_version", 0) or 0)
+    if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION:
+        return "", False
     html_content = entry.get("html", "")
     updated_raw = entry.get("updated_at", "")
     try:
@@ -770,9 +770,11 @@ def cache_dashboard_sections_for_user(user_email: str, sections: dict):
     for payload_key, cache_key in section_key_by_payload.items():
         content = sections.get(payload_key)
         if isinstance(content, str) and content.strip():
-            entry_payload = {"updated_at": now_str, "html": content}
-            if cache_key == "posts":
-                entry_payload["format_version"] = DASHBOARD_POSTS_CACHE_FORMAT_VERSION
+            entry_payload = {
+                "updated_at": now_str,
+                "html": content,
+                "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
+            }
             pending_updates[f"{user_email}:{cache_key}"] = entry_payload
     if not pending_updates:
         return
@@ -796,7 +798,7 @@ def background_refresh_dashboard_data(user_email, section_type):
         active_ws = None
         if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
             try:
-                if section_type in {"overview", "posts"}:
+                if section_type == "overview":
                     time.sleep(0.2)
                 active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
             except Exception:
@@ -807,10 +809,18 @@ def background_refresh_dashboard_data(user_email, section_type):
         
         if section_type == "overview":
             html_content = build_overview_panel_for_state(runtime_state, sheet=active_ws)
-            full_cache[f"{user_email}:overview"] = {"updated_at": now_str, "html": html_content}
+            full_cache[f"{user_email}:overview"] = {
+                "updated_at": now_str,
+                "html": html_content,
+                "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
+            }
         elif section_type == "posts":
             html_content = build_posts_panel_html(active_ws, runtime_state)
-            full_cache[f"{user_email}:posts"] = {"updated_at": now_str, "html": html_content}
+            full_cache[f"{user_email}:posts"] = {
+                "updated_at": now_str,
+                "html": html_content,
+                "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
+            }
         elif section_type == "config":
             # For the config panel, we just return the metric_cols_html block
             column_config = build_column_config_payload(active_ws, runtime_state)
@@ -819,7 +829,7 @@ def background_refresh_dashboard_data(user_email, section_type):
             metric_cols_html = f"""
                 <div class="bg-black/20 rounded-3xl p-4 mb-4 border border-white/5">
                     <div class="mb-2 text-xs font-bold text-slate-500 uppercase">
-                        <span>Chuẩn bị quét</span>
+                        <span>Trình chạy quét</span>
                     </div>
                     <div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1.16fr)_minmax(380px,0.84fr)] gap-4 items-start">
                         <div class="space-y-3">
@@ -854,7 +864,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 {''.join([
                                     f'''
                                     <div>
-                                        <div class="flex items-center justify-between gap-3 mb-2">
+                                        <div class="mb-2">
                                             <label class="block text-xs text-slate-400 uppercase tracking-wider">{
                                                 "Cột ngày quét" if field == "date" else
                                                 "Cột ngày air bài" if field == "air_date" else
@@ -867,7 +877,6 @@ def background_refresh_dashboard_data(user_email, section_type):
                                                 "Cột Save" if field == "save" else
                                                 "Dòng bắt đầu"
                                             }</label>
-                                            <span class="text-[11px] text-slate-500 font-black uppercase tracking-[0.18em]" data-column-source="{field}">{column_config["input_sources"].get(field, "CHƯA THẤY")}</span>
                                         </div>
                                         <input name="{field}" form="set-columns-form" data-column-input="{field}" data-detected-value="{column_config["detected_inputs"].get(field, '')}" data-manual-value="{column_config["manual_inputs"].get(field, '')}" value="{column_config["input_values"].get(field, '')}" placeholder="{
                                             "VD: A hoặc 1" if field == "date" else
@@ -918,7 +927,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
                                     <span>Nhật ký hệ thống</span><span class="text-slate-400">Cập nhật realtime</span>
                                 </div>
-                                <div id="log-section" class="bg-black/40 rounded-2xl p-3 h-[34vh] min-h-[240px] max-h-[460px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-xs">
+                                <div id="log-section" class="runtime-scroll-panel rounded-2xl p-3 overflow-y-auto shadow-inner font-mono italic text-xs">
                                     {build_log_html(runtime_state)}
                                 </div>
                             </div>
@@ -926,7 +935,6 @@ def background_refresh_dashboard_data(user_email, section_type):
                                 <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
                                     <span>Danh sách lỗi quét</span>
                                     <div class="flex items-center gap-2">
-                                        <span class="text-rose-300">Theo dõi nhanh</span>
                                         <button
                                             type="button"
                                             data-rerun-failed-btn
@@ -937,7 +945,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                                         </button>
                                     </div>
                                 </div>
-                                <div id="failed-section" class="bg-black/40 rounded-2xl p-4 h-[24vh] min-h-[180px] max-h-[320px] overflow-y-auto border border-white/5 shadow-inner font-mono italic text-sm">
+                                <div id="failed-section" class="runtime-scroll-panel rounded-2xl p-4 overflow-y-auto shadow-inner font-mono italic text-sm">
                                     {build_failed_html(runtime_state)}
                                 </div>
                             </div>
@@ -945,7 +953,11 @@ def background_refresh_dashboard_data(user_email, section_type):
                     </div>
                 </div>
             """
-            full_cache[f"{user_email}:config"] = {"updated_at": now_str, "html": metric_cols_html}
+            full_cache[f"{user_email}:config"] = {
+                "updated_at": now_str,
+                "html": metric_cols_html,
+                "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
+            }
         elif section_type == "schedule":
             schedule_text = schedule_label(runtime_state)
             schedule_config = build_schedule_config_payload(runtime_state)
@@ -1028,7 +1040,11 @@ def background_refresh_dashboard_data(user_email, section_type):
                     </form>
                 </div>
             """
-            full_cache[f"{user_email}:schedule"] = {"updated_at": now_str, "html": schedule_html}
+            full_cache[f"{user_email}:schedule"] = {
+                "updated_at": now_str,
+                "html": schedule_html,
+                "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
+            }
             
         persist_dashboard_cache_throttled()
     except Exception as e:
@@ -2732,7 +2748,6 @@ def build_employee_settings_content_html(current_user):
         <div class="flex flex-col gap-5">
             <div class="posts-page-head">
                 <div>
-                    <div class="posts-page-kicker">Nhân viên</div>
                     <h2 class="posts-page-title">Nhân viên</h2>
                     <p class="posts-page-subtitle">Quản lý email được phép đăng nhập, role và trạng thái xác thực của từng người dùng.</p>
                 </div>
@@ -2819,7 +2834,7 @@ def build_employee_settings_content_html(current_user):
                             <i class="fa-solid fa-xmark"></i> Hủy sửa
                         </button>
                     </div>
-                    <div class="employee-form-note">Mail đã xác thực sẽ tự chuyển trạng thái sau khi đăng nhập OTP thành công. Email admin cứng vẫn luôn giữ quyền admin.</div>
+                    <div class="employee-form-note">Mail đã xác thực sẽ tự chuyển trạng thái sau khi đăng nhập OTP thành công. Email Super admin vẫn luôn giữ quyền admin.</div>
                 </div>
             </div>
         </div>
@@ -5026,6 +5041,7 @@ def collect_posts_dataset_for_worksheet(
     sheet_id: Optional[str] = None,
     sheet_slug: str = "",
     campaign_override: str = "",
+    include_rows: bool = True,
     state=None,
 ):
     runtime_state = resolve_runtime_state(state)
@@ -5088,14 +5104,14 @@ def collect_posts_dataset_for_worksheet(
         if not link:
             continue
 
-        resolved_link = resolve_creator_link(link)
+        resolved_link = resolve_creator_link(link) if include_rows else link
         platform = detect_platform(resolved_link or link)
         platform_key = normalize_header(platform)
         if platform_key not in platform_counts:
             platform_key = "khac"
         platform_counts[platform_key] += 1
 
-        creator = resolve_post_creator_name(normalized_record, resolved_link or link, platform)
+        creator = resolve_post_creator_name(normalized_record, resolved_link or link, platform) if include_rows else ""
         brand_label = extract_brand_label_from_record(normalized_record)
         campaign = (
             resolved_campaign_override
@@ -5105,12 +5121,6 @@ def collect_posts_dataset_for_worksheet(
             ).strip()
             or sheet_title
         )
-        title = str(
-            first_nonempty_value(normalized_record, "caption", "title", "content", "noidung", "post", "mota")
-        ).strip() or infer_post_title(resolved_link or link, platform)
-        raw_date_text = resolve_dashboard_air_date_value(record, normalized_record, col_map) or resolve_dashboard_date_value(record, normalized_record, col_map)
-        date_text = format_dashboard_date_text(raw_date_text) if raw_date_text else "-"
-        date_title = format_dashboard_date_text(raw_date_text, include_time=True) if raw_date_text else "-"
         view = parse_metric_number(read_record_value_from_column(record, col_map.get("view")) or first_nonempty_value(normalized_record, "view", "views", "luotxem"))
         reaction = parse_metric_number(read_record_value_from_column(record, col_map.get("like")) or first_nonempty_value(normalized_record, "like", "likes", "reaction", "reactions"))
         share = parse_metric_number(read_record_value_from_column(record, col_map.get("share")) or first_nonempty_value(normalized_record, "share", "shares"))
@@ -5121,82 +5131,84 @@ def collect_posts_dataset_for_worksheet(
             or first_nonempty_value(normalized_record, "buzz", "buzzcount", "totalbuzz", "tongbuzz")
         )
         buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else compute_buzz_value(platform, share, comment)
-        plan = str(first_nonempty_value(normalized_record, "plan", "nam", "period", "fiscalyear") or "-").strip()
-        line_product = str(first_nonempty_value(normalized_record, "line_product", "lineproduct", "sanpham", "nhanhang", "line", "product") or "-").strip()
-        kol_tier = str(first_nonempty_value(normalized_record, "kol_tier", "koltier", "tier", "phanloaikol", "kolevel") or "-").strip()
-        status_label = "Đã quét" if any([view, reaction, share, comment, save]) or date_text != "-" else "Chờ quét"
-        status_class = "posts-status-done" if status_label == "Đã quét" else "posts-status-pending"
-        avatar = html.escape((creator or platform)[:1].upper())
-        safe_title = html.escape(shorten_text(title, 88))
-        safe_link = html.escape(link, quote=True)
-        safe_creator = html.escape(shorten_text(creator, 24))
-        creator_handle = infer_creator_handle(resolved_link or link, creator, platform)
-        safe_creator_handle = html.escape(shorten_text(creator_handle, 24))
-        safe_platform = html.escape(platform)
-        safe_campaign = html.escape(shorten_text(campaign, 28))
-        safe_campaign_meta = html.escape(shorten_text(title, 28) if title else shorten_text(platform, 28))
-        safe_date = html.escape(date_text)
-        safe_date_title = html.escape(date_title, quote=True)
-        safe_content_meta = html.escape(shorten_text(link, 76))
-        safe_sheet_name_attr = html.escape(sheet_title, quote=True)
-        safe_title_attr = html.escape(title, quote=True)
-        safe_platform_attr = html.escape(platform, quote=True)
-        safe_campaign_attr = html.escape(campaign, quote=True)
-        safe_plan = html.escape(plan)
-        safe_line = html.escape(line_product)
-        safe_tier = html.escape(kol_tier)
-        search_blob = html.escape(
-            " ".join([title, creator, campaign, platform, link, date_text, sheet_title, plan, line_product, kol_tier]).lower(),
-            quote=True,
-        )
 
-        rows_html.append(
-            f"""
-            <tr class="post-row posts-table-row" data-platform="{platform_key}" data-search="{search_blob}">
-                <td class="posts-cell posts-cell-check">
-                    <input
-                        type="checkbox"
-                        class="posts-table-check post-select-check"
-                        data-post-select
-                        data-sheet-id="{html.escape(resolved_sheet_id, quote=True)}"
-                        data-sheet-gid="{html.escape(str(getattr(ws, 'id', '') or '0'), quote=True)}"
-                        data-sheet-name="{safe_sheet_name_attr}"
-                        data-row-idx="{row_idx}"
-                        data-link="{safe_link}"
-                        data-title="{safe_title_attr}"
-                        data-platform-name="{safe_platform_attr}"
-                        aria-label="Chọn dòng {row_idx}"
-                    />
-                </td>
-                <td class="posts-cell posts-cell-content" data-post-col="content">
-                    <div class="post-content-wrap">
-                        <a href="{safe_link}" target="_blank" rel="noreferrer" class="post-content-meta">{safe_content_meta}</a>
-                    </div>
-                </td>
-                <td class="posts-cell" data-post-col="creator">
-                    <div class="flex items-center gap-3">
-                        <div class="post-avatar post-avatar-{platform_key}">{avatar}</div>
-                        <div>
-                            <div class="post-creator-name">{safe_creator}</div>
-                            <div class="post-creator-handle">{safe_creator_handle}</div>
+        if include_rows:
+            title = str(
+                first_nonempty_value(normalized_record, "caption", "title", "content", "noidung", "post", "mota")
+            ).strip() or infer_post_title(resolved_link or link, platform)
+            raw_date_text = resolve_dashboard_air_date_value(record, normalized_record, col_map) or resolve_dashboard_date_value(record, normalized_record, col_map)
+            date_text = format_dashboard_date_text(raw_date_text) if raw_date_text else "-"
+            date_title = format_dashboard_date_text(raw_date_text, include_time=True) if raw_date_text else "-"
+            plan = str(first_nonempty_value(normalized_record, "plan", "nam", "period", "fiscalyear") or "-").strip()
+            line_product = str(first_nonempty_value(normalized_record, "line_product", "lineproduct", "sanpham", "nhanhang", "line", "product") or "-").strip()
+            kol_tier = str(first_nonempty_value(normalized_record, "kol_tier", "koltier", "tier", "phanloaikol", "kolevel") or "-").strip()
+            status_label = "Đã quét" if any([view, reaction, share, comment, save]) or date_text != "-" else "Chờ quét"
+            status_class = "posts-status-done" if status_label == "Đã quét" else "posts-status-pending"
+            avatar = html.escape((creator or platform)[:1].upper())
+            safe_link = html.escape(link, quote=True)
+            safe_creator = html.escape(shorten_text(creator, 24))
+            creator_handle = infer_creator_handle(resolved_link or link, creator, platform)
+            safe_creator_handle = html.escape(shorten_text(creator_handle, 24))
+            safe_date = html.escape(date_text)
+            safe_date_title = html.escape(date_title, quote=True)
+            safe_content_meta = html.escape(shorten_text(link, 76))
+            safe_sheet_name_attr = html.escape(sheet_title, quote=True)
+            safe_title_attr = html.escape(title, quote=True)
+            safe_platform_attr = html.escape(platform, quote=True)
+            safe_plan = html.escape(plan)
+            safe_line = html.escape(line_product)
+            safe_tier = html.escape(kol_tier)
+            search_blob = html.escape(
+                " ".join([title, creator, campaign, platform, link, date_text, sheet_title, plan, line_product, kol_tier]).lower(),
+                quote=True,
+            )
+            rows_html.append(
+                f"""
+                <tr class="post-row posts-table-row" data-platform="{platform_key}" data-search="{search_blob}">
+                    <td class="posts-cell posts-cell-check">
+                        <input
+                            type="checkbox"
+                            class="posts-table-check post-select-check"
+                            data-post-select
+                            data-sheet-id="{html.escape(resolved_sheet_id, quote=True)}"
+                            data-sheet-gid="{html.escape(str(getattr(ws, 'id', '') or '0'), quote=True)}"
+                            data-sheet-name="{safe_sheet_name_attr}"
+                            data-row-idx="{row_idx}"
+                            data-link="{safe_link}"
+                            data-title="{safe_title_attr}"
+                            data-platform-name="{safe_platform_attr}"
+                            aria-label="Chọn dòng {row_idx}"
+                        />
+                    </td>
+                    <td class="posts-cell posts-cell-content" data-post-col="content">
+                        <div class="post-content-wrap">
+                            <a href="{safe_link}" target="_blank" rel="noreferrer" class="post-content-meta">{safe_content_meta}</a>
                         </div>
-                    </div>
-                </td>
-                <td class="posts-cell" data-post-col="status"><span class="post-status-pill {status_class}">{status_label}</span></td>
-                <td class="posts-cell text-xs font-bold text-slate-400" data-post-col="plan">{safe_plan}</td>
-                <td class="posts-cell text-xs font-bold text-slate-400" data-post-col="line">{safe_line}</td>
-                <td class="posts-cell" data-post-col="tier">
-                    {f'<span class="px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-500 text-[10px] font-black border border-amber-500/20">{safe_tier}</span>' if safe_tier and safe_tier != "-" else "-"}
-                </td>
-                <td class="posts-cell posts-cell-date" data-post-col="date" title="{safe_date_title}">{safe_date}</td>
-                <td class="posts-cell posts-cell-metric" data-post-col="view">{format_table_metric(view)}</td>
-                <td class="posts-cell posts-cell-metric" data-post-col="reaction">{format_table_metric(reaction)}</td>
-                <td class="posts-cell posts-cell-metric" data-post-col="share">{format_table_metric(share)}</td>
-                <td class="posts-cell posts-cell-metric" data-post-col="comment">{format_table_metric(comment)}</td>
-                <td class="posts-cell posts-cell-metric" data-post-col="buzz">{format_table_metric(buzz)}</td>
-            </tr>
-            """
-        )
+                    </td>
+                    <td class="posts-cell" data-post-col="creator">
+                        <div class="flex items-center gap-3">
+                            <div class="post-avatar post-avatar-{platform_key}">{avatar}</div>
+                            <div>
+                                <div class="post-creator-name">{safe_creator}</div>
+                                <div class="post-creator-handle">{safe_creator_handle}</div>
+                            </div>
+                        </div>
+                    </td>
+                    <td class="posts-cell" data-post-col="status"><span class="post-status-pill {status_class}">{status_label}</span></td>
+                    <td class="posts-cell text-xs font-bold text-slate-400" data-post-col="plan">{safe_plan}</td>
+                    <td class="posts-cell text-xs font-bold text-slate-400" data-post-col="line">{safe_line}</td>
+                    <td class="posts-cell" data-post-col="tier">
+                        {f'<span class="px-2 py-0.5 rounded-md bg-amber-500/10 text-amber-500 text-[10px] font-black border border-amber-500/20">{safe_tier}</span>' if safe_tier and safe_tier != "-" else "-"}
+                    </td>
+                    <td class="posts-cell posts-cell-date" data-post-col="date" title="{safe_date_title}">{safe_date}</td>
+                    <td class="posts-cell posts-cell-metric" data-post-col="view">{format_table_metric(view)}</td>
+                    <td class="posts-cell posts-cell-metric" data-post-col="reaction">{format_table_metric(reaction)}</td>
+                    <td class="posts-cell posts-cell-metric" data-post-col="share">{format_table_metric(share)}</td>
+                    <td class="posts-cell posts-cell-metric" data-post-col="comment">{format_table_metric(comment)}</td>
+                    <td class="posts-cell posts-cell-metric" data-post-col="buzz">{format_table_metric(buzz)}</td>
+                </tr>
+                """
+            )
 
         total_posts += 1
         total_views += view
@@ -5617,57 +5629,62 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                         <div class="overview-stat-value">{format_compact_metric(total_views)}</div>
                     </div>
                 </div>
+                <div class="overview-stat-card">
+                    <div class="overview-stat-icon icon-buzz"><i class="fa-solid fa-bolt"></i></div>
+                    <div>
+                        <div class="overview-stat-label">Tổng buzz</div>
+                        <div class="overview-stat-value">{format_compact_metric(total_buzz)}</div>
+                    </div>
+                </div>
             </div>
 
             <div class="overview-section-title">Hiệu suất tổng thể</div>
             <div class="overview-chart-card" data-overview-chart-card>
                 <script type="application/json" data-overview-chart-data>{chart_payload_json}</script>
-                <div class="overview-chart-head">
+                <div class="overview-chart-meta">
+                    <div class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:#10b981;"></span><span>Buzz (cột)</span></div>
+                    <div class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:#38bdf8;"></span><span>Lượt xem (đường)</span></div>
                     <div class="overview-head-actions">
                         <button type="button" class="overview-filter-trigger" data-overview-filter-trigger aria-label="Mở bộ lọc biểu đồ thời gian">
                             <i class="fa-regular fa-calendar"></i>
                             <span>Khoảng thời gian</span>
                             <i class="fa-solid fa-chevron-down overview-filter-trigger-chevron"></i>
                         </button>
-                    </div>
-                </div>
-                <div class="overview-chart-filter-anchor">
-                    <div class="overview-chart-control-wrap hidden" data-overview-filter-panel>
-                        <div class="overview-time-filter-card">
-                            <div class="overview-time-filter-title">Khoảng thời gian:</div>
-                            <div class="overview-time-filter-grid">
-                                <button type="button" class="overview-chart-toggle is-active" data-overview-range="7d">7 ngày qua</button>
-                                <button type="button" class="overview-chart-toggle" data-overview-range="30d">30 ngày qua</button>
-                                <button type="button" class="overview-chart-toggle" data-overview-range="this_month">Tháng này</button>
-                                <button type="button" class="overview-chart-toggle" data-overview-range="last_month">Tháng trước</button>
-                                <button type="button" class="overview-chart-toggle overview-chart-toggle-full" data-overview-range="all_time">Toàn thời gian</button>
-                            </div>
-                            <div class="overview-time-custom-label">Hiển thị theo:</div>
-                            <div class="overview-chart-segment">
-                                <button type="button" class="overview-chart-toggle is-active" data-overview-granularity="day">Theo ngày</button>
-                                <button type="button" class="overview-chart-toggle" data-overview-granularity="week">Theo tuần</button>
-                                <button type="button" class="overview-chart-toggle" data-overview-granularity="month">Theo tháng</button>
-                            </div>
-                            <div class="overview-time-custom-label">Tùy chỉnh:</div>
-                            <div class="overview-chart-custom-range">
-                                <div class="overview-chart-custom-row">
-                                    <label>Từ:</label>
-                                    <input type="date" class="overview-chart-date-input" data-overview-custom-from />
-                                </div>
-                                <div class="overview-chart-custom-row">
-                                    <label>Đến:</label>
-                                    <input type="date" class="overview-chart-date-input" data-overview-custom-to />
-                                </div>
-                                <div class="overview-chart-custom-actions">
-                                    <button type="button" class="overview-chart-apply" data-overview-apply-custom>Áp dụng</button>
+                        <div class="overview-chart-filter-anchor">
+                            <div class="overview-chart-control-wrap hidden" data-overview-filter-panel>
+                                <div class="overview-time-filter-card">
+                                    <div class="overview-time-filter-title">Khoảng thời gian:</div>
+                                    <div class="overview-time-filter-grid">
+                                        <button type="button" class="overview-chart-toggle is-active" data-overview-range="7d">7 ngày qua</button>
+                                        <button type="button" class="overview-chart-toggle" data-overview-range="30d">30 ngày qua</button>
+                                        <button type="button" class="overview-chart-toggle" data-overview-range="this_month">Tháng này</button>
+                                        <button type="button" class="overview-chart-toggle" data-overview-range="last_month">Tháng trước</button>
+                                        <button type="button" class="overview-chart-toggle overview-chart-toggle-full" data-overview-range="all_time">Toàn thời gian</button>
+                                    </div>
+                                    <div class="overview-time-custom-label">Hiển thị theo:</div>
+                                    <div class="overview-chart-segment">
+                                        <button type="button" class="overview-chart-toggle is-active" data-overview-granularity="day">Theo ngày</button>
+                                        <button type="button" class="overview-chart-toggle" data-overview-granularity="week">Theo tuần</button>
+                                        <button type="button" class="overview-chart-toggle" data-overview-granularity="month">Theo tháng</button>
+                                    </div>
+                                    <div class="overview-time-custom-label">Tùy chỉnh:</div>
+                                    <div class="overview-chart-custom-range">
+                                        <div class="overview-chart-custom-row">
+                                            <label>Từ:</label>
+                                            <input type="date" class="overview-chart-date-input" data-overview-custom-from />
+                                        </div>
+                                        <div class="overview-chart-custom-row">
+                                            <label>Đến:</label>
+                                            <input type="date" class="overview-chart-date-input" data-overview-custom-to />
+                                        </div>
+                                        <div class="overview-chart-custom-actions">
+                                            <button type="button" class="overview-chart-apply" data-overview-apply-custom>Áp dụng</button>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
                         </div>
                     </div>
-                </div>
-                <div class="overview-chart-meta">
-                    <div class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:#10b981;"></span><span>Buzz (cột)</span></div>
-                    <div class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:#38bdf8;"></span><span>Lượt xem (đường)</span></div>
                 </div>
                 <div class="overview-chart-brand-legend" data-overview-brand-legend></div>
                 <div class="overview-chart-frame">
@@ -5710,6 +5727,149 @@ def format_saved_sheet_error(error: str) -> str:
     if "notfound" in normalized or "khongtimthay" in normalized:
         return "Không tìm thấy sheet này hoặc tab đã bị đổi tên."
     return shorten_text(raw, 84)
+
+def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
+    if not isinstance(dataset, dict):
+        return ""
+    safe_sheet_title = html.escape(str(dataset.get("sheet_title", "") or "Sheet"))
+    brand_label = str(dataset.get("brand_label", "") or "").strip()
+    industry_label = str(dataset.get("industry_label", "") or "").strip()
+    posts_text = format_metric_number(dataset.get("total_posts", 0))
+    views_text = format_compact_metric(dataset.get("total_views", 0))
+    reaction_text = format_compact_metric(dataset.get("total_reaction", 0))
+    comment_text = format_compact_metric(dataset.get("total_comment", 0))
+    share_text = format_compact_metric(dataset.get("total_share", 0))
+    buzz_text = format_compact_metric(dataset.get("total_buzz", 0))
+    detail_meta_chips = []
+    if brand_label:
+        detail_meta_chips.append(
+            f'<div class="posts-detail-summary-chip"><i class="fa-solid fa-tag"></i><span>{html.escape(brand_label)}</span></div>'
+        )
+    if industry_label:
+        detail_meta_chips.append(
+            f'<div class="posts-detail-summary-chip"><i class="fa-solid fa-shapes"></i><span>{html.escape(industry_label)}</span></div>'
+        )
+    detail_meta_chips_html = "".join(detail_meta_chips)
+    sheet_snapshot_url = build_snapshot_url(dataset.get("sheet_id", ""), dataset.get("sheet_gid", "0"), runtime_state)
+    filter_definitions = [
+        ("all", "Tất cả", dataset.get("total_posts", 0)),
+        ("tiktok", "TikTok", (dataset.get("platform_counts", {}) or {}).get("tiktok", 0)),
+        ("facebook", "Facebook", (dataset.get("platform_counts", {}) or {}).get("facebook", 0)),
+        ("instagram", "Instagram", (dataset.get("platform_counts", {}) or {}).get("instagram", 0)),
+        ("youtube", "YouTube", (dataset.get("platform_counts", {}) or {}).get("youtube", 0)),
+        ("khac", "Khác", (dataset.get("platform_counts", {}) or {}).get("khac", 0)),
+    ]
+    filter_chips_html = "".join(
+        [
+            f'<button type="button" class="posts-chip{" is-active" if key == "all" else ""}" data-platform="{key}">{label} <span>{count}</span></button>'
+            for key, label, count in filter_definitions
+            if key == "all" or int(count or 0) > 0
+        ]
+    )
+    rows_html = str(dataset.get("rows_html", "") or "").strip()
+    table_rows_html = rows_html if rows_html else '<tr><td colspan="13" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'
+    return f"""
+        <div class="posts-tab-panel" data-posts-tab-panel="{html.escape(str(dataset.get("sheet_slug", "") or ""), quote=True)}" data-posts-tab-title="{safe_sheet_title}" data-posts-platform="all">
+            <div class="posts-tab-panel-head">
+                <div>
+                    <div class="posts-tab-panel-kicker">Đang xem sheet</div>
+                    <div class="posts-tab-panel-title">{safe_sheet_title}</div>
+                    <div class="posts-tab-panel-sub">Sheet ID: {html.escape(str(dataset.get("sheet_id", "") or ""))}</div>
+                </div>
+                <a href="{html.escape(sheet_snapshot_url, quote=True)}" target="_blank" rel="noreferrer" class="posts-toolbar-btn">
+                    <i class="fa-solid fa-up-right-from-square"></i> Mở sheet này
+                </a>
+            </div>
+            <div class="posts-detail-summary-shell">
+                <div class="posts-detail-summary-meta">
+                    {detail_meta_chips_html if detail_meta_chips_html else '<div class="posts-detail-summary-chip"><i class="fa-solid fa-circle-info"></i><span>Chưa có thông tin tổng thêm</span></div>'}
+                </div>
+                <div class="posts-detail-summary-grid">
+                    <div class="posts-detail-summary-card">
+                        <div class="posts-detail-summary-label">Bài đăng</div>
+                        <div class="posts-detail-summary-value">{posts_text}</div>
+                    </div>
+                    <div class="posts-detail-summary-card">
+                        <div class="posts-detail-summary-label">View</div>
+                        <div class="posts-detail-summary-value">{views_text}</div>
+                    </div>
+                    <div class="posts-detail-summary-card">
+                        <div class="posts-detail-summary-label">Reaction</div>
+                        <div class="posts-detail-summary-value">{reaction_text}</div>
+                    </div>
+                    <div class="posts-detail-summary-card">
+                        <div class="posts-detail-summary-label">Comment</div>
+                        <div class="posts-detail-summary-value">{comment_text}</div>
+                    </div>
+                    <div class="posts-detail-summary-card">
+                        <div class="posts-detail-summary-label">Share</div>
+                        <div class="posts-detail-summary-value">{share_text}</div>
+                    </div>
+                    <div class="posts-detail-summary-card">
+                        <div class="posts-detail-summary-label">Buzz</div>
+                        <div class="posts-detail-summary-value">{buzz_text}</div>
+                    </div>
+                </div>
+            </div>
+            <div class="posts-toolbar rounded-[1.5rem] p-4 md:p-5">
+                <div class="posts-toolbar-row">
+                    <label class="posts-search-shell">
+                        <i class="fa-solid fa-magnifying-glass text-slate-400"></i>
+                        <input type="text" placeholder="Tìm kiếm bài đăng hoặc creator..." class="posts-search-input posts-search-field" />
+                    </label>
+                    <div class="posts-toolbar-actions">
+                        <div class="text-xs text-slate-400 font-bold px-3 py-2 rounded-xl border border-white/10 bg-slate-900/60" data-posts-selection-count>0 bài đã chọn</div>
+                        <div class="posts-columns-wrap">
+                            <button type="button" class="posts-toolbar-btn posts-columns-toggle" data-post-columns-toggle>
+                                <i class="fa-solid fa-sliders"></i> Cột hiển thị
+                            </button>
+                            <div class="posts-columns-popover hidden" data-post-columns-menu>
+                                <div class="posts-columns-head">
+                                    <div class="posts-columns-title">Cột hiển thị · <span data-post-columns-count>0/0</span></div>
+                                    <button type="button" class="posts-columns-all" data-post-columns-show-all>Tất cả</button>
+                                </div>
+                                <div class="posts-columns-list" data-post-columns-list></div>
+                            </div>
+                        </div>
+                        <button type="button" class="posts-toolbar-btn posts-rerun-btn"><i class="fa-solid fa-rotate-left"></i> Chạy lại</button>
+                    </div>
+                </div>
+                <div class="posts-mini-campaign-feedback hidden" data-posts-rerun-feedback></div>
+                <div class="posts-filter-row">
+                    {filter_chips_html}
+                </div>
+            </div>
+            <div class="posts-table-shell">
+                <div class="overflow-x-auto">
+                    <table class="w-full min-w-[1450px] posts-table">
+                        <thead>
+                            <tr>
+                                <th class="posts-check-col"><input type="checkbox" class="posts-table-check posts-select-all" data-select-all-posts aria-label="Chọn tất cả" /></th>
+                                <th data-post-col="content">Link</th>
+                                <th data-post-col="creator">Creator</th>
+                                <th data-post-col="status">Trạng thái</th>
+                                <th data-post-col="plan">Plan</th>
+                                <th data-post-col="line">Line</th>
+                                <th data-post-col="tier">Tier</th>
+                                <th data-post-col="date">Ngày quét</th>
+                                <th class="text-right" data-post-col="view">View</th>
+                                <th class="text-right" data-post-col="reaction">Reaction</th>
+                                <th class="text-right" data-post-col="share">Share</th>
+                                <th class="text-right" data-post-col="comment">Comment</th>
+                                <th class="text-right" data-post-col="buzz">Buzz</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {table_rows_html}
+                        </tbody>
+                    </table>
+                </div>
+                <div class="posts-empty-state posts-empty-panel hidden">
+                    Không có bài đăng nào khớp bộ lọc hiện tại.
+                </div>
+            </div>
+        </div>
+    """
 
 
 def summarize_campaign_groups(saved_entries):
@@ -5892,6 +6052,7 @@ def build_posts_panel_html(sheet=None, state=None):
                 sheet_id=entry_sheet_id,
                 sheet_slug=entry_slug,
                 campaign_override=entry_campaign_label,
+                include_rows=False,
                 state=runtime_state,
             )
             dataset["saved_at_text"] = entry_saved_at_text
@@ -5927,37 +6088,12 @@ def build_posts_panel_html(sheet=None, state=None):
             }
         datasets.append(dataset)
 
-    campaign_counts = {}
-    for dataset in datasets:
-        campaign_label = str(dataset.get("campaign_label", "") or "").strip()
-        if not campaign_label:
-            continue
-        campaign_counts[campaign_label] = campaign_counts.get(campaign_label, 0) + 1
-
     summary_rows_html = []
-    detail_panels_html = []
     for dataset in datasets:
         safe_sheet_title = html.escape(dataset["sheet_title"])
-        saved_at_text = html.escape(dataset.get("saved_at_text", "") or "Chưa có thời gian lưu")
         brand_label = str(dataset.get("brand_label", "") or "").strip()
         campaign_label = str(dataset.get("campaign_label", "") or "").strip()
         industry_label = str(dataset.get("industry_label", "") or "").strip()
-        campaign_slug = build_dom_slug(campaign_label or "khong-gan", "campaign")
-        primary_platform_key = "khac"
-        primary_platform_count = 0
-        for platform_key in ("tiktok", "facebook", "instagram", "youtube", "khac"):
-            count = int((dataset.get("platform_counts", {}) or {}).get(platform_key) or 0)
-            if count > primary_platform_count:
-                primary_platform_key = platform_key
-                primary_platform_count = count
-        platform_label_map = {
-            "tiktok": "TikTok",
-            "facebook": "Facebook",
-            "instagram": "Instagram",
-            "youtube": "YouTube",
-            "khac": "Khác",
-        }
-        primary_platform_label = platform_label_map.get(primary_platform_key, "Khác")
         status_label = "Lỗi đọc" if dataset["error"] else ("Đã lưu" if dataset["total_posts"] > 0 else "Chưa có bài")
         status_class = "posts-row-status-error" if dataset["error"] else ("posts-row-status-ready" if dataset["total_posts"] > 0 else "posts-row-status-empty")
         activity_title = html.escape(dataset["sheet_title"])
@@ -5978,27 +6114,11 @@ def build_posts_panel_html(sheet=None, state=None):
         comment_text = format_compact_metric(dataset.get("total_comment", 0))
         share_text = format_compact_metric(dataset.get("total_share", 0))
         buzz_text = format_compact_metric(dataset.get("total_buzz", 0))
-        platform_summary = " • ".join(
-            [
-                f"{platform_label_map.get(platform_key, platform_key.title())} {count}"
-                for platform_key, count in (dataset.get("platform_counts", {}) or {}).items()
-                if int(count or 0) > 0
-            ]
-        )
-        detail_meta_chips = []
-        if brand_label:
-            detail_meta_chips.append(
-                f'<div class="posts-detail-summary-chip"><i class="fa-solid fa-tag"></i><span>{html.escape(brand_label)}</span></div>'
-            )
-        if industry_label:
-            detail_meta_chips.append(
-                f'<div class="posts-detail-summary-chip"><i class="fa-solid fa-shapes"></i><span>{html.escape(industry_label)}</span></div>'
-            )
-        detail_meta_chips_html = "".join(detail_meta_chips)
         sheet_snapshot_url = build_snapshot_url(dataset.get("sheet_id", ""), dataset["sheet_gid"], runtime_state)
+        schedule_binding_key = build_sheet_binding_key(dataset.get("sheet_id", ""), dataset.get("sheet_title", ""))
         summary_rows_html.append(
             f"""
-            <div class="posts-sheet-list-row" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-master-campaign="all" data-posts-master-search="{html.escape((dataset['sheet_title'] + ' ' + brand_label + ' ' + industry_label).lower(), quote=True)}">
+            <div class="posts-sheet-list-row" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}" data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}" data-posts-sheet-gid="{html.escape(str(dataset.get('sheet_gid', '0') or '0'), quote=True)}" data-posts-sheet-campaign="{html.escape(campaign_label, quote=True)}" data-posts-sheet-brand="{html.escape(brand_label, quote=True)}" data-posts-sheet-industry="{html.escape(industry_label, quote=True)}" data-posts-master-campaign="all" data-posts-master-search="{html.escape((dataset['sheet_title'] + ' ' + brand_label + ' ' + industry_label).lower(), quote=True)}">
                 <div class="posts-sheet-list-cell posts-sheet-list-activity">
                     <div class="posts-sheet-list-title">{activity_title}</div>
                     <div class="posts-sheet-list-sub">{activity_sub}</div>
@@ -6036,6 +6156,17 @@ def build_posts_panel_html(sheet=None, state=None):
                             </button>
                             <button
                                 type="button"
+                                class="posts-sheet-actions-item"
+                                data-posts-sheet-action="bind-schedule"
+                                data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}"
+                                data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}"
+                                data-posts-sheet-key="{html.escape(schedule_binding_key, quote=True)}"
+                            >
+                                <i class="fa-regular fa-calendar-check"></i>
+                                <span>Đặt lịch</span>
+                            </button>
+                            <button
+                                type="button"
                                 class="posts-sheet-actions-item text-rose-300"
                                 data-posts-sheet-action="delete-sheet"
                                 data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}"
@@ -6055,122 +6186,7 @@ def build_posts_panel_html(sheet=None, state=None):
             """
         )
 
-        filter_definitions = [
-            ("all", "Tất cả", dataset["total_posts"]),
-            ("tiktok", "TikTok", dataset["platform_counts"]["tiktok"]),
-            ("facebook", "Facebook", dataset["platform_counts"]["facebook"]),
-            ("instagram", "Instagram", dataset["platform_counts"]["instagram"]),
-            ("youtube", "YouTube", dataset["platform_counts"]["youtube"]),
-            ("khac", "Khác", dataset["platform_counts"]["khac"]),
-        ]
-        filter_chips_html = "".join(
-            [
-                f'<button type="button" class="posts-chip{" is-active" if key == "all" else ""}" data-platform="{key}">{label} <span>{count}</span></button>'
-                for key, label, count in filter_definitions
-                if key == "all" or count > 0
-            ]
-        )
-
-        detail_panels_html.append(
-            f"""
-            <div class="posts-tab-panel" data-posts-tab-panel="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-platform="all">
-                <div class="posts-tab-panel-head">
-                    <div>
-                        <div class="posts-tab-panel-kicker">Đang xem sheet</div>
-                        <div class="posts-tab-panel-title">{safe_sheet_title}</div>
-                        <div class="posts-tab-panel-sub">Sheet ID: {html.escape(dataset.get("sheet_id", ""))}</div>
-                    </div>
-                    <a href="{html.escape(build_snapshot_url(dataset.get("sheet_id", ""), dataset["sheet_gid"], runtime_state), quote=True)}" target="_blank" rel="noreferrer" class="posts-toolbar-btn">
-                        <i class="fa-solid fa-up-right-from-square"></i> Mở sheet này
-                    </a>
-                </div>
-                <div class="posts-detail-summary-shell">
-                    <div class="posts-detail-summary-meta">
-                        {detail_meta_chips_html if detail_meta_chips_html else '<div class="posts-detail-summary-chip"><i class="fa-solid fa-circle-info"></i><span>Chưa có thông tin tổng thêm</span></div>'}
-                    </div>
-                    <div class="posts-detail-summary-grid">
-                        <div class="posts-detail-summary-card">
-                            <div class="posts-detail-summary-label">Bài đăng</div>
-                            <div class="posts-detail-summary-value">{posts_text}</div>
-                        </div>
-                        <div class="posts-detail-summary-card">
-                            <div class="posts-detail-summary-label">View</div>
-                            <div class="posts-detail-summary-value">{views_text}</div>
-                        </div>
-                        <div class="posts-detail-summary-card">
-                            <div class="posts-detail-summary-label">Reaction</div>
-                            <div class="posts-detail-summary-value">{reaction_text}</div>
-                        </div>
-                        <div class="posts-detail-summary-card">
-                            <div class="posts-detail-summary-label">Comment</div>
-                            <div class="posts-detail-summary-value">{comment_text}</div>
-                        </div>
-                        <div class="posts-detail-summary-card">
-                            <div class="posts-detail-summary-label">Share</div>
-                            <div class="posts-detail-summary-value">{share_text}</div>
-                        </div>
-                    </div>
-                </div>
-                <div class="posts-toolbar rounded-[1.5rem] p-4 md:p-5">
-                    <div class="posts-toolbar-row">
-                        <label class="posts-search-shell">
-                            <i class="fa-solid fa-magnifying-glass text-slate-400"></i>
-                            <input type="text" placeholder="Tìm kiếm bài đăng hoặc creator..." class="posts-search-input posts-search-field" />
-                        </label>
-                        <div class="posts-toolbar-actions">
-                            <div class="text-xs text-slate-400 font-bold px-3 py-2 rounded-xl border border-white/10 bg-slate-900/60" data-posts-selection-count>0 bài đã chọn</div>
-                            <div class="posts-columns-wrap">
-                                <button type="button" class="posts-toolbar-btn posts-columns-toggle" data-post-columns-toggle>
-                                    <i class="fa-solid fa-sliders"></i> Cột hiển thị
-                                </button>
-                                <div class="posts-columns-popover hidden" data-post-columns-menu>
-                                    <div class="posts-columns-head">
-                                        <div class="posts-columns-title">Cột hiển thị · <span data-post-columns-count>0/0</span></div>
-                                        <button type="button" class="posts-columns-all" data-post-columns-show-all>Tất cả</button>
-                                    </div>
-                                    <div class="posts-columns-list" data-post-columns-list></div>
-                                </div>
-                            </div>
-                            <button type="button" class="posts-toolbar-btn posts-rerun-btn"><i class="fa-solid fa-rotate-left"></i> Chạy lại</button>
-                        </div>
-                    </div>
-                    <div class="posts-mini-campaign-feedback hidden" data-posts-rerun-feedback></div>
-                    <div class="posts-filter-row">
-                        {filter_chips_html}
-                    </div>
-                </div>
-                <div class="posts-table-shell">
-                    <div class="overflow-x-auto">
-                        <table class="w-full min-w-[1450px] posts-table">
-                            <thead>
-                                <tr>
-                                    <th class="posts-check-col"><input type="checkbox" class="posts-table-check posts-select-all" data-select-all-posts aria-label="Chọn tất cả" /></th>
-                                    <th data-post-col="content">Link</th>
-                                    <th data-post-col="creator">Creator</th>
-                                    <th data-post-col="status">Trạng thái</th>
-                                    <th data-post-col="plan">Plan</th>
-                                    <th data-post-col="line">Line</th>
-                                    <th data-post-col="tier">Tier</th>
-                                    <th data-post-col="date">Ngày quét</th>
-                                    <th class="text-right" data-post-col="view">View</th>
-                                    <th class="text-right" data-post-col="reaction">Reaction</th>
-                                    <th class="text-right" data-post-col="share">Share</th>
-                                    <th class="text-right" data-post-col="comment">Comment</th>
-                                    <th class="text-right" data-post-col="buzz">Buzz</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {dataset["rows_html"] if dataset["rows_html"] else '<tr><td colspan="13" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'}
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="posts-empty-state posts-empty-panel hidden">
-                        Không có bài đăng nào khớp bộ lọc hiện tại.
-                    </div>
-                </div>
-            </div>
-            """
-        )
+        # Chi tiết bài đăng sẽ được tải lazy theo từng sheet để giảm thời gian load ban đầu.
 
     saved_count = len(datasets)
     return f"""
@@ -6232,7 +6248,6 @@ def build_posts_panel_html(sheet=None, state=None):
                         <div class="mt-3 text-2xl font-black text-slate-100">Chọn một sheet đã lưu để xem bài đăng</div>
                         <p class="mt-2 text-sm text-slate-400">Bấm vào card sheet phía trên, lúc đó bảng chi tiết sẽ hiện ra như bạn muốn.</p>
                     </div>
-                    {"".join(detail_panels_html)}
                 </div>
             </div>
         </div>
@@ -8556,8 +8571,65 @@ def api_dashboard_posts(background_tasks: BackgroundTasks, request: Request):
 
     if cached_html:
         return {"ok": True, "status": "ready", "html": cached_html, "cached": True, "refreshing": needs_refresh}
-    
+
+    # Fallback sync render to avoid long "processing" loops on slow/broken background refresh.
+    try:
+        runtime_state = get_runtime_state(current_user)
+        html_content = build_posts_panel_html(state=runtime_state)
+        if isinstance(html_content, str) and html_content.strip():
+            now_str = datetime.now().isoformat()
+            _get_dashboard_cache_map()[f"{user_email}:posts"] = {
+                "updated_at": now_str,
+                "html": html_content,
+                "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
+            }
+            persist_dashboard_cache_throttled()
+            return {"ok": True, "status": "ready", "html": html_content, "cached": False, "refreshing": needs_refresh}
+    except Exception:
+        pass
+
     return {"ok": True, "status": "processing", "html": ""}
+
+@app.get("/api/dashboard/posts-detail")
+def api_dashboard_posts_detail(
+    request: Request,
+    sheet_id: str = "",
+    sheet_name: str = "",
+    sheet_slug: str = "",
+    campaign_label: str = "",
+    brand_label: str = "",
+    industry_label: str = "",
+):
+    current_user, auth_response = require_authenticated_user(request)
+    if auth_response:
+        return {"error": "Unauthorized", "html": ""}
+    runtime_state = get_runtime_state(current_user)
+    resolved_sheet_id = str(sheet_id or "").strip()
+    resolved_sheet_name = str(sheet_name or "").strip()
+    if not resolved_sheet_id or not resolved_sheet_name:
+        return {"ok": False, "message": "Thiếu thông tin sheet để tải chi tiết.", "html": ""}
+    try:
+        ws = get_worksheet(resolved_sheet_name, resolved_sheet_id, runtime_state)
+        resolved_slug = str(sheet_slug or "").strip() or f"{build_dom_slug(resolved_sheet_name, 'sheet')}-detail"
+        dataset = collect_posts_dataset_for_worksheet(
+            ws,
+            0,
+            sheet_id=resolved_sheet_id,
+            sheet_slug=resolved_slug,
+            campaign_override=str(campaign_label or "").strip(),
+            include_rows=True,
+            state=runtime_state,
+        )
+        dataset["sheet_id"] = resolved_sheet_id
+        dataset["sheet_title"] = resolved_sheet_name
+        dataset["sheet_slug"] = resolved_slug
+        dataset["campaign_label"] = str(campaign_label or "").strip()
+        dataset["brand_label"] = str(brand_label or "").strip() or str(dataset.get("brand_label", "") or "").strip()
+        dataset["industry_label"] = str(industry_label or "").strip()
+        detail_html = build_posts_detail_panel_html(dataset, runtime_state)
+        return {"ok": True, "html": detail_html, "sheet_slug": resolved_slug}
+    except Exception as exc:
+        return {"ok": False, "message": f"Không tải được chi tiết sheet: {str(exc)}", "html": ""}
 
 
 @app.get("/api/dashboard/config")
@@ -8625,6 +8697,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
     
     def get_shell(cached_key, section_id, display_name, active=False):
         entry = DASHBOARD_CACHE.get(f"{user_email}:{cached_key}")
+        if isinstance(entry, dict):
+            cached_format_version = int(entry.get("format_version", 0) or 0)
+            if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION:
+                entry = None
         if entry and entry.get("html"):
             return entry["html"]
         return f"""
@@ -8826,6 +8902,20 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 background: rgba(15, 23, 42, 0.32);
                 color: #94a3b8;
                 font-size: 13px;
+            }}
+            .runtime-scroll-panel {{
+                border: 1px solid rgba(148, 163, 184, 0.16);
+                background: linear-gradient(180deg, rgba(15, 23, 42, 0.62), rgba(15, 23, 42, 0.5));
+            }}
+            #log-section.runtime-scroll-panel {{
+                height: 170px;
+                min-height: 170px;
+                max-height: 170px;
+            }}
+            #failed-section.runtime-scroll-panel {{
+                height: 130px;
+                min-height: 130px;
+                max-height: 130px;
             }}
             .schedule-history-footer {{
                 width: 100%;
@@ -9067,6 +9157,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 color: #60a5fa;
                 background: rgba(59, 130, 246, 0.14);
             }}
+            .icon-buzz {{
+                color: #22c55e;
+                background: rgba(34, 197, 94, 0.14);
+            }}
             .icon-creator {{
                 color: #c084fc;
                 background: rgba(168, 85, 247, 0.14);
@@ -9259,6 +9353,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 flex-wrap: wrap;
                 justify-content: flex-end;
                 margin-left: auto;
+                position: relative;
             }}
             .overview-filter-trigger {{
                 display: inline-flex;
@@ -9296,8 +9391,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .overview-chart-filter-anchor {{
                 position: absolute;
-                top: 56px;
-                right: 18px;
+                top: calc(100% + 8px);
+                right: 0;
                 z-index: 12;
             }}
             .overview-chart-control-wrap {{
@@ -9383,7 +9478,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 align-items: center;
                 gap: 10px;
                 flex-wrap: wrap;
-                margin-top: 12px;
+                margin-top: 10px;
             }}
             .overview-chart-custom-range {{
                 margin-top: 6px;
@@ -9612,7 +9707,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 box-shadow: 0 22px 42px rgba(2, 6, 23, 0.36);
                 backdrop-filter: blur(14px);
                 pointer-events: none;
-                z-index: 6;
+                z-index: 20;
             }}
             .overview-chart-tooltip-title {{
                 font-size: 12px;
@@ -9865,7 +9960,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 position: relative;
                 display: inline-flex;
                 justify-content: flex-end;
-                width: 100%;
+                width: max-content;
+                margin-left: auto;
                 z-index: 12;
             }}
             .posts-sheet-actions-toggle {{
@@ -9897,8 +9993,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .posts-sheet-actions-dropdown {{
                 position: absolute;
-                top: -12px;
-                right: 100%;
+                top: 50%;
+                right: calc(100% + 6px);
+                transform: translateY(-50%);
                 min-width: 188px;
                 display: grid;
                 gap: 4px;
@@ -10025,18 +10122,18 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .schedule-track-list-table {{
                 display: grid;
-                min-width: 0;
+                min-width: 1120px;
                 width: 100%;
             }}
             .schedule-track-list-head,
             .schedule-track-list-row {{
                 display: grid;
-                grid-template-columns: minmax(200px, 1.2fr) minmax(220px, 1fr) minmax(120px, 0.7fr) minmax(120px, 0.7fr) minmax(160px, 0.9fr);
-                gap: 12px;
+                grid-template-columns: minmax(250px, 1.45fr) minmax(280px, 1.35fr) minmax(150px, 0.75fr) minmax(140px, 0.7fr) minmax(220px, 1fr);
+                gap: 14px;
                 align-items: center;
             }}
             .schedule-track-list-head {{
-                padding: 0 16px 12px;
+                padding: 0 18px 14px;
                 border-bottom: 1px solid rgba(148, 163, 184, 0.14);
             }}
             .schedule-track-list-head-cell {{
@@ -10053,7 +10150,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 background: transparent;
                 font: inherit;
                 cursor: pointer;
-                padding: 12px 14px;
+                padding: 14px 18px;
                 border-top: 1px solid rgba(148, 163, 184, 0.08);
                 transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
             }}
@@ -10093,13 +10190,17 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 font-size: 12px;
                 font-weight: 800;
                 color: #e2e8f0;
-                line-height: 1.5;
+                line-height: 1.45;
             }}
             .schedule-track-list-last-run {{
                 display: flex;
                 align-items: center;
-                justify-content: space-between;
-                gap: 10px;
+                justify-content: flex-start;
+                gap: 12px;
+                flex-wrap: wrap;
+            }}
+            .schedule-track-list-last-run .schedule-track-list-main {{
+                white-space: nowrap;
             }}
             .schedule-track-delete-btn {{
                 display: inline-flex;
@@ -10168,7 +10269,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     min-width: 1320px;
                 }}
                 .schedule-track-list-table {{
-                    min-width: 980px;
+                    min-width: 1040px;
                 }}
                 .posts-detail-summary-grid {{
                     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -10177,15 +10278,15 @@ def home(request: Request, background_tasks: BackgroundTasks):
             @media (max-width: 1360px) {{
                 .schedule-track-list-head,
                 .schedule-track-list-row {{
-                    grid-template-columns: minmax(180px, 1.15fr) minmax(200px, 1fr) minmax(110px, 0.65fr) minmax(110px, 0.65fr) minmax(140px, 0.8fr);
-                    gap: 10px;
+                    grid-template-columns: minmax(220px, 1.3fr) minmax(240px, 1.2fr) minmax(130px, 0.72fr) minmax(120px, 0.68fr) minmax(190px, 0.95fr);
+                    gap: 12px;
                 }}
                 .schedule-track-list-head-cell {{
                     font-size: 11px;
                     letter-spacing: 0.14em;
                 }}
                 .schedule-track-list-row {{
-                    padding: 10px 12px;
+                    padding: 12px 14px;
                 }}
             }}
             .posts-tab-panels {{
@@ -10518,7 +10619,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .employee-layout {{
                 display: grid;
-                grid-template-columns: minmax(0, 1.5fr) minmax(280px, 0.9fr);
+                grid-template-columns: minmax(0, 1.7fr) minmax(250px, 320px);
                 gap: 18px;
             }}
             .settings-layout {{
@@ -10869,40 +10970,54 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 cursor: not-allowed;
             }}
             .employee-form-card {{
-                padding: 20px;
-                border-radius: 24px;
+                width: 100%;
+                max-width: 320px;
+                justify-self: end;
+                padding: 16px;
+                border-radius: 20px;
                 background: linear-gradient(180deg, rgba(20, 28, 45, 0.92), rgba(24, 33, 52, 0.92));
                 border: 1px solid rgba(148, 163, 184, 0.12);
             }}
             .employee-form-title {{
-                font-size: 18px;
+                font-size: 16px;
                 font-weight: 900;
                 color: #f8fafc;
             }}
             .employee-form-sub {{
-                margin-top: 8px;
-                font-size: 13px;
-                line-height: 1.7;
+                margin-top: 6px;
+                font-size: 12px;
+                line-height: 1.55;
                 color: #94a3b8;
             }}
             .employee-form-grid {{
                 display: grid;
-                gap: 14px;
-                margin-top: 18px;
+                gap: 10px;
+                margin-top: 12px;
             }}
             .employee-form-label {{
                 display: block;
-                margin-bottom: 8px;
-                font-size: 12px;
+                margin-bottom: 6px;
+                font-size: 11px;
                 font-weight: 800;
-                letter-spacing: 0.12em;
+                letter-spacing: 0.1em;
                 text-transform: uppercase;
                 color: #94a3b8;
             }}
             .employee-form-actions {{
                 display: grid;
-                gap: 12px;
-                margin-top: 18px;
+                gap: 8px;
+                margin-top: 12px;
+            }}
+            .employee-form-card .employee-form-input {{
+                border-radius: 12px;
+                padding: 9px 12px;
+                font-size: 13px;
+            }}
+            .employee-form-card .posts-toolbar-btn {{
+                gap: 7px;
+                border-radius: 11px;
+                padding: 8px 11px;
+                font-size: 12px;
             }}
             .employee-save-btn {{
                 width: 100%;
@@ -10917,9 +11032,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 text-transform: uppercase;
             }}
             .employee-form-note {{
-                margin-top: 14px;
-                font-size: 12px;
-                line-height: 1.7;
+                margin-top: 10px;
+                font-size: 11px;
+                line-height: 1.5;
                 color: #94a3b8;
             }}
             .posts-table {{
@@ -11504,6 +11619,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 border: 1px solid rgba(148, 163, 184, 0.1);
                 box-shadow: 0 22px 50px rgba(15, 23, 42, 0.2);
                 overflow: hidden;
+                position: relative;
+                display: flex;
+                flex-direction: column;
             }}
             .dashboard-shell.is-sidebar-collapsed {{
                 grid-template-columns: 92px minmax(0, 1fr);
@@ -11539,7 +11657,23 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 margin: 0;
             }}
             .dashboard-main-inner {{
-                padding: 14px 18px 20px;
+                padding: 14px 18px 72px;
+                flex: 1 1 auto;
+            }}
+            .dashboard-footer-note {{
+                position: sticky;
+                bottom: 0;
+                z-index: 20;
+                margin-top: 0;
+                padding: 10px 16px 11px;
+                font-size: 12px;
+                font-weight: 800;
+                letter-spacing: 0.04em;
+                color: #64748b;
+                text-align: center;
+                border-top: 1px solid rgba(148, 163, 184, 0.16);
+                background: linear-gradient(180deg, rgba(18, 24, 37, 0.92), rgba(18, 24, 37, 0.98));
+                backdrop-filter: blur(8px);
             }}
             .dashboard-section {{
                 scroll-margin-top: 24px;
@@ -11585,6 +11719,11 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(249, 250, 252, 0.98));
                 border-color: rgba(148, 163, 184, 0.18);
                 box-shadow: 0 22px 50px rgba(148, 163, 184, 0.14);
+            }}
+            html[data-theme="light"] .dashboard-footer-note {{
+                color: #475569;
+                border-top-color: rgba(148, 163, 184, 0.22);
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(248, 250, 252, 0.98));
             }}
             html[data-theme="light"] .sidebar-brand-title,
             html[data-theme="light"] .sidebar-status-value,
@@ -11636,7 +11775,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
             html[data-theme="light"] .dashboard-section-title,
             html[data-theme="light"] .dashboard-card-title,
             html[data-theme="light"] .overview-subtitle,
-            html[data-theme="light"] .overview-stat-label,
+            html[data-theme="light"] .overview-stat-label {{
+                color: #64748b !important;
+            }}
             /* Prevent browser autofill from forcing white input backgrounds in dark mode. */
             html:not([data-theme="light"]) input:-webkit-autofill,
             html:not([data-theme="light"]) input:-webkit-autofill:hover,
@@ -11731,6 +11872,38 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 border-color: rgba(148, 163, 184, 0.18) !important;
                 color: #0f172a;
             }}
+            html[data-theme="light"] .posts-chip span {{
+                color: #475569 !important;
+            }}
+            html[data-theme="light"] .posts-chip.is-active {{
+                background: rgba(59, 130, 246, 0.1) !important;
+                border-color: rgba(59, 130, 246, 0.22) !important;
+                color: #1d4ed8 !important;
+                box-shadow: 0 10px 20px rgba(148, 163, 184, 0.1);
+            }}
+            html[data-theme="light"] .posts-chip.is-active span {{
+                color: #1e40af !important;
+            }}
+            html[data-theme="light"] .employee-table thead th {{
+                background: rgba(71, 85, 105, 0.96) !important;
+                color: #e2e8f0 !important;
+            }}
+            html[data-theme="light"] .employee-table tbody td {{
+                color: #334155 !important;
+                border-top-color: rgba(148, 163, 184, 0.2) !important;
+            }}
+            html[data-theme="light"] .employee-table tbody tr:hover {{
+                background: rgba(241, 245, 249, 0.82);
+            }}
+            html[data-theme="light"] .employee-table tbody td:nth-child(4),
+            html[data-theme="light"] .employee-table tbody td:nth-child(5) {{
+                color: #475569 !important;
+                font-weight: 700;
+            }}
+            html[data-theme="light"] .employee-table tbody td:nth-child(5) {{
+                color: #1e293b !important;
+                font-weight: 900;
+            }}
             html[data-theme="light"] .overview-filter-trigger {{
                 background: rgba(255, 255, 255, 0.95);
                 color: #334155;
@@ -11755,6 +11928,29 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 background: rgba(255, 255, 255, 0.92) !important;
                 border-color: rgba(148, 163, 184, 0.18) !important;
                 box-shadow: 0 10px 24px rgba(148, 163, 184, 0.1);
+            }}
+            html[data-theme="light"] .posts-detail-summary-shell {{
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.98)) !important;
+                border-color: rgba(148, 163, 184, 0.2) !important;
+                box-shadow: 0 10px 24px rgba(148, 163, 184, 0.12);
+            }}
+            html[data-theme="light"] .posts-detail-summary-chip {{
+                background: rgba(248, 250, 252, 0.96) !important;
+                border-color: rgba(148, 163, 184, 0.2) !important;
+                color: #334155 !important;
+            }}
+            html[data-theme="light"] .posts-detail-summary-chip i {{
+                color: #64748b !important;
+            }}
+            html[data-theme="light"] .posts-detail-summary-card {{
+                background: rgba(248, 250, 252, 0.96) !important;
+                border-color: rgba(148, 163, 184, 0.2) !important;
+            }}
+            html[data-theme="light"] .posts-detail-summary-label {{
+                color: #64748b !important;
+            }}
+            html[data-theme="light"] .posts-detail-summary-value {{
+                color: #0f172a !important;
             }}
             html[data-theme="light"] .posts-columns-popover {{
                 background: linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(248, 250, 252, 0.99));
@@ -11880,6 +12076,31 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 border-color: rgba(148, 163, 184, 0.18);
                 box-shadow: 0 8px 18px rgba(148, 163, 184, 0.08);
             }}
+            html[data-theme="light"] #theo-doi-lan-chay .schedule-history-status.text-emerald-300 {{
+                color: #059669 !important;
+            }}
+            html[data-theme="light"] #theo-doi-lan-chay .schedule-history-status.text-sky-300 {{
+                color: #0369a1 !important;
+            }}
+            html[data-theme="light"] #theo-doi-lan-chay .schedule-history-status.text-rose-300 {{
+                color: #be123c !important;
+            }}
+            html[data-theme="light"] #theo-doi-lan-chay .schedule-history-status.text-amber-300 {{
+                color: #b45309 !important;
+            }}
+            html[data-theme="light"] #theo-doi-lan-chay .schedule-history-meta {{
+                color: #475569 !important;
+            }}
+            html[data-theme="light"] #theo-doi-lan-chay .schedule-history-detail-btn {{
+                background: rgba(37, 99, 235, 0.1);
+                border-color: rgba(37, 99, 235, 0.3);
+                color: #1d4ed8;
+            }}
+            html[data-theme="light"] #theo-doi-lan-chay .schedule-history-detail-btn:hover {{
+                background: rgba(37, 99, 235, 0.16);
+                border-color: rgba(37, 99, 235, 0.42);
+                color: #1e40af;
+            }}
             html[data-theme="light"] #theo-doi-lan-chay .schedule-history-empty {{
                 background: rgba(248, 250, 252, 0.96);
                 border-color: rgba(148, 163, 184, 0.18);
@@ -11952,6 +12173,50 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             html[data-theme="light"] #chien-dich .posts-chip.is-active span {{
                 color: #475569;
+            }}
+            html[data-theme="light"] #cau-hinh .text-slate-500 {{
+                color: #475569 !important;
+            }}
+            html[data-theme="light"] #cau-hinh .text-slate-400 {{
+                color: #334155 !important;
+            }}
+            html[data-theme="light"] #cau-hinh .text-blue-300 {{
+                color: #1d4ed8 !important;
+            }}
+            html[data-theme="light"] #cau-hinh .text-sky-300 {{
+                color: #0369a1 !important;
+            }}
+            html[data-theme="light"] #cau-hinh .text-cyan-200,
+            html[data-theme="light"] #cau-hinh .text-cyan-200\\/80 {{
+                color: #0f766e !important;
+            }}
+            html[data-theme="light"] #cau-hinh .text-emerald-200 {{
+                color: #047857 !important;
+            }}
+            html[data-theme="light"] #cau-hinh .runtime-scroll-panel {{
+                background: linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.98)) !important;
+                border-color: rgba(148, 163, 184, 0.24) !important;
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.85);
+            }}
+            html[data-theme="light"] #cau-hinh .bg-cyan-500\\/10 {{
+                background: rgba(6, 182, 212, 0.16) !important;
+            }}
+            html[data-theme="light"] #cau-hinh .border-cyan-500\\/20 {{
+                border-color: rgba(14, 116, 144, 0.32) !important;
+            }}
+            html[data-theme="light"] #cau-hinh .bg-emerald-500\\/15 {{
+                background: rgba(16, 185, 129, 0.22) !important;
+            }}
+            html[data-theme="light"] #cau-hinh .border-emerald-400\\/30 {{
+                border-color: rgba(5, 150, 105, 0.36) !important;
+            }}
+            html[data-theme="light"] #cau-hinh [data-column-source] {{
+                color: #334155 !important;
+            }}
+            html[data-theme="light"] #cau-hinh input::placeholder,
+            html[data-theme="light"] #cau-hinh textarea::placeholder {{
+                color: #64748b !important;
+                opacity: 1;
             }}
             html[data-theme="light"] .settings-nav-shell,
             html[data-theme="light"] .settings-pane-shell {{
@@ -12045,6 +12310,22 @@ def home(request: Request, background_tasks: BackgroundTasks):
             html[data-theme="light"] .link-history-link,
             html[data-theme="light"] .post-creator-handle {{
                 color: #2563eb;
+            }}
+            html[data-theme="light"] .text-amber-200,
+            html[data-theme="light"] .text-amber-300,
+            html[data-theme="light"] .text-amber-400,
+            html[data-theme="light"] .text-amber-500 {{
+                color: #92400e !important;
+            }}
+            html[data-theme="light"] .text-rose-200,
+            html[data-theme="light"] .text-rose-300 {{
+                color: #be123c !important;
+            }}
+            html[data-theme="light"] .bg-amber-500\\/10 {{
+                background: rgba(251, 191, 36, 0.18) !important;
+            }}
+            html[data-theme="light"] .border-amber-500\\/20 {{
+                border-color: rgba(217, 119, 6, 0.36) !important;
             }}
             html[data-theme="light"] .link-history-link:hover {{
                 color: #1d4ed8;
@@ -12145,6 +12426,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 .employee-layout {{
                     grid-template-columns: 1fr;
                 }}
+                .employee-form-card {{
+                    max-width: none;
+                    justify-self: stretch;
+                }}
                 .settings-layout {{
                     grid-template-columns: 1fr;
                 }}
@@ -12158,19 +12443,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 .overview-header {{
                     flex-direction: column;
                 }}
-                .overview-chart-head {{
-                    flex-direction: column;
-                    padding-right: 0;
-                }}
                 .overview-head-actions {{
-                    width: 100%;
-                    justify-content: flex-start;
-                }}
-                .overview-chart-filter-anchor {{
-                    position: absolute;
-                    top: 56px;
-                    right: 18px;
-                    margin-top: 0;
+                    justify-content: flex-end;
                 }}
                 .overview-actions {{
                     justify-content: flex-start;
@@ -12200,7 +12474,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     flex-wrap: wrap;
                 }}
                 .dashboard-main-inner {{
-                    padding: 18px;
+                    padding: 18px 18px 72px;
                 }}
                 .employee-summary-grid {{
                     width: 100%;
@@ -12318,6 +12592,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 const scheduleTrackCalendarTitle = document.getElementById("schedule-track-calendar-title");
                 const scheduleTrackCalendarSubtext = document.getElementById("schedule-track-calendar-subtext");
                 const scheduleTrackCalendar = document.getElementById("schedule-track-calendar");
+                const scheduleTrackDetailShell = document.getElementById("schedule-track-detail-shell");
                 const scheduleTrackDetailBody = document.getElementById("schedule-track-detail-body");
                 const scheduleTrackEmptyState = document.getElementById("schedule-track-empty-state");
                 const scheduleTargetSummary = document.getElementById("schedule-target-summary");
@@ -14131,6 +14406,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 let postsActiveTabLabel = document.getElementById("posts-active-tab-label");
                 let postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
                 let postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
+                let postsTabPanelsWrap = document.querySelector(".posts-tab-panels");
                 let postsSelectionPlaceholder = document.getElementById("posts-selection-placeholder");
                 let postsMasterView = document.getElementById("posts-master-view");
                 let postsDetailView = document.getElementById("posts-detail-view");
@@ -14190,6 +14466,19 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     postsVisibleCount = document.getElementById("posts-visible-count");
                     postsActiveTabLabel = document.getElementById("posts-active-tab-label");
                     postsTabCards = Array.from(document.querySelectorAll("[data-posts-tab-trigger]"));
+                    postsTabPanelsWrap = document.querySelector(".posts-tab-panels");
+                    if (postsTabPanelsWrap) {{
+                        const seenPanelSlugs = new Set();
+                        Array.from(postsTabPanelsWrap.querySelectorAll("[data-posts-tab-panel]")).forEach((panel) => {{
+                            const slug = String(panel.dataset.postsTabPanel || "").trim();
+                            if (!slug) return;
+                            if (seenPanelSlugs.has(slug)) {{
+                                panel.remove();
+                                return;
+                            }}
+                            seenPanelSlugs.add(slug);
+                        }});
+                    }}
                     postsTabPanels = Array.from(document.querySelectorAll("[data-posts-tab-panel]"));
                     postsSelectionPlaceholder = document.getElementById("posts-selection-placeholder");
                     postsMasterView = document.getElementById("posts-master-view");
@@ -14383,7 +14672,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         return matchesSearch && matchesRole && matchesStatus;
                     }});
                     employeeTableBody.innerHTML = rows.map((item) => {{
-                        const forcedHint = item.is_forced_admin ? '<div class="employee-meta">Admin cứng</div>' : `<div class="employee-meta">${{item.role_label}}</div>`;
+                        const forcedHint = item.is_forced_admin ? '<div class="employee-meta">Super admin</div>' : `<div class="employee-meta">${{item.role_label}}</div>`;
                         return `
                             <tr>
                                 <td>
@@ -14720,6 +15009,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     lastScheduleTrackingSignature = scheduleTrackingSignature;
                     if (scheduleTrackList && typeof tracking.entries_html === "string") {{
                         setHtmlIfChanged(scheduleTrackList, tracking.entries_html);
+                    }}
+                    if (scheduleTrackDetailShell) {{
+                        scheduleTrackDetailShell.classList.toggle("hidden", !tracking.has_active_entry);
                     }}
                     if (scheduleTrackDetailBody) {{
                         scheduleTrackDetailBody.classList.toggle("hidden", !tracking.has_active_entry);
@@ -15296,38 +15588,51 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 }}
                                 const showTooltip = (event, pointData) => {{
                                     if (!tooltip || !pointData) return;
+                                    const isLightTheme = document.documentElement?.dataset?.theme === "light";
+                                    const titleColor = isLightTheme ? "#0f172a" : "#f8fafc";
+                                    const bodyColor = isLightTheme ? "#334155" : "#cbd5e1";
+                                    const mutedColor = isLightTheme ? "#475569" : "#94a3b8";
+                                    const topBrandColor = isLightTheme ? "#1d4ed8" : "#93c5fd";
+                                    const topSheetColor = isLightTheme ? "#4338ca" : "#a5b4fc";
                                     const topBrands = (Array.isArray(pointData.topBrands) ? pointData.topBrands : []).slice(0, 2);
                                     const topSheets = (Array.isArray(pointData.topSheets) ? pointData.topSheets : []).slice(0, 2);
                                     const topBrandHtml = topBrands.length
-                                        ? topBrands.map((item, idx) => `<div style="color:#93c5fd;font-size:11px;line-height:1.35;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
-                                        : '<div style="color:#64748b;">Chưa có dữ liệu thương hiệu</div>';
+                                        ? topBrands.map((item, idx) => `<div style="color:${{topBrandColor}};font-size:11px;line-height:1.35;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
+                                        : `<div style="color:${{mutedColor}};">Chưa có dữ liệu thương hiệu</div>`;
                                     const topSheetHtml = topSheets.length
-                                        ? topSheets.map((item, idx) => `<div style="color:#a5b4fc;font-size:11px;line-height:1.35;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
-                                        : '<div style="color:#64748b;">Chưa có dữ liệu sheet</div>';
+                                        ? topSheets.map((item, idx) => `<div style="color:${{topSheetColor}};font-size:11px;line-height:1.35;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
+                                        : `<div style="color:${{mutedColor}};">Chưa có dữ liệu sheet</div>`;
                                     const brandDetailBlock = pointData.__brandName
                                         ? `
                                             <div style="margin-top:6px;color:${{pointData.__brandColor || "#f59e0b"}};font-weight:800;font-size:11px;">
                                                 Thương hiệu: ${{pointData.__brandName}}
                                             </div>
-                                            <div style="color:#cbd5e1;font-size:11px;">Buzz (brand): <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.__brandBuzz || 0)}}</strong></div>
+                                            <div style="color:${{bodyColor}};font-size:11px;">Buzz (brand): <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.__brandBuzz || 0)}}</strong></div>
                                         `
                                         : "";
                                     tooltip.innerHTML = `
-                                        <div style="font-weight:800;color:#f8fafc;font-size:12px;">${{pointData.label || pointData.key || "N/A"}}</div>
-                                        <div style="margin-top:3px;color:#cbd5e1;font-size:11px;">Buzz: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.buzz || 0)}}</strong></div>
-                                        <div style="color:#cbd5e1;font-size:11px;">Lượt xem: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.views || 0)}}</strong></div>
+                                        <div style="font-weight:800;color:${{titleColor}};font-size:12px;">${{pointData.label || pointData.key || "N/A"}}</div>
+                                        <div style="margin-top:3px;color:${{bodyColor}};font-size:11px;">Buzz: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.buzz || 0)}}</strong></div>
+                                        <div style="color:${{bodyColor}};font-size:11px;">Lượt xem: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.views || 0)}}</strong></div>
                                         ${{brandDetailBlock}}
-                                        <div style="margin-top:6px;color:#94a3b8;font-weight:700;font-size:11px;">Thương hiệu (${{topBrands.length}}):</div>
+                                        <div style="margin-top:6px;color:${{mutedColor}};font-weight:700;font-size:11px;">Thương hiệu (${{topBrands.length}}):</div>
                                         <div style="margin-top:2px;">${{topBrandHtml}}</div>
-                                        <div style="margin-top:6px;color:#94a3b8;font-weight:700;font-size:11px;">Sheet (${{topSheets.length}}):</div>
+                                        <div style="margin-top:6px;color:${{mutedColor}};font-weight:700;font-size:11px;">Sheet (${{topSheets.length}}):</div>
                                         <div style="margin-top:2px;">${{topSheetHtml}}</div>
                                     `;
                                     tooltip.classList.remove("hidden");
-                                    const rect = svg.getBoundingClientRect();
-                                    const x = (event?.clientX || rect.left) - rect.left + 14;
-                                    const y = (event?.clientY || rect.top) - rect.top - 14;
-                                    tooltip.style.left = `${{Math.max(12, x)}}px`;
-                                    tooltip.style.top = `${{Math.max(12, y)}}px`;
+                                    const svgRect = svg.getBoundingClientRect();
+                                    const hostRect = tooltip.offsetParent?.getBoundingClientRect() || svgRect;
+                                    const rawX = (event?.clientX || svgRect.left) - hostRect.left + 14;
+                                    const rawY = (event?.clientY || svgRect.top) - hostRect.top - 14;
+                                    const tooltipWidth = tooltip.offsetWidth || 216;
+                                    const tooltipHeight = tooltip.offsetHeight || 160;
+                                    const maxLeft = Math.max(12, hostRect.width - tooltipWidth - 12);
+                                    const maxTop = Math.max(12, hostRect.height - tooltipHeight - 12);
+                                    const left = Math.min(Math.max(12, rawX), maxLeft);
+                                    const top = Math.min(Math.max(12, rawY), maxTop);
+                                    tooltip.style.left = `${{left}}px`;
+                                    tooltip.style.top = `${{top}}px`;
                                 }};
                                 const hideTooltip = () => {{
                                     if (!tooltip) return;
@@ -15395,9 +15700,19 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 defs.appendChild(greyGrad);
                                 svg.appendChild(defs);
 
+                                const isLightThemeChart = document.documentElement?.dataset?.theme === "light";
+                                const chartBgFill = isLightThemeChart ? "rgba(248, 250, 252, 0.94)" : "rgba(15, 23, 42, 0.4)";
+                                const chartBgStroke = isLightThemeChart ? "rgba(148, 163, 184, 0.28)" : "rgba(148, 163, 184, 0.1)";
+                                const gridLineColor = isLightThemeChart ? "rgba(100, 116, 139, 0.24)" : "rgba(148, 163, 184, 0.1)";
+                                const axisBuzzColor = isLightThemeChart ? "rgba(5, 150, 105, 0.82)" : "rgba(16, 185, 129, 0.6)";
+                                const axisViewColor = isLightThemeChart ? "rgba(2, 132, 199, 0.82)" : "rgba(56, 189, 248, 0.6)";
+                                const axisLabelColor = isLightThemeChart ? "rgba(71, 85, 105, 0.9)" : "rgba(148, 163, 184, 0.9)";
+                                const barStrokeColor = isLightThemeChart ? "rgba(255, 255, 255, 0.78)" : "rgba(15, 23, 42, 0.5)";
+                                const pointFillColor = isLightThemeChart ? "#ffffff" : "#0f172a";
+
                                 const bgRect = createSvgNode("rect", {{
                                     x: padding.left, y: padding.top, width: innerWidth, height: innerHeight,
-                                    rx: 24, fill: "rgba(15, 23, 42, 0.4)", stroke: "rgba(148, 163, 184, 0.1)", "stroke-width": 1
+                                    rx: 24, fill: chartBgFill, stroke: chartBgStroke, "stroke-width": 1
                                 }});
                                 svg.appendChild(bgRect);
 
@@ -15408,18 +15723,18 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     
                                     svg.appendChild(createSvgNode("line", {{
                                         x1: padding.left, y1: y, x2: width - padding.right, y2: y,
-                                        stroke: "rgba(148, 163, 184, 0.1)", "stroke-width": 1, "stroke-dasharray": "4 8"
+                                        stroke: gridLineColor, "stroke-width": 1, "stroke-dasharray": "4 8"
                                     }}));
                                     
                                     const lblLeft = createSvgNode("text", {{
-                                        x: padding.left - 12, y: y + 4, fill: "rgba(16, 185, 129, 0.6)",
+                                        x: padding.left - 12, y: y + 4, fill: axisBuzzColor,
                                         "font-size": 11, "font-weight": 700, "text-anchor": "end"
                                     }});
                                     lblLeft.textContent = formatMetric(buzzVal);
                                     svg.appendChild(lblLeft);
 
                                     const lblRight = createSvgNode("text", {{
-                                        x: width - padding.right + 12, y: y + 4, fill: "rgba(56, 189, 248, 0.6)",
+                                        x: width - padding.right + 12, y: y + 4, fill: axisViewColor,
                                         "font-size": 11, "font-weight": 700, "text-anchor": "start"
                                     }});
                                     lblRight.textContent = formatMetric(viewVal);
@@ -15447,7 +15762,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                         const barColor = brandColorByName.get(brandName) || "#f59e0b";
                                         const bar = createSvgNode("rect", {{
                                             x: barX, y: barY, width: barW, height: barH + 20,
-                                            rx: 4, fill: barColor, stroke: "rgba(15, 23, 42, 0.5)", "stroke-width": 1,
+                                            rx: 4, fill: barColor, stroke: barStrokeColor, "stroke-width": 1,
                                             style: "transition: all 0.3s ease; clip-path: inset(0 0 20px 0);"
                                         }});
                                         bar.addEventListener("mouseenter", (e) => showTooltip(e, {{
@@ -15465,7 +15780,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                         const dateTxt = createSvgNode("text", {{
                                             x,
                                             y: height - 14,
-                                            fill: "rgba(148, 163, 184, 0.9)",
+                                            fill: axisLabelColor,
                                             "font-size": 10,
                                             "font-weight": 700,
                                             "text-anchor": "middle"
@@ -15533,7 +15848,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                                 cx: pt.x,
                                                 cy: pt.y,
                                                 r: 5,
-                                                fill: "#0f172a",
+                                                fill: pointFillColor,
                                                 stroke: "#38bdf8",
                                                 "stroke-width": 3
                                             }});
@@ -15961,6 +16276,118 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }}
                 }};
 
+                const bindSheetToSchedule = async (sheetId = "", sheetName = "", preferredKey = "") => {{
+                    const syncVisibleScheduleBinding = (responseData, fallbackName = "", fallbackKey = "") => {{
+                        const liveSearchInput = document.getElementById("schedule-sheet-search");
+                        const liveSelectInput = document.getElementById("schedule-sheet-select");
+                        const config = responseData?.schedule_config || {{}};
+                        const resolvedKey = String(config.sheet_binding_key || fallbackKey || "").trim();
+                        const resolvedName = String(config.sheet_name_text || fallbackName || "").trim();
+                        if (liveSelectInput && resolvedKey) {{
+                            const exists = Array.from(liveSelectInput.options || []).some((option) => option.value === resolvedKey);
+                            if (!exists) {{
+                                const option = document.createElement("option");
+                                option.value = resolvedKey;
+                                option.textContent = resolvedName || resolvedKey;
+                                liveSelectInput.appendChild(option);
+                            }}
+                            liveSelectInput.value = resolvedKey;
+                        }}
+                        if (liveSearchInput && resolvedName) {{
+                            liveSearchInput.value = resolvedName;
+                        }}
+                    }};
+
+                    closePostsSheetActionMenus();
+                    closePostsColumnMenus();
+                    setActivePanel("lich-tu-dong", {{ historyMode: "push" }});
+                    const activeScheduleSheetSearch = document.getElementById("schedule-sheet-search") || scheduleSheetSearch;
+                    const activeScheduleSheetSelect = document.getElementById("schedule-sheet-select") || scheduleSheetSelect;
+                    if (!activeScheduleSheetSelect || !activeScheduleSheetSearch) {{
+                        showNotice("Không mở được phần lịch tự động.", "error");
+                        return;
+                    }}
+
+                    snapshotScheduleSheetOptions();
+                    if (!scheduleSheetOptionItems.length) {{
+                        rebuildScheduleSheetSelectOptions(activeScheduleSheetSelect.value || "");
+                    }}
+
+                    const normalizedKey = String(preferredKey || "").trim();
+                    const normalizedSheetId = String(sheetId || "").trim();
+                    const normalizedSheetName = String(sheetName || "").trim();
+                    const fallbackKey = normalizedKey || (
+                        normalizedSheetId && normalizedSheetName
+                            ? `${{normalizedSheetId}}::${{normalizedSheetName}}`
+                            : ""
+                    );
+                    let targetItem = null;
+
+                    if (normalizedKey) {{
+                        targetItem = scheduleSheetOptionItems.find((item) => item.value === normalizedKey) || null;
+                    }}
+                    if (!targetItem && normalizedSheetId && normalizedSheetName) {{
+                        targetItem = scheduleSheetOptionItems.find(
+                            (item) => item.sheetId === normalizedSheetId && item.sheetName === normalizedSheetName
+                        ) || null;
+                    }}
+                    if (!targetItem && normalizedSheetId) {{
+                        targetItem = scheduleSheetOptionItems.find((item) => item.sheetId === normalizedSheetId) || null;
+                    }}
+                    if (!targetItem && normalizedSheetName) {{
+                        targetItem = scheduleSheetOptionItems.find((item) => item.sheetName === normalizedSheetName) || null;
+                    }}
+
+                    if (!targetItem) {{
+                        if (normalizedSheetName) {{
+                            activeScheduleSheetSearch.value = normalizedSheetName;
+                        }}
+                        if (!fallbackKey) {{
+                            showNotice("Thiếu thông tin sheet để đặt lịch.", "warning");
+                            return;
+                        }}
+                        const fallbackData = await selectScheduleEntry(fallbackKey, "form", false);
+                        if (fallbackData?.ok) {{
+                            const appliedItem = scheduleSheetOptionItems.find((item) => item.value === fallbackKey)
+                                || scheduleSheetOptionItems.find((item) => item.sheetId === normalizedSheetId && item.sheetName === normalizedSheetName)
+                                || scheduleSheetOptionItems.find((item) => item.sheetId === normalizedSheetId)
+                                || null;
+                            if (appliedItem) {{
+                                activeScheduleSheetSearch.value = appliedItem.label;
+                                activeScheduleSheetSelect.value = appliedItem.value;
+                            }}
+                            syncVisibleScheduleBinding(
+                                fallbackData,
+                                appliedItem?.label || normalizedSheetName || "",
+                                appliedItem?.value || fallbackKey
+                            );
+                            showNotice(
+                                fallbackData.message || `Đã chọn lịch cho "${{appliedItem?.label || normalizedSheetName || "sheet vừa chọn"}}".`,
+                                fallbackData.level || "success"
+                            );
+                            return;
+                        }}
+                        showNotice(
+                            fallbackData?.message || "Không tìm thấy sheet này trong danh sách lịch.",
+                            fallbackData?.level || "warning"
+                        );
+                        return;
+                    }}
+
+                    activeScheduleSheetSearch.value = targetItem.label;
+                    activeScheduleSheetSelect.value = targetItem.value;
+                    const data = await selectScheduleEntry(targetItem.value, "form", false);
+                    syncVisibleScheduleBinding(
+                        data,
+                        targetItem.label || normalizedSheetName || "",
+                        targetItem.value || fallbackKey
+                    );
+                    showNotice(
+                        data?.message || (data?.ok ? `Đã chọn lịch cho "${{targetItem.label}}".` : "Không chọn được sheet cho lịch."),
+                        data?.level || (data?.ok ? "success" : "error")
+                    );
+                }};
+
                 const closeEditMetadataModal = () => {{
                     const modal = document.getElementById("edit-metadata-modal");
                     if (!modal) return;
@@ -15974,8 +16401,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         e.preventDefault();
                         const formData = new FormData(editMetaForm);
                         const p = Object.fromEntries(formData.entries());
-                        const modal = document.getElementById("edit-metadata-modal");
                         const submitBtn = editMetaForm.querySelector('button[type="submit"]');
+                        let savedSuccessfully = false;
                         if (submitBtn) submitBtn.disabled = true;
                         
                         try {{
@@ -15993,8 +16420,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             }} catch (_) {{
                                 data = null;
                             }}
-                            const isSuccess = Boolean(data?.ok || (res?.ok && data?.ok !== false));
-                            if (isSuccess) {{
+                            savedSuccessfully = Boolean(data?.ok || (res?.ok && data?.ok !== false));
+                            if (savedSuccessfully) {{
                                 closeEditMetadataModal();
                                 showNotice(data?.message || "Cập nhật thành công", "success");
                                 let hasPatchedUi = false;
@@ -16024,15 +16451,73 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         }} catch (err) {{
                             showNotice("Lỗi kết nối server", "error");
                         }} finally {{
+                            if (savedSuccessfully) {{
+                                closeEditMetadataModal();
+                            }}
                             if (submitBtn) submitBtn.disabled = false;
                         }}
                     }});
                 }}
 
+                const ensurePostsDetailPanelLoaded = async (tabSlug, card = null) => {{
+                    const safeSlug = String(tabSlug || "").trim();
+                    if (!safeSlug) return null;
+                    syncPostsDomRefs();
+                    const existingPanel = postsTabPanels.find((panel) => panel.dataset.postsTabPanel === safeSlug);
+                    if (existingPanel) return existingPanel;
+                    const sourceCard = card || postsTabCards.find((item) => (item.dataset.postsTabTrigger || "") === safeSlug);
+                    if (!sourceCard || !postsTabPanelsWrap) return null;
+
+                    const sheetId = String(sourceCard.dataset.postsSheetId || "").trim();
+                    const sheetName = String(sourceCard.dataset.postsSheetName || "").trim();
+                    if (!sheetId || !sheetName) return null;
+
+                    try {{
+                        if (postsSelectionPlaceholder) {{
+                            postsSelectionPlaceholder.classList.remove("hidden");
+                            postsSelectionPlaceholder.innerHTML = '<div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Chi tiết</div><div class="mt-3 text-2xl font-black text-slate-100">Đang tải dữ liệu sheet...</div><p class="mt-2 text-sm text-slate-400">Vui lòng chờ trong giây lát.</p>';
+                        }}
+                        const params = new URLSearchParams({{
+                            sheet_id: sheetId,
+                            sheet_name: sheetName,
+                            sheet_slug: safeSlug,
+                            campaign_label: String(sourceCard.dataset.postsSheetCampaign || "").trim(),
+                            brand_label: String(sourceCard.dataset.postsSheetBrand || "").trim(),
+                            industry_label: String(sourceCard.dataset.postsSheetIndustry || "").trim(),
+                        }});
+                        const response = await fetch(`/api/dashboard/posts-detail?${{params.toString()}}`, {{
+                            headers: {{ "X-Requested-With": "fetch" }},
+                            cache: "no-store",
+                        }});
+                        const data = await response.json();
+                        if (!response.ok || !data?.ok || typeof data.html !== "string" || !data.html.trim()) {{
+                            showNotice(data?.message || "Không tải được chi tiết sheet.", "error");
+                            return null;
+                        }}
+                        const template = document.createElement("template");
+                        template.innerHTML = data.html.trim();
+                        const panel = template.content.firstElementChild;
+                        if (!panel) return null;
+                        postsTabPanelsWrap.appendChild(panel);
+                        syncPostsDomRefs();
+                        const freshPanel = postsTabPanels.find((item) => (item.dataset.postsTabPanel || "") === safeSlug) || panel;
+                        compactPostsMetricCells();
+                        initializePostsPanel();
+                        return freshPanel;
+                    }} catch (_) {{
+                        showNotice("Không tải được chi tiết sheet. Vui lòng thử lại.", "error");
+                        return null;
+                    }}
+                }};
+
                 const setActivePostsTab = (tabSlug) => {{
+                    syncPostsDomRefs();
                     const safeSlug = postsTabCards.some((card) => card.dataset.postsTabTrigger === tabSlug)
                         ? tabSlug
                         : "";
+                    const activePanel = safeSlug
+                        ? (postsTabPanels.find((panel) => panel.dataset.postsTabPanel === safeSlug) || null)
+                        : null;
                     if (postsMasterView) {{
                         postsMasterView.classList.toggle("hidden", !!safeSlug);
                     }}
@@ -16046,9 +16531,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         panel.classList.toggle("is-active", !!safeSlug && panel.dataset.postsTabPanel === safeSlug);
                     }});
                     if (postsSelectionPlaceholder) {{
-                        postsSelectionPlaceholder.classList.toggle("hidden", !!safeSlug);
+                        postsSelectionPlaceholder.classList.toggle("hidden", !!(safeSlug && activePanel));
                     }}
-                    applyPostFilters(safeSlug ? getActivePostsPanel() : null);
+                    applyPostFilters(activePanel);
                 }};
 
                 const initializePostsPanel = () => {{
@@ -16071,17 +16556,23 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }}
 
                     postsTabCards.forEach((card) => {{
-                        card.addEventListener("click", (event) => {{
+                        if (card.dataset.postsClickBound === "1") return;
+                        card.dataset.postsClickBound = "1";
+                        card.addEventListener("click", async (event) => {{
                             if (event.target.closest("[data-posts-sheet-action-toggle], [data-posts-sheet-action-menu]")) {{
                                 return;
                             }}
                             closePostsSheetActionMenus();
                             closePostsColumnMenus();
-                            setActivePostsTab(card.dataset.postsTabTrigger || "");
+                            const targetSlug = card.dataset.postsTabTrigger || "";
+                            await ensurePostsDetailPanelLoaded(targetSlug, card);
+                            setActivePostsTab(targetSlug);
                         }});
                     }});
 
                     document.querySelectorAll("[data-posts-sheet-action-toggle]").forEach((toggle) => {{
+                        if (toggle.dataset.postsBound === "1") return;
+                        toggle.dataset.postsBound = "1";
                         toggle.addEventListener("click", (event) => {{
                             event.preventDefault();
                             event.stopPropagation();
@@ -16094,16 +16585,22 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }});
 
                     document.querySelectorAll("[data-posts-sheet-action='open-detail']").forEach((button) => {{
-                        button.addEventListener("click", (event) => {{
+                        if (button.dataset.postsBound === "1") return;
+                        button.dataset.postsBound = "1";
+                        button.addEventListener("click", async (event) => {{
                             event.preventDefault();
                             event.stopPropagation();
                             closePostsSheetActionMenus();
                             closePostsColumnMenus();
-                            setActivePostsTab(button.dataset.postsSheetTarget || "");
+                            const targetSlug = button.dataset.postsSheetTarget || "";
+                            await ensurePostsDetailPanelLoaded(targetSlug);
+                            setActivePostsTab(targetSlug);
                         }});
                     }});
 
                     document.querySelectorAll("[data-posts-sheet-action='edit-metadata']").forEach((button) => {{
+                        if (button.dataset.postsBound === "1") return;
+                        button.dataset.postsBound = "1";
                         button.addEventListener("click", (event) => {{
                             event.preventDefault();
                             event.stopPropagation();
@@ -16124,7 +16621,23 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         }});
                     }});
 
+                    document.querySelectorAll("[data-posts-sheet-action='bind-schedule']").forEach((button) => {{
+                        if (button.dataset.postsBound === "1") return;
+                        button.dataset.postsBound = "1";
+                        button.addEventListener("click", async (event) => {{
+                            event.preventDefault();
+                            event.stopPropagation();
+                            await bindSheetToSchedule(
+                                button.dataset.postsSheetId || "",
+                                button.dataset.postsSheetName || "",
+                                button.dataset.postsSheetKey || ""
+                            );
+                        }});
+                    }});
+
                     document.querySelectorAll("[data-posts-sheet-action='delete-sheet']").forEach((button) => {{
+                        if (button.dataset.postsBound === "1") return;
+                        button.dataset.postsBound = "1";
                         button.addEventListener("click", async (event) => {{
                             event.preventDefault();
                             event.stopPropagation();
@@ -16187,20 +16700,27 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }}
 
                     document.querySelectorAll("[data-posts-sheet-action-menu]").forEach((menu) => {{
+                        if (menu.dataset.postsBound === "1") return;
+                        menu.dataset.postsBound = "1";
                         menu.addEventListener("click", (event) => {{
                             event.stopPropagation();
                         }});
                     }});
 
                     if (postsBackButton) {{
-                        postsBackButton.addEventListener("click", () => {{
-                            closePostsSheetActionMenus();
-                            closePostsColumnMenus();
-                            setActivePostsTab("");
-                        }});
+                        if (postsBackButton.dataset.postsBound !== "1") {{
+                            postsBackButton.dataset.postsBound = "1";
+                            postsBackButton.addEventListener("click", () => {{
+                                closePostsSheetActionMenus();
+                                closePostsColumnMenus();
+                                setActivePostsTab("");
+                            }});
+                        }}
                     }}
 
                     postsMasterCampaignChips.forEach((chip) => {{
+                        if (chip.dataset.postsBound === "1") return;
+                        chip.dataset.postsBound = "1";
                         chip.addEventListener("click", () => {{
                             closePostsSheetActionMenus();
                             setPostsMasterCampaignFilter(chip.dataset.masterCampaign || "all");
@@ -16208,13 +16728,18 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }});
 
                     if (postsMasterSearchField) {{
-                        postsMasterSearchField.addEventListener("input", () => {{
-                            closePostsSheetActionMenus();
-                            applyPostsMasterFilters();
-                        }});
+                        if (postsMasterSearchField.dataset.postsBound !== "1") {{
+                            postsMasterSearchField.dataset.postsBound = "1";
+                            postsMasterSearchField.addEventListener("input", () => {{
+                                closePostsSheetActionMenus();
+                                applyPostsMasterFilters();
+                            }});
+                        }}
                     }}
 
                     postsTabPanels.forEach((panel) => {{
+                        if (panel.dataset.postsBound === "1") return;
+                        panel.dataset.postsBound = "1";
                         const searchField = panel.querySelector(".posts-search-field");
                         const rerunButton = panel.querySelector(".posts-rerun-btn");
                         const chips = Array.from(panel.querySelectorAll(".posts-chip"));
@@ -16670,7 +17195,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 </div>
                 <nav class="sidebar-nav">
                     <a href="/tong-quan" class="sidebar-link is-active" data-nav-link="tong-quan" title="Tổng quan"><span class="sidebar-link-icon"><i class="fa-solid fa-gauge-high"></i></span><span class="sidebar-link-label">Tổng quan</span></a>
-                    <a href="/cau-hinh" class="sidebar-link" data-nav-link="cau-hinh" title="Chuẩn bị"><span class="sidebar-link-icon"><i class="fa-solid fa-sliders"></i></span><span class="sidebar-link-label">Chuẩn bị</span></a>
+                    <a href="/cau-hinh" class="sidebar-link" data-nav-link="cau-hinh" title="Trình chạy"><span class="sidebar-link-icon"><i class="fa-solid fa-sliders"></i></span><span class="sidebar-link-label">Trình chạy</span></a>
                     <a href="/bai-dang" class="sidebar-link" data-nav-link="bai-dang" title="Bài đăng"><span class="sidebar-link-icon"><i class="fa-regular fa-newspaper"></i></span><span class="sidebar-link-label">Bài đăng</span></a>
                     <a href="/lich-tu-dong" class="sidebar-link" data-nav-link="lich-tu-dong" title="Lịch tự động"><span class="sidebar-link-icon"><i class="fa-regular fa-calendar-days"></i></span><span class="sidebar-link-label">Lịch tự động</span></a>
                     <a href="/cai-dat" class="sidebar-link" data-nav-link="cai-dat" title="Cài đặt"><span class="sidebar-link-icon"><i class="fa-solid fa-gear"></i></span><span class="sidebar-link-label">Cài đặt</span></a>
@@ -16792,7 +17317,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                         {schedule_tracking["entries_html"]}
                                     </div>
                                 </div>
-                                <div id="schedule-track-detail-shell" class="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3">
+                                <div id="schedule-track-detail-shell" class="rounded-2xl border border-white/10 bg-slate-950/35 px-3 py-3 {'hidden' if not schedule_tracking['has_active_entry'] else ''}">
                                     <div class="flex items-center justify-between gap-3 mb-3">
                                         <div>
                                             <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Theo dõi lần chạy</div>
@@ -16804,7 +17329,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                         <div class="text-sm font-black text-slate-200">Chọn một sheet ở danh sách bên trên</div>
                                         <div class="mt-2 text-xs text-slate-500">Khi bạn bấm đúng sheet muốn xem, bảng tracking bên dưới mới hiện chi tiết của sheet đó.</div>
                                     </div>
-                                    <div id="schedule-track-detail-body" class="grid grid-cols-1 2xl:grid-cols-[minmax(0,1fr),340px] gap-4 items-start {'hidden' if not schedule_tracking['has_active_entry'] else ''}">
+                                    <div id="schedule-track-detail-body" class="grid grid-cols-1 gap-4 items-start {'hidden' if not schedule_tracking['has_active_entry'] else ''}">
                                         <div>
                                             <div class="mt-3">
                                                 <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 font-black mb-2">Lịch sử gần nhất</div>
@@ -16813,21 +17338,13 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                                 </div>
                                             </div>
                                         </div>
-                                        <div class="rounded-2xl border border-white/10 bg-slate-900/40 p-3">
-                                            <div class="text-[11px] uppercase tracking-[0.22em] text-slate-400 font-black">Lịch xem trước</div>
-                                            <div id="schedule-track-calendar-title" class="mt-2 text-base font-black text-slate-100">{html.escape(schedule_tracking["calendar_title"])}</div>
-                                            <div id="schedule-track-calendar-subtext" class="mt-1 text-xs text-slate-400 leading-5">{html.escape(schedule_tracking["calendar_subtext"])}</div>
-                                            <div id="schedule-track-calendar" class="mt-4">
-                                                {schedule_tracking["calendar_html"]}
-                                            </div>
-                                        </div>
                                     </div>
                                 </div>
                             </div>
                         </div>
                     </section>
-
                 </div>
+                <div class="dashboard-footer-note">Bản quyền thuộc về Fanscom</div>
 
                 <div id="edit-metadata-modal" class="fixed inset-0 z-[100] hidden items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
                     <div class="bg-slate-900 border border-white/10 rounded-[2.5rem] w-full max-w-lg p-8 shadow-2xl shadow-black/50">
@@ -16855,7 +17372,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             </div>
 
                             <div class="flex gap-3 pt-4">
-                                <button type="button" onclick="(function(){{const m=document.getElementById('edit-metadata-modal'); if(m){{m.classList.add('hidden'); m.classList.remove('flex');}}}})()" class="flex-1 py-4 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-2xl font-bold transition-all">Hủy</button>
+                                <button type="button" onclick="(function(){{const m=document.getElementById('edit-metadata-modal'); if(m){{m.classList.add('hidden'); m.classList.remove('flex');}}}})()" class="flex-1 py-4 bg-slate-700 hover:bg-slate-600 text-white rounded-2xl font-black border border-white/10 transition-all">Hủy</button>
                                 <button type="submit" class="flex-[2] py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black shadow-lg shadow-emerald-900/20 transition-all">Lưu thay đổi</button>
                             </div>
                         </form>
