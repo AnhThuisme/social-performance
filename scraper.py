@@ -185,7 +185,7 @@ DASHBOARD_CACHE_LAST_SAVE_AT = 0.0
 LINK_RESOLVE_CACHE = {}  # {raw_url: {"final_url": "...", "updated_at": iso}}
 LINK_RESOLVE_CACHE_TTL_SECONDS = 1800
 # Bump khi thay đổi markup dashboard để invalidate cache HTML cũ (overview/posts/config/schedule).
-DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 5
+DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 10
 MAX_RUNTIME_LOG_LINES = max(100, int(os.getenv("MAX_RUNTIME_LOG_LINES", "400")))
 MAX_RUNTIME_LOG_RENDER_LINES = max(50, int(os.getenv("MAX_RUNTIME_LOG_RENDER_LINES", "160")))
 SHEET_TABS_REQUEST_LIMITER = {}  # {sheet_id: last_request_time}
@@ -449,6 +449,7 @@ def normalize_saved_sheet_entries(raw_items):
         entries.append({
             "sheet_id": sheet_id,
             "sheet_name": sheet_name,
+            "display_name": str(item.get("display_name", "") or "").strip() or sheet_name,
             "sheet_gid": str(item.get("sheet_gid", "") or "0").strip() or "0",
             "saved_at_text": str(item.get("saved_at_text", "") or "").strip(),
             "campaign_label": str(item.get("campaign_label", "") or "").strip(),
@@ -705,14 +706,14 @@ def _get_dashboard_cache_map():
     return DASHBOARD_CACHE
 
 
-def get_dashboard_cached_section(user_email: str, section: str):
+def get_dashboard_cached_section(user_email: str, section: str, allow_legacy_version: bool = False):
     now = datetime.now()
     cache_map = _get_dashboard_cache_map()
     entry = cache_map.get(f"{user_email}:{section}") if isinstance(cache_map, dict) else None
     if not isinstance(entry, dict):
         return "", False
     cached_format_version = int(entry.get("format_version", 0) or 0)
-    if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION:
+    if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION and not allow_legacy_version:
         return "", False
     html_content = entry.get("html", "")
     updated_raw = entry.get("updated_at", "")
@@ -720,6 +721,8 @@ def get_dashboard_cached_section(user_email: str, section: str):
         updated_at = datetime.fromisoformat(str(updated_raw or ""))
         is_fresh = (now - updated_at).total_seconds() < DASHBOARD_CACHE_TTL_SECONDS
     except Exception:
+        is_fresh = False
+    if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION:
         is_fresh = False
     return (html_content if isinstance(html_content, str) else ""), is_fresh
 
@@ -796,10 +799,9 @@ def background_refresh_dashboard_data(user_email, section_type):
         
         runtime_state = get_runtime_state(target_user)
         active_ws = None
-        if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
+        should_prefetch_active_ws = section_type in {"overview", "posts", "config"}
+        if should_prefetch_active_ws and runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
             try:
-                if section_type == "overview":
-                    time.sleep(0.2)
                 active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
             except Exception:
                 pass
@@ -835,7 +837,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                         <div class="space-y-3">
                             <div class="bg-slate-950/40 rounded-2xl p-3 border border-white/10 mb-3">
                                 <div class="space-y-3">
-                                    <form action="/set-sheet" method="get" class="flex flex-col gap-3">
+                                    <form action="/set-sheet" method="get" onsubmit="return false;" class="flex flex-col gap-3">
                                         <label class="text-xs font-black uppercase tracking-[0.16em] text-slate-400">Nhập link sheet</label>
                                         <div class="flex flex-col md:flex-row gap-2 md:items-center">
                                             <input id="sheet-url-input" name="sheet_url" value="{snapshot_url}" placeholder="Nhập link Google Sheet hoặc Sheet ID" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-2.5 border border-white/10 outline-none focus:border-blue-400" />
@@ -901,7 +903,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                                     <input name="start_row" form="set-columns-form" value="{runtime_state.get('start_row', 2)}" inputmode="numeric" placeholder="VD: 2" class="w-full bg-slate-900 text-slate-100 rounded-xl px-4 py-2.5 border border-white/10 outline-none focus:border-cyan-400" />
                                 </div>
                             </div>
-                            <form id="set-columns-form" action="/set-columns" method="get" class="mb-2">
+                            <form id="set-columns-form" action="/set-columns" method="get" onsubmit="return false;" class="mb-2">
                                 <input id="col-config-active-tab-input" type="hidden" name="tab_name" value="" />
                                 <button type="submit" class="w-full py-2.5 bg-slate-700 hover:bg-slate-600 text-white rounded-xl font-black uppercase text-xs shadow-sm shadow-slate-900/10">Lưu cấu hình nhập liệu</button>
                             </form>
@@ -959,7 +961,6 @@ def background_refresh_dashboard_data(user_email, section_type):
                 "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
             }
         elif section_type == "schedule":
-            schedule_text = schedule_label(runtime_state)
             schedule_config = build_schedule_config_payload(runtime_state)
             mode_selected = {
                 "off": "selected" if runtime_state["schedule_mode"] == "off" else "",
@@ -977,7 +978,7 @@ def background_refresh_dashboard_data(user_email, section_type):
                 <div class="dashboard-section-title">Lịch tự động</div>
                 <div class="bg-black/20 rounded-3xl p-6 border border-white/5">
                     <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
-                        <span>Lịch tự động</span><span class="text-cyan-300 font-black text-lg" data-schedule-label>{schedule_text}</span>
+                        <span>Lịch tự động</span>
                     </div>
                     <form action="/set-schedule" method="get" class="flex flex-col gap-3">
                         <div>
@@ -1109,10 +1110,12 @@ def build_sheet_metadata_payload(sheet_id: str = "", sheet_name: str = "", state
     can_edit_metadata = bool(resolved_sheet_id and resolved_sheet_name)
     campaign_label = str((saved_entry or {}).get("campaign_label", "") or "").strip()
     brand_label = str((saved_entry or {}).get("brand_label", "") or "").strip()
+    industry_label = str((saved_entry or {}).get("industry_label", "") or "").strip()
     campaign_description = str((saved_entry or {}).get("campaign_description", "") or "").strip()
     return {
         "campaign_label": campaign_label,
         "brand_label": brand_label,
+        "industry_label": industry_label,
         "campaign_description": campaign_description,
         "campaign_options_html": build_campaign_options_html(
             campaign_label,
@@ -1186,6 +1189,7 @@ def save_sheet_entry(
         {
             "sheet_id": normalized_sheet_id,
             "sheet_name": normalized_sheet_name,
+            "display_name": str((existing_entry or {}).get("display_name", "") or "").strip() or normalized_sheet_name,
             "sheet_gid": str(sheet_gid or "0").strip() or "0",
             "saved_at_text": saved_at_text,
             "campaign_label": str(
@@ -1245,6 +1249,7 @@ def update_saved_sheet_campaign(sheet_id: str, sheet_name: str, campaign_label: 
                 {
                     "sheet_id": current_sheet_id,
                     "sheet_name": current_sheet_name,
+                    "display_name": str(item.get("display_name", "") or "").strip() or current_sheet_name,
                     "sheet_gid": str(item.get("sheet_gid", "") or "0").strip() or "0",
                     "saved_at_text": str(item.get("saved_at_text", "") or "").strip(),
                     "campaign_label": cleaned_campaign,
@@ -1270,14 +1275,14 @@ def update_saved_sheet_metadata(
     sheet_id: str,
     sheet_name: str,
     new_sheet_name: str = "",
-    campaign_label: str = "",
+    campaign_label: Optional[str] = None,
     brand_label: str = "",
     industry_label: str = "",
     owner_email: Optional[str] = None
 ):
     normalized_sheet_id = str(sheet_id or "").strip()
     normalized_sheet_name = str(sheet_name or "").strip()
-    if not normalized_sheet_id or not normalized_sheet_name:
+    if not normalized_sheet_id:
         return []
         
     normalized_owner = normalize_email_address(owner_email or "")
@@ -1289,26 +1294,29 @@ def update_saved_sheet_metadata(
         curr_name = str(item.get("sheet_name", "") or "").strip()
         return {
             "sheet_id": curr_id,
-            "sheet_name": (new_sheet_name or curr_name).strip(),
+            # Keep technical sheet_name unchanged; this API updates display metadata only.
+            "sheet_name": curr_name,
+            "display_name": (new_sheet_name or str(item.get("display_name", "") or "") or curr_name).strip(),
             "sheet_gid": str(item.get("sheet_gid", "") or "0").strip() or "0",
             "saved_at_text": str(item.get("saved_at_text", "") or "").strip(),
-            "campaign_label": str(campaign_label or "").strip(),
+            "campaign_label": str(item.get("campaign_label", "") or "").strip() if campaign_label is None else str(campaign_label or "").strip(),
             "brand_label": str(brand_label or "").strip(),
             "industry_label": str(industry_label or "").strip(),
             "campaign_description": str(item.get("campaign_description", "") or "").strip(),
         }
 
     target_index = -1
-    normalized_target_name = unicodedata.normalize('NFC', normalized_sheet_name).casefold()
+    normalized_target_name = unicodedata.normalize('NFC', normalized_sheet_name).casefold() if normalized_sheet_name else ""
 
     # Pass 1: match chặt theo ID + tên cũ (đúng hành vi cũ)
-    for idx, item in enumerate(existing_entries):
-        curr_id = str(item.get("sheet_id", "") or "").strip()
-        curr_name = str(item.get("sheet_name", "") or "").strip()
-        norm_curr = unicodedata.normalize('NFC', curr_name).casefold()
-        if curr_id == normalized_sheet_id and norm_curr == normalized_target_name:
-            target_index = idx
-            break
+    if normalized_target_name:
+        for idx, item in enumerate(existing_entries):
+            curr_id = str(item.get("sheet_id", "") or "").strip()
+            curr_name = str(item.get("sheet_name", "") or "").strip()
+            norm_curr = unicodedata.normalize('NFC', curr_name).casefold()
+            if curr_id == normalized_sheet_id and norm_curr == normalized_target_name:
+                target_index = idx
+                break
 
     # Pass 2: fallback theo ID (trường hợp tên hiển thị đã lệch)
     if target_index < 0:
@@ -1359,6 +1367,18 @@ def remove_saved_sheet_entry(sheet_id: str, sheet_name: str, owner_email: Option
             removed = True
             continue
         next_entries.append(dict(item))
+
+    # Fallback theo sheet_id nếu tên kỹ thuật trên UI/server đang bị lệch.
+    if not removed:
+        next_entries = []
+        removed_by_id = False
+        for item in existing_entries:
+            current_sheet_id = str(item.get("sheet_id", "") or "").strip()
+            if not removed_by_id and current_sheet_id == normalized_sheet_id:
+                removed_by_id = True
+                continue
+            next_entries.append(dict(item))
+        removed = removed_by_id
 
     if not removed:
         return []
@@ -4500,17 +4520,13 @@ def build_unique_headers(headers):
     return unique_headers
 
 
-def get_sheet_records(sheet, layout=None, include_row_values: bool = False):
-    resolved_layout = layout or detect_sheet_layout(sheet)
-    header_row = max(1, int(resolved_layout.get("header_row") or 1))
-    headers = list(resolved_layout.get("headers") or [])
-    
-    # Cache logic for all_values
+def get_sheet_all_values_cached(sheet):
+    # Shared cached reader to avoid repeating the same Google Sheet fetch logic.
     global SHEET_DATA_CACHE
     sheet_id = getattr(sheet.spreadsheet, "id", "")
     sheet_name = getattr(sheet, "title", "")
     cache_key = f"{sheet_id}:{sheet_name}"
-    
+
     now = datetime.now()
     all_values = None
     cache_entry = SHEET_DATA_CACHE.get(cache_key)
@@ -4521,7 +4537,7 @@ def get_sheet_records(sheet, layout=None, include_row_values: bool = False):
                 all_values = cache_entry["data"]
         except Exception:
             pass
-    
+
     if all_values is None:
         stale_values = None
         if cache_entry:
@@ -4538,6 +4554,14 @@ def get_sheet_records(sheet, layout=None, include_row_values: bool = False):
                 all_values = stale_values
             else:
                 raise
+    return all_values or []
+
+
+def get_sheet_records(sheet, layout=None, include_row_values: bool = False):
+    resolved_layout = layout or detect_sheet_layout(sheet)
+    header_row = max(1, int(resolved_layout.get("header_row") or 1))
+    headers = list(resolved_layout.get("headers") or [])
+    all_values = get_sheet_all_values_cached(sheet)
         
     if not headers and len(all_values) >= header_row:
         headers = list(all_values[header_row - 1] or [])
@@ -5149,8 +5173,12 @@ def collect_posts_dataset_for_worksheet(
             safe_creator = html.escape(shorten_text(creator, 24))
             creator_handle = infer_creator_handle(resolved_link or link, creator, platform)
             safe_creator_handle = html.escape(shorten_text(creator_handle, 24))
+            creator_key = normalize_header(creator) or normalize_header(creator_handle) or normalize_header(platform) or "khac"
+            safe_creator_key = html.escape(creator_key, quote=True)
+            safe_creator_attr = html.escape(creator, quote=True)
             safe_date = html.escape(date_text)
             safe_date_title = html.escape(date_title, quote=True)
+            safe_date_attr = html.escape(date_text, quote=True)
             safe_content_meta = html.escape(shorten_text(link, 76))
             safe_sheet_name_attr = html.escape(sheet_title, quote=True)
             safe_title_attr = html.escape(title, quote=True)
@@ -5164,7 +5192,7 @@ def collect_posts_dataset_for_worksheet(
             )
             rows_html.append(
                 f"""
-                <tr class="post-row posts-table-row" data-platform="{platform_key}" data-search="{search_blob}">
+                <tr class="post-row posts-table-row" data-platform="{platform_key}" data-search="{search_blob}" data-post-link="{safe_link}" data-post-title="{safe_title_attr}" data-post-platform="{safe_platform_attr}" data-post-date="{safe_date_attr}" data-post-sheet="{safe_sheet_name_attr}" data-creator-key="{safe_creator_key}" data-creator-name="{safe_creator_attr}">
                     <td class="posts-cell posts-cell-check">
                         <input
                             type="checkbox"
@@ -5188,10 +5216,10 @@ def collect_posts_dataset_for_worksheet(
                     <td class="posts-cell" data-post-col="creator">
                         <div class="flex items-center gap-3">
                             <div class="post-avatar post-avatar-{platform_key}">{avatar}</div>
-                            <div>
-                                <div class="post-creator-name">{safe_creator}</div>
-                                <div class="post-creator-handle">{safe_creator_handle}</div>
-                            </div>
+                            <button type="button" class="post-creator-trigger" data-post-creator-open data-creator-key="{safe_creator_key}" data-creator-name="{safe_creator_attr}" aria-label="Xem bài của {safe_creator}">
+                                <span class="post-creator-name">{safe_creator}</span>
+                                <span class="post-creator-handle">{safe_creator_handle}</span>
+                            </button>
                         </div>
                     </td>
                     <td class="posts-cell" data-post-col="status"><span class="post-status-pill {status_class}">{status_label}</span></td>
@@ -5232,6 +5260,7 @@ def collect_posts_dataset_for_worksheet(
 
     return {
         "sheet_title": sheet_title,
+        "sheet_name": sheet_title,
         "sheet_slug": resolved_sheet_slug,
         "sheet_id": resolved_sheet_id,
         "sheet_gid": str(getattr(ws, "id", "") or "0"),
@@ -5355,7 +5384,17 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
     creators = set()
     campaigns = {}
     brands_summary = {}
+    platform_outcomes = {
+        "TikTok": 0,
+        "Facebook": 0,
+        "Instagram": 0,
+        "YouTube": 0,
+        "Khác": 0,
+    }
+    chart_entries_limit = 4000
     timeline_rows = []
+    min_air_date = None
+    max_air_date = None
     overview_errors = []
 
     overview_sources = []
@@ -5384,53 +5423,154 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             ) else get_worksheet(entry_sheet_name, entry_sheet_id, runtime_state)
             layout = detect_sheet_layout(ws)
             col_map = apply_column_overrides_for_tab(layout.get("columns"), entry_sheet_name, state=runtime_state)
-            records, header_row, headers = get_sheet_records(ws, layout, include_row_values=True)
-            link_header = resolve_header_from_column(headers, col_map.get("link"))
-            campaign_header = resolve_header_from_column(headers, col_map.get("campaign"))
+            header_row = max(1, int(layout.get("header_row") or 1))
+            headers = list(layout.get("headers") or [])
+            all_values = get_sheet_all_values_cached(ws)
+            if not headers and len(all_values) >= header_row:
+                headers = list(all_values[header_row - 1] or [])
+            unique_headers = build_unique_headers(headers)
+            data_rows = all_values[header_row:] if len(all_values) > header_row else []
+            max_width = max(
+                len(unique_headers),
+                max((len(row or []) for row in data_rows), default=0),
+            )
+            if len(unique_headers) < max_width:
+                unique_headers.extend([f"__extra_{idx}" for idx in range(len(unique_headers) + 1, max_width + 1)])
+            normalized_header_index_map = {}
+            for col_idx, raw_header in enumerate(unique_headers):
+                normalized_key = normalize_header(str(raw_header or ""))
+                if not normalized_key:
+                    continue
+                normalized_header_index_map.setdefault(normalized_key, []).append(col_idx)
             start_row = resolve_effective_start_row(header_row, runtime_state)
         except Exception as exc:
             overview_errors.append(f"{entry_sheet_name or f'Sheet {source_index + 1}'}: {exc}")
             continue
 
+        def read_value_from_col(row_values, col_idx: Optional[int]):
+            if not col_idx or col_idx <= 0 or col_idx > len(row_values):
+                return ""
+            value = row_values[col_idx - 1]
+            try:
+                if pd.isna(value):
+                    return ""
+            except Exception:
+                pass
+            return value if str(value).strip() else ""
+
+        def read_first_value_by_norm_keys(row_values, norm_keys):
+            for norm_key in norm_keys:
+                for col_idx in normalized_header_index_map.get(norm_key, ()):
+                    value = row_values[col_idx] if col_idx < len(row_values) else ""
+                    try:
+                        if pd.isna(value):
+                            continue
+                    except Exception:
+                        pass
+                    if str(value).strip():
+                        return value
+            return ""
+
+        link_norm_keys = tuple(normalize_header(key) for key in ("link", "url", "posturl", "linkpost"))
+        campaign_norm_keys = tuple(normalize_header(key) for key in ("campaign", "chiendich", "camp"))
+        view_norm_keys = tuple(normalize_header(key) for key in ("view", "views", "luotxem"))
+        share_norm_keys = tuple(normalize_header(key) for key in ("share", "shares"))
+        comment_norm_keys = tuple(normalize_header(key) for key in ("comment", "comments", "cmt"))
+        buzz_norm_keys = tuple(normalize_header(key) for key in ("buzz", "buzzcount", "totalbuzz", "tongbuzz"))
+        air_date_norm_keys = tuple(
+            normalize_header(key)
+            for key in ("airdate", "aireddate", "ngayair", "ngaydang", "ngayairbai", "ngaydangbai", "publishdate", "publisheddate")
+        )
+        brand_norm_keys = tuple(
+            normalize_header(key)
+            for key in ("thuonghieu", "tenthuonghieu", "brand", "brandname", "nhanhang", "tennhanhang", "client", "clientname")
+        )
+        creator_norm_keys = tuple(normalize_header(key) for key in ("kol", "creator", "author", "username", "account", "channel"))
+        facebook_creator_norm_keys = tuple(
+            normalize_header(key)
+            for key in (
+                "groupprofile",
+                "group",
+                "groupname",
+                "tennhom",
+                "tennhomfb",
+                "profile",
+                "profilename",
+                "page",
+                "pagename",
+                "tenpage",
+                "fanpage",
+                "pageprofile",
+                "kol",
+                "creator",
+                "author",
+                "username",
+                "account",
+                "channel",
+            )
+        )
+
         entry_brand_label = str(source_entry.get("brand_label", "") or "").strip()
-        for row_idx, record in enumerate(records, start=header_row + 1):
+        for row_idx, raw_row in enumerate(data_rows, start=header_row + 1):
             if row_idx < start_row:
                 continue
-            normalized_record = {normalize_header(str(key)): value for key, value in (record or {}).items()}
+            row_values = list(raw_row or [])
+            if len(row_values) < max_width:
+                row_values.extend([""] * (max_width - len(row_values)))
             link = str(
-                read_record_value_from_column(record, col_map.get("link"))
-                or read_record_value_from_header(record, normalized_record, link_header)
-                or first_nonempty_value(normalized_record, "link", "url", "posturl", "linkpost")
+                read_value_from_col(row_values, col_map.get("link"))
+                or read_first_value_by_norm_keys(row_values, link_norm_keys)
             ).strip()
             if not link:
                 continue
 
-            resolved_link = resolve_creator_link(link)
-            platform = detect_platform(resolved_link or link)
-            creator = resolve_post_creator_name(normalized_record, resolved_link or link, platform)
-            brand_name = entry_brand_label or extract_brand_label_from_record(normalized_record) or "Chưa gắn"
+            # Overview is an aggregated view; avoid per-row network URL resolving to keep loading fast.
+            platform = detect_platform(link)
+            if platform == "Facebook":
+                creator = str(read_first_value_by_norm_keys(row_values, facebook_creator_norm_keys) or "").strip() or infer_creator_name(link, platform)
+            else:
+                creator = str(read_first_value_by_norm_keys(row_values, creator_norm_keys) or "").strip() or infer_creator_name(link, platform)
+            brand_name = entry_brand_label or str(read_first_value_by_norm_keys(row_values, brand_norm_keys) or "").strip() or "Chưa gắn"
             campaign_name = str(
                 entry_campaign_label
-                or read_record_value_from_header(record, normalized_record, campaign_header)
-                or first_nonempty_value(normalized_record, "campaign", "chiendich", "camp")
+                or read_value_from_col(row_values, col_map.get("campaign"))
+                or read_first_value_by_norm_keys(row_values, campaign_norm_keys)
             ).strip()
-            view = parse_metric_number(read_record_value_from_column(record, col_map.get("view")) or first_nonempty_value(normalized_record, "view", "views", "luotxem"))
-            reaction = parse_metric_number(read_record_value_from_column(record, col_map.get("like")) or first_nonempty_value(normalized_record, "like", "likes", "reaction", "reactions"))
-            share = parse_metric_number(read_record_value_from_column(record, col_map.get("share")) or first_nonempty_value(normalized_record, "share", "shares"))
-            comment = parse_metric_number(read_record_value_from_column(record, col_map.get("comment")) or first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
-            save = parse_metric_number(read_record_value_from_column(record, col_map.get("save")) or first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
+            view = parse_metric_number(
+                read_value_from_col(row_values, col_map.get("view"))
+                or read_first_value_by_norm_keys(row_values, view_norm_keys)
+            )
+            share = parse_metric_number(
+                read_value_from_col(row_values, col_map.get("share"))
+                or read_first_value_by_norm_keys(row_values, share_norm_keys)
+            )
+            comment = parse_metric_number(
+                read_value_from_col(row_values, col_map.get("comment"))
+                or read_first_value_by_norm_keys(row_values, comment_norm_keys)
+            )
             buzz_raw = (
-                read_record_value_from_column(record, col_map.get("buzz"))
-                or first_nonempty_value(normalized_record, "buzz", "buzzcount", "totalbuzz", "tongbuzz")
+                read_value_from_col(row_values, col_map.get("buzz"))
+                or read_first_value_by_norm_keys(row_values, buzz_norm_keys)
             )
             buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else compute_buzz_value(platform, share, comment)
-            air_date_value = resolve_dashboard_air_date_value(record, normalized_record, col_map)
+            air_date_value = str(
+                read_value_from_col(row_values, col_map.get("air_date"))
+                or read_first_value_by_norm_keys(row_values, air_date_norm_keys)
+                or ""
+            ).strip()
             aired_at = parse_dashboard_date(air_date_value)
+            if aired_at:
+                if min_air_date is None or aired_at < min_air_date:
+                    min_air_date = aired_at
+                if max_air_date is None or aired_at > max_air_date:
+                    max_air_date = aired_at
 
             total_posts += 1
             total_views += view
             total_buzz += buzz
             creators.add(creator.strip().lower())
+            # Outcome theo kênh = số bài đăng theo nền tảng.
+            platform_outcomes[platform if platform in platform_outcomes else "Khác"] += 1
 
             campaign_bucket = campaigns.setdefault(
                 campaign_name or no_campaign_label,
@@ -5448,7 +5588,7 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             campaign_bucket["platforms"].add(platform)
             if aired_at and (campaign_bucket["started_at"] is None or aired_at < campaign_bucket["started_at"]):
                 campaign_bucket["started_at"] = aired_at
-            if aired_at:
+            if aired_at and len(timeline_rows) < chart_entries_limit:
                 timeline_rows.append(
                     {
                         "date": aired_at.strftime("%Y-%m-%d"),
@@ -5546,12 +5686,11 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
         campaign_cards_html.append(card_html)
         
     campaigns_rendered = '<div class="flex flex-col gap-4">' + "".join(campaign_cards_html) + "</div>"
-    chart_dates = sorted({item["date"] for item in timeline_rows if item.get("date")})
     chart_period_text = "Chưa có dữ liệu ngày air bài."
-    if chart_dates:
+    if min_air_date and max_air_date:
         chart_period_text = (
-            f"{datetime.strptime(chart_dates[0], '%Y-%m-%d').strftime('%d/%m/%Y')}"
-            f" - {datetime.strptime(chart_dates[-1], '%Y-%m-%d').strftime('%d/%m/%Y')}"
+            f"{min_air_date.strftime('%d/%m/%Y')}"
+            f" - {max_air_date.strftime('%d/%m/%Y')}"
         )
     source_scope_text = (
         f"{format_metric_number(len(saved_entries))} sheet đã lưu"
@@ -5607,6 +5746,34 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
         else ""
     )
 
+    platform_total_outcome = sum(int(value or 0) for value in platform_outcomes.values())
+    platform_order = [
+        ("TikTok", "overview-platform-dot-tiktok"),
+        ("Facebook", "overview-platform-dot-facebook"),
+        ("Instagram", "overview-platform-dot-instagram"),
+        ("YouTube", "overview-platform-dot-youtube"),
+        ("Khác", "overview-platform-dot-other"),
+    ]
+    platform_rows_html = []
+    for platform_name, dot_class in platform_order:
+        platform_value = int(platform_outcomes.get(platform_name, 0) or 0)
+        platform_ratio = (platform_value / platform_total_outcome * 100.0) if platform_total_outcome > 0 else 0.0
+        platform_rows_html.append(
+            f"""
+            <div class="overview-platform-row">
+                <div class="overview-platform-cell overview-platform-cell-name">
+                    <span class="overview-platform-dot {dot_class}"></span>
+                    <span>{html.escape(platform_name)}</span>
+                </div>
+                <div class="overview-platform-cell overview-platform-cell-value">{format_metric_number(platform_value)}</div>
+                <div class="overview-platform-cell overview-platform-cell-ratio">
+                    <span class="overview-platform-ratio-text">{platform_ratio:.1f}%</span>
+                </div>
+            </div>
+            """
+        )
+    platform_rows_rendered = "".join(platform_rows_html)
+
     return f"""
     <section id="tong-quan" data-dashboard-section="tong-quan" class="dashboard-section dashboard-panel is-active mb-6">
         <div class="overview-shell">
@@ -5655,8 +5822,8 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                                 <div class="overview-time-filter-card">
                                     <div class="overview-time-filter-title">Khoảng thời gian:</div>
                                     <div class="overview-time-filter-grid">
-                                        <button type="button" class="overview-chart-toggle is-active" data-overview-range="7d">7 ngày qua</button>
-                                        <button type="button" class="overview-chart-toggle" data-overview-range="30d">30 ngày qua</button>
+                                        <button type="button" class="overview-chart-toggle" data-overview-range="7d">7 ngày qua</button>
+                                        <button type="button" class="overview-chart-toggle is-active" data-overview-range="30d">30 ngày qua</button>
                                         <button type="button" class="overview-chart-toggle" data-overview-range="this_month">Tháng này</button>
                                         <button type="button" class="overview-chart-toggle" data-overview-range="last_month">Tháng trước</button>
                                         <button type="button" class="overview-chart-toggle overview-chart-toggle-full" data-overview-range="all_time">Toàn thời gian</button>
@@ -5694,6 +5861,25 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
                         {html.escape("Chưa có dữ liệu ngày air bài trong các sheet đã lưu để dựng sơ đồ." if saved_entries else "Sheet này chưa có dữ liệu ngày air bài để dựng sơ đồ.")}
                     </div>
                     <div class="overview-chart-tooltip hidden" data-overview-chart-tooltip></div>
+                </div>
+            </div>
+
+            <div class="overview-section-title">Outcome theo kênh</div>
+            <div class="overview-platform-wrap">
+                <div class="overview-platform-card">
+                    <div class="overview-platform-head">
+                        <div>Nền tảng</div>
+                        <div>Outcome (bài)</div>
+                        <div>Tỷ trọng</div>
+                    </div>
+                    <div class="overview-platform-body">
+                        {platform_rows_rendered}
+                    </div>
+                    <div class="overview-platform-total">
+                        <div>Tổng</div>
+                        <div>{format_metric_number(platform_total_outcome)}</div>
+                        <div>100%</div>
+                    </div>
                 </div>
             </div>
 
@@ -5769,7 +5955,7 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
     rows_html = str(dataset.get("rows_html", "") or "").strip()
     table_rows_html = rows_html if rows_html else '<tr><td colspan="13" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'
     return f"""
-        <div class="posts-tab-panel" data-posts-tab-panel="{html.escape(str(dataset.get("sheet_slug", "") or ""), quote=True)}" data-posts-tab-title="{safe_sheet_title}" data-posts-platform="all">
+        <div class="posts-tab-panel" data-posts-tab-panel="{html.escape(str(dataset.get("sheet_slug", "") or ""), quote=True)}" data-posts-tab-title="{safe_sheet_title}" data-posts-sheet-id="{html.escape(str(dataset.get('sheet_id', '') or ''), quote=True)}" data-posts-sheet-name="{html.escape(str(dataset.get('sheet_name', '') or ''), quote=True)}" data-posts-platform="all">
             <div class="posts-tab-panel-head">
                 <div>
                     <div class="posts-tab-panel-kicker">Đang xem sheet</div>
@@ -5841,7 +6027,22 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
             </div>
             <div class="posts-table-shell">
                 <div class="overflow-x-auto">
-                    <table class="w-full min-w-[1450px] posts-table">
+                    <table class="w-full min-w-[1180px] posts-table">
+                        <colgroup>
+                            <col class="posts-col-check" />
+                            <col class="posts-col-content" />
+                            <col class="posts-col-creator" />
+                            <col class="posts-col-status" />
+                            <col class="posts-col-plan" />
+                            <col class="posts-col-line" />
+                            <col class="posts-col-tier" />
+                            <col class="posts-col-date" />
+                            <col class="posts-col-metric" />
+                            <col class="posts-col-metric" />
+                            <col class="posts-col-metric" />
+                            <col class="posts-col-metric" />
+                            <col class="posts-col-metric" />
+                        </colgroup>
                         <thead>
                             <tr>
                                 <th class="posts-check-col"><input type="checkbox" class="posts-table-check posts-select-all" data-select-all-posts aria-label="Chọn tất cả" /></th>
@@ -5866,6 +6067,22 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
                 </div>
                 <div class="posts-empty-state posts-empty-panel hidden">
                     Không có bài đăng nào khớp bộ lọc hiện tại.
+                </div>
+            </div>
+            <div class="posts-creator-modal hidden" data-posts-creator-modal aria-hidden="true">
+                <div class="posts-creator-modal-backdrop" data-posts-creator-close></div>
+                <div class="posts-creator-modal-card" role="dialog" aria-modal="true" aria-label="Danh sách bài đăng của creator">
+                    <div class="posts-creator-modal-head">
+                        <div>
+                            <div class="posts-creator-modal-kicker">Creator</div>
+                            <div class="posts-creator-modal-title" data-posts-creator-modal-title>Danh sách bài đăng</div>
+                            <div class="posts-creator-modal-sub" data-posts-creator-modal-count>0 bài</div>
+                        </div>
+                        <button type="button" class="posts-creator-modal-close" data-posts-creator-close aria-label="Đóng">
+                            <i class="fa-solid fa-xmark"></i>
+                        </button>
+                    </div>
+                    <div class="posts-creator-modal-list" data-posts-creator-modal-list></div>
                 </div>
             </div>
         </div>
@@ -6027,13 +6244,14 @@ def build_posts_panel_html(sheet=None, state=None):
     for entry_index, entry in enumerate(saved_entries):
         entry_sheet_id = str(entry.get("sheet_id", "") or "").strip()
         entry_sheet_name = str(entry.get("sheet_name", "") or "").strip()
+        entry_display_name = str(entry.get("display_name", "") or "").strip() or entry_sheet_name
         entry_sheet_gid = str(entry.get("sheet_gid", "") or "0").strip() or "0"
         entry_saved_at_text = str(entry.get("saved_at_text", "") or "").strip()
         entry_campaign_label = str(entry.get("campaign_label", "") or "").strip()
         entry_brand_label = str(entry.get("brand_label", "") or "").strip()
         entry_industry_label = str(entry.get("industry_label", "") or "").strip()
         entry_campaign_description = str(entry.get("campaign_description", "") or "").strip()
-        entry_slug = f"{build_dom_slug(entry_sheet_name, 'sheet')}-{entry_index}"
+        entry_slug = build_dom_slug(f"{entry_sheet_id}-{entry_sheet_name}", "sheet")
         
         try:
             # Optional stagger between sheets to reduce burst traffic to Google APIs.
@@ -6055,6 +6273,8 @@ def build_posts_panel_html(sheet=None, state=None):
                 include_rows=False,
                 state=runtime_state,
             )
+            dataset["sheet_name"] = entry_sheet_name
+            dataset["sheet_title"] = entry_display_name or str(dataset.get("sheet_title", "") or "").strip()
             dataset["saved_at_text"] = entry_saved_at_text
             dataset["sheet_id"] = entry_sheet_id
             dataset["sheet_gid"] = entry_sheet_gid or dataset.get("sheet_gid", "0")
@@ -6064,7 +6284,8 @@ def build_posts_panel_html(sheet=None, state=None):
             dataset["campaign_description"] = entry_campaign_description
         except Exception as exc:
             dataset = {
-                "sheet_title": entry_sheet_name or f"Sheet {entry_index + 1}",
+                "sheet_title": entry_display_name or entry_sheet_name or f"Sheet {entry_index + 1}",
+                "sheet_name": entry_sheet_name or f"Sheet {entry_index + 1}",
                 "sheet_slug": entry_slug,
                 "sheet_id": entry_sheet_id,
                 "sheet_gid": entry_sheet_gid,
@@ -6080,7 +6301,6 @@ def build_posts_panel_html(sheet=None, state=None):
                 "total_buzz": 0,
                 "creator_count": 0,
                 "campaign_count": 0,
-                "brand_label": "",
                 "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
                 "rows_html": "",
                 "error": str(exc),
@@ -6114,11 +6334,12 @@ def build_posts_panel_html(sheet=None, state=None):
         comment_text = format_compact_metric(dataset.get("total_comment", 0))
         share_text = format_compact_metric(dataset.get("total_share", 0))
         buzz_text = format_compact_metric(dataset.get("total_buzz", 0))
+        technical_sheet_name = str(dataset.get("sheet_name", "") or dataset.get("sheet_title", "") or "").strip()
         sheet_snapshot_url = build_snapshot_url(dataset.get("sheet_id", ""), dataset["sheet_gid"], runtime_state)
-        schedule_binding_key = build_sheet_binding_key(dataset.get("sheet_id", ""), dataset.get("sheet_title", ""))
+        schedule_binding_key = build_sheet_binding_key(dataset.get("sheet_id", ""), technical_sheet_name)
         summary_rows_html.append(
             f"""
-            <div class="posts-sheet-list-row" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}" data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}" data-posts-sheet-gid="{html.escape(str(dataset.get('sheet_gid', '0') or '0'), quote=True)}" data-posts-sheet-campaign="{html.escape(campaign_label, quote=True)}" data-posts-sheet-brand="{html.escape(brand_label, quote=True)}" data-posts-sheet-industry="{html.escape(industry_label, quote=True)}" data-posts-master-campaign="all" data-posts-master-search="{html.escape((dataset['sheet_title'] + ' ' + brand_label + ' ' + industry_label).lower(), quote=True)}">
+            <div class="posts-sheet-list-row" data-posts-tab-trigger="{dataset["sheet_slug"]}" data-posts-tab-title="{safe_sheet_title}" data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}" data-posts-sheet-name="{html.escape(technical_sheet_name, quote=True)}" data-posts-sheet-display-name="{html.escape(dataset['sheet_title'], quote=True)}" data-posts-sheet-gid="{html.escape(str(dataset.get('sheet_gid', '0') or '0'), quote=True)}" data-posts-sheet-campaign="{html.escape(campaign_label, quote=True)}" data-posts-sheet-brand="{html.escape(brand_label, quote=True)}" data-posts-sheet-industry="{html.escape(industry_label, quote=True)}" data-posts-master-campaign="all" data-posts-master-search="{html.escape((dataset['sheet_title'] + ' ' + brand_label + ' ' + industry_label).lower(), quote=True)}">
                 <div class="posts-sheet-list-cell posts-sheet-list-activity">
                     <div class="posts-sheet-list-title">{activity_title}</div>
                     <div class="posts-sheet-list-sub">{activity_sub}</div>
@@ -6147,7 +6368,8 @@ def build_posts_panel_html(sheet=None, state=None):
                                 class="posts-sheet-actions-item"
                                 data-posts-sheet-action="edit-metadata"
                                 data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}"
-                                data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}"
+                                data-posts-sheet-name="{html.escape(technical_sheet_name, quote=True)}"
+                                data-posts-sheet-display-name="{html.escape(dataset['sheet_title'], quote=True)}"
                                 data-posts-sheet-brand="{html.escape(brand_label, quote=True)}"
                                 data-posts-sheet-industry="{html.escape(industry_label, quote=True)}"
                             >
@@ -6159,7 +6381,7 @@ def build_posts_panel_html(sheet=None, state=None):
                                 class="posts-sheet-actions-item"
                                 data-posts-sheet-action="bind-schedule"
                                 data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}"
-                                data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}"
+                                data-posts-sheet-name="{html.escape(technical_sheet_name, quote=True)}"
                                 data-posts-sheet-key="{html.escape(schedule_binding_key, quote=True)}"
                             >
                                 <i class="fa-regular fa-calendar-check"></i>
@@ -6170,7 +6392,7 @@ def build_posts_panel_html(sheet=None, state=None):
                                 class="posts-sheet-actions-item text-rose-300"
                                 data-posts-sheet-action="delete-sheet"
                                 data-posts-sheet-id="{html.escape(dataset.get('sheet_id', ''), quote=True)}"
-                                data-posts-sheet-name="{html.escape(dataset['sheet_title'], quote=True)}"
+                                data-posts-sheet-name="{html.escape(technical_sheet_name, quote=True)}"
                             >
                                 <i class="fa-regular fa-trash-can"></i>
                                 <span>Xóa sheet</span>
@@ -8192,11 +8414,12 @@ async def api_update_sheet_metadata(request: Request):
     sheet_id = str((payload or {}).get("sheet_id", "") or "").strip()
     original_name = str((payload or {}).get("original_name", "") or "").strip()
     new_name = str((payload or {}).get("sheet_name", "") or "").strip()
-    campaign_label = str((payload or {}).get("campaign_label", "") or "").strip()
+    raw_campaign_label = (payload or {}).get("campaign_label", None)
+    campaign_label = (str(raw_campaign_label or "").strip() if raw_campaign_label is not None else None)
     brand_label = str((payload or {}).get("brand_label", "") or "").strip()
     industry_label = str((payload or {}).get("industry_label", "") or "").strip()
 
-    if not sheet_id or not original_name:
+    if not sheet_id:
         return build_ui_json_response("Thiếu thông tin sheet để cập nhật.", level="error", ok=False, state=runtime_state)
     if not new_name:
         return build_ui_json_response("Tên hiển thị không được để trống.", level="warning", ok=False, state=runtime_state)
@@ -8213,13 +8436,13 @@ async def api_update_sheet_metadata(request: Request):
     if not updated_entries:
         return build_ui_json_response("Không tìm thấy sheet để cập nhật.", level="warning", ok=False, state=runtime_state)
 
-    if campaign_label:
+    if campaign_label is not None and campaign_label:
         save_campaign_label(campaign_label, owner_email=runtime_state["owner_email"])
 
     add_log(
-        f"Đã cập nhật thông tin sheet '{original_name}' -> '{new_name}'"
+        f"Đã cập nhật tên hiển thị sheet '{original_name or sheet_id}' -> '{new_name}'"
         + (f" | BRAND={brand_label}" if brand_label else "")
-        + (f" | CAMPAIGN={campaign_label}" if campaign_label else "")
+        + (f" | CAMPAIGN={campaign_label}" if campaign_label is not None and str(campaign_label).strip() else "")
         + (f" | INDUSTRY={industry_label}" if industry_label else ""),
         runtime_state,
     )
@@ -8237,6 +8460,7 @@ async def api_update_sheet_metadata(request: Request):
             "posts_html": build_posts_panel_html(active_ws, runtime_state),
             "campaign_html": build_campaign_panel_html(runtime_state),
         }
+        cache_dashboard_sections_for_user(str(runtime_state.get("owner_email", "") or "").strip(), extra_payload)
     except Exception as render_error:
         # Không chặn thao tác lưu metadata nếu phần render realtime tạm thời lỗi.
         add_log(f"Cảnh báo render sau khi lưu metadata: {render_error}", runtime_state)
@@ -8245,7 +8469,16 @@ async def api_update_sheet_metadata(request: Request):
     return build_ui_json_response(
         "Đã lưu thay đổi thông tin sheet.",
         level="success",
-        extra=extra_payload,
+        extra={
+            **extra_payload,
+            "metadata_update": {
+                "sheet_id": sheet_id,
+                "sheet_name": original_name,
+                "display_name": new_name,
+                "brand_label": brand_label,
+                "industry_label": industry_label,
+            },
+        },
         state=runtime_state,
     )
 
@@ -8266,6 +8499,15 @@ async def api_delete_saved_sheet(request: Request):
         return build_ui_json_response("Thiếu thông tin sheet để xóa.", level="error", ok=False, state=runtime_state)
 
     existed_entry = get_saved_sheet_entry(sheet_id, sheet_name, owner_email=runtime_state["owner_email"])
+    if not existed_entry:
+        existed_entry = next(
+            (
+                dict(item)
+                for item in get_saved_sheet_entries(owner_email=runtime_state["owner_email"])
+                if str(item.get("sheet_id", "") or "").strip() == sheet_id
+            ),
+            None,
+        )
     if not existed_entry:
         return build_ui_json_response("Không tìm thấy sheet để xóa.", level="warning", ok=False, state=runtime_state)
 
@@ -8299,14 +8541,17 @@ async def api_delete_saved_sheet(request: Request):
         except Exception:
             active_ws = None
 
+    extra_payload = {
+        "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
+        "posts_html": build_posts_panel_html(active_ws, runtime_state),
+        "campaign_html": build_campaign_panel_html(runtime_state),
+    }
+    cache_dashboard_sections_for_user(str(runtime_state.get("owner_email", "") or "").strip(), extra_payload)
+
     return build_ui_json_response(
         f"Đã xóa sheet '{sheet_name}'.",
         level="success",
-        extra={
-            "overview_html": build_overview_panel_for_state(runtime_state, sheet=active_ws),
-            "posts_html": build_posts_panel_html(active_ws, runtime_state),
-            "campaign_html": build_campaign_panel_html(runtime_state),
-        },
+        extra=extra_payload,
         state=runtime_state,
     )
 
@@ -8539,7 +8784,7 @@ def api_dashboard_overview(background_tasks: BackgroundTasks, request: Request):
     if auth_response:
         return {"error": "Unauthorized", "html": ""}
     user_email = current_user.get("email", "")
-    cached_html, is_fresh = get_dashboard_cached_section(user_email, "overview")
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "overview", allow_legacy_version=True)
     needs_refresh = not is_fresh
 
     if needs_refresh:
@@ -8554,6 +8799,35 @@ def api_dashboard_overview(background_tasks: BackgroundTasks, request: Request):
             "refreshing": needs_refresh,
         }
 
+    # Fallback sync render to avoid long loading loops when the background refresh
+    # has not populated the overview cache yet.
+    try:
+        runtime_state = get_runtime_state(current_user)
+        active_ws = None
+        if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
+            try:
+                active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
+            except Exception:
+                active_ws = None
+        html_content = build_overview_panel_for_state(runtime_state, sheet=active_ws)
+        if isinstance(html_content, str) and html_content.strip():
+            now_str = datetime.now().isoformat()
+            _get_dashboard_cache_map()[f"{user_email}:overview"] = {
+                "updated_at": now_str,
+                "html": html_content,
+                "format_version": DASHBOARD_POSTS_CACHE_FORMAT_VERSION,
+            }
+            persist_dashboard_cache_throttled()
+            return {
+                "ok": True,
+                "status": "ready",
+                "html": html_content,
+                "cached": False,
+                "refreshing": needs_refresh,
+            }
+    except Exception:
+        pass
+
     return {"ok": True, "status": "processing", "html": "", "cached": False, "refreshing": True}
 
 @app.get("/api/dashboard/posts")
@@ -8563,7 +8837,7 @@ def api_dashboard_posts(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     
     user_email = current_user.get("email", "")
-    cached_html, is_fresh = get_dashboard_cached_section(user_email, "posts")
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "posts", allow_legacy_version=True)
     needs_refresh = not is_fresh
 
     if needs_refresh:
@@ -8610,7 +8884,7 @@ def api_dashboard_posts_detail(
         return {"ok": False, "message": "Thiếu thông tin sheet để tải chi tiết.", "html": ""}
     try:
         ws = get_worksheet(resolved_sheet_name, resolved_sheet_id, runtime_state)
-        resolved_slug = str(sheet_slug or "").strip() or f"{build_dom_slug(resolved_sheet_name, 'sheet')}-detail"
+        resolved_slug = str(sheet_slug or "").strip() or build_dom_slug(f"{resolved_sheet_id}-{resolved_sheet_name}", "sheet")
         dataset = collect_posts_dataset_for_worksheet(
             ws,
             0,
@@ -8621,6 +8895,7 @@ def api_dashboard_posts_detail(
             state=runtime_state,
         )
         dataset["sheet_id"] = resolved_sheet_id
+        dataset["sheet_name"] = resolved_sheet_name
         dataset["sheet_title"] = resolved_sheet_name
         dataset["sheet_slug"] = resolved_slug
         dataset["campaign_label"] = str(campaign_label or "").strip()
@@ -8639,7 +8914,7 @@ def api_dashboard_config(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     
     user_email = current_user.get("email", "")
-    cached_html, is_fresh = get_dashboard_cached_section(user_email, "config")
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "config", allow_legacy_version=True)
     needs_refresh = not is_fresh
 
     if needs_refresh:
@@ -8658,7 +8933,7 @@ def api_dashboard_schedule(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     
     user_email = current_user.get("email", "")
-    cached_html, is_fresh = get_dashboard_cached_section(user_email, "schedule")
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "schedule", allow_legacy_version=True)
     needs_refresh = not is_fresh
 
     if needs_refresh:
@@ -8696,13 +8971,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
     user_email = current_user.get("email", "")
     
     def get_shell(cached_key, section_id, display_name, active=False):
-        entry = DASHBOARD_CACHE.get(f"{user_email}:{cached_key}")
-        if isinstance(entry, dict):
-            cached_format_version = int(entry.get("format_version", 0) or 0)
-            if cached_format_version != DASHBOARD_POSTS_CACHE_FORMAT_VERSION:
-                entry = None
-        if entry and entry.get("html"):
-            return entry["html"]
+        cached_html, _ = get_dashboard_cached_section(user_email, cached_key, allow_legacy_version=True)
+        if cached_html:
+            return cached_html
         return f"""
         <section id="{section_id}" data-dashboard-section="{section_id}" class="dashboard-section dashboard-panel mb-6 {'is-active' if active else ''}">
             <div class="animate-pulse flex flex-col gap-4 p-6 bg-slate-900/40 rounded-3xl border border-white/5">
@@ -8718,16 +8989,22 @@ def home(request: Request, background_tasks: BackgroundTasks):
     initial_posts_html = get_shell("posts", "bai-dang", "bài đăng")
     initial_schedule_html = get_shell("schedule", "lich-tu-dong", "lịch tự động")
 
-    for section_key in ("overview", "posts", "config", "schedule"):
-        cached_html, is_fresh = get_dashboard_cached_section(user_email, section_key)
-        if not is_fresh or not cached_html:
-            schedule_dashboard_refresh(background_tasks, user_email, section_key)
+    section_to_cache_key = {
+        "tong-quan": "overview",
+        "bai-dang": "posts",
+        "cau-hinh": "config",
+        "lich-tu-dong": "schedule",
+        "theo-doi-lan-chay": "schedule",
+    }
+    initial_cache_key = section_to_cache_key.get(initial_dashboard_section, "overview")
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, initial_cache_key, allow_legacy_version=True)
+    if not is_fresh or not cached_html:
+        schedule_dashboard_refresh(background_tasks, user_email, initial_cache_key)
     
     settings_panel_html = build_settings_panel_html(current_user, runtime_state)
 
     # Initialize variables for the asynchronous dashboard content slots
     metric_cols_html = initial_config_html
-    schedule_text = schedule_label(runtime_state)
     schedule_config = build_schedule_config_payload(runtime_state)
     mode_selected = {
         "off": "selected" if runtime_state["schedule_mode"] == "off" else "",
@@ -9187,6 +9464,106 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 text-transform: uppercase;
                 color: #f8fafc;
             }}
+            .overview-platform-wrap {{
+                display: flex;
+                justify-content: flex-start;
+                width: fit-content;
+                max-width: 100%;
+            }}
+            .overview-platform-card {{
+                width: 100%;
+                max-width: 500px;
+                border-radius: 14px;
+                border: 1px solid rgba(148, 163, 184, 0.12);
+                background: linear-gradient(180deg, rgba(20, 28, 45, 0.92), rgba(26, 35, 55, 0.9));
+                box-shadow: 0 12px 28px rgba(15, 23, 42, 0.18);
+                overflow: hidden;
+            }}
+            .overview-platform-head,
+            .overview-platform-row,
+            .overview-platform-total {{
+                display: grid;
+                grid-template-columns: minmax(180px, 1.35fr) minmax(110px, 0.75fr) minmax(96px, 0.6fr);
+                gap: 6px;
+                align-items: center;
+            }}
+            .overview-platform-head {{
+                padding: 9px 12px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: 0.12em;
+                text-transform: uppercase;
+                color: #93a4bf;
+            }}
+            .overview-platform-body {{
+                display: grid;
+            }}
+            .overview-platform-row {{
+                padding: 8px 12px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+                font-size: 13px;
+                color: #e2e8f0;
+            }}
+            .overview-platform-row:last-child {{
+                border-bottom: 0;
+            }}
+            .overview-platform-cell {{
+                min-width: 0;
+            }}
+            .overview-platform-cell-name {{
+                display: inline-flex;
+                align-items: center;
+                gap: 7px;
+                font-weight: 800;
+                color: #f8fafc;
+            }}
+            .overview-platform-dot {{
+                width: 7px;
+                height: 7px;
+                border-radius: 999px;
+                display: inline-block;
+                flex: 0 0 auto;
+            }}
+            .overview-platform-dot-tiktok {{
+                background: #3b82f6;
+            }}
+            .overview-platform-dot-facebook {{
+                background: #10b981;
+            }}
+            .overview-platform-dot-instagram {{
+                background: #f59e0b;
+            }}
+            .overview-platform-dot-youtube {{
+                background: #f43f5e;
+            }}
+            .overview-platform-dot-other {{
+                background: #8b5cf6;
+            }}
+            .overview-platform-cell-value {{
+                font-weight: 900;
+                color: #dbeafe;
+            }}
+            .overview-platform-cell-ratio {{
+                display: inline-flex;
+                align-items: center;
+                gap: 0;
+                justify-content: flex-start;
+            }}
+            .overview-platform-ratio-text {{
+                min-width: 42px;
+                font-size: 12px;
+                font-weight: 900;
+                color: #93c5fd;
+            }}
+            .overview-platform-total {{
+                padding: 9px 12px;
+                border-top: 1px solid rgba(148, 163, 184, 0.16);
+                background: rgba(15, 23, 42, 0.58);
+                font-size: 13px;
+                font-weight: 900;
+                color: #f8fafc;
+            }}
             .overview-campaign-card {{
                 padding: 16px;
                 border-radius: 20px;
@@ -9569,6 +9946,30 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 gap: 8px;
                 margin-top: 10px;
             }}
+            .overview-chart-brand-pill {{
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 12px;
+                border-radius: 999px;
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                background: rgba(15, 23, 42, 0.68);
+                color: rgba(226, 232, 240, 0.92);
+                font-size: 12px;
+                font-weight: 800;
+                cursor: pointer;
+                transition: all 0.2s ease;
+            }}
+            .overview-chart-brand-pill:hover {{
+                border-color: rgba(96, 165, 250, 0.42);
+                transform: translateY(-1px);
+            }}
+            .overview-chart-brand-pill.is-active {{
+                border-color: rgba(96, 165, 250, 0.58);
+                background: linear-gradient(135deg, rgba(37, 99, 235, 0.32), rgba(14, 165, 233, 0.24));
+                color: #f8fafc;
+                box-shadow: 0 10px 24px rgba(14, 165, 233, 0.14);
+            }}
             .overview-chart-frame {{
                 position: relative;
                 margin-top: 14px;
@@ -9848,16 +10249,16 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
 
             .posts-sheet-list-table {{
-                min-width: 1400px;
+                min-width: 1240px;
                 position: relative;
                 padding-bottom: 120px;
             }}
             .posts-sheet-list-head {{
                 display: grid;
-                grid-template-columns: minmax(250px, 2.15fr) minmax(170px, 0.95fr) minmax(150px, 0.84fr) minmax(95px, 0.58fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(100px, 0.7fr) minmax(100px, 0.7fr) minmax(120px, 0.82fr) minmax(138px, 0.9fr);
-                gap: 12px;
+                grid-template-columns: minmax(230px, 1.95fr) minmax(150px, 0.9fr) minmax(118px, 0.72fr) minmax(84px, 0.48fr) repeat(5, minmax(88px, 0.56fr)) minmax(90px, 0.58fr) 56px;
+                gap: 10px;
                 align-items: center;
-                padding: 12px 16px;
+                padding: 12px 14px;
                 background: rgba(51, 65, 85, 0.9);
                 color: #cbd5e1;
                 font-size: 11px;
@@ -9866,12 +10267,13 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 text-transform: uppercase;
             }}
             .posts-sheet-list-row {{
+                position: relative;
                 width: 100%;
                 display: grid;
-                grid-template-columns: minmax(250px, 2.15fr) minmax(170px, 0.95fr) minmax(150px, 0.84fr) minmax(95px, 0.58fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(110px, 0.72fr) minmax(100px, 0.7fr) minmax(100px, 0.7fr) minmax(120px, 0.82fr) minmax(138px, 0.9fr);
-                gap: 12px;
+                grid-template-columns: minmax(230px, 1.95fr) minmax(150px, 0.9fr) minmax(118px, 0.72fr) minmax(84px, 0.48fr) repeat(5, minmax(88px, 0.56fr)) minmax(90px, 0.58fr) 56px;
+                gap: 10px;
                 align-items: center;
-                padding: 12px 16px;
+                padding: 12px 14px;
                 text-align: left;
                 background: transparent;
                 border: none;
@@ -9884,6 +10286,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .posts-sheet-list-row.is-active {{
                 background: rgba(37, 99, 235, 0.08);
+            }}
+            .posts-sheet-list-row.is-menu-open {{
+                z-index: 36;
+                isolation: isolate;
             }}
             .posts-sheet-list-cell {{
                 min-width: 0;
@@ -9905,6 +10311,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 font-weight: 900;
                 color: #f8fafc;
                 line-height: 1.25;
+                word-break: break-word;
             }}
             .posts-sheet-list-sub {{
                 font-size: 12px;
@@ -9962,7 +10369,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 justify-content: flex-end;
                 width: max-content;
                 margin-left: auto;
-                z-index: 12;
+                z-index: 8;
             }}
             .posts-sheet-actions-toggle {{
                 display: inline-flex;
@@ -10004,7 +10411,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 border: 1px solid rgba(148, 163, 184, 0.16);
                 background: rgba(15, 23, 42, 0.98);
                 box-shadow: 0 18px 48px rgba(15, 23, 42, 0.34);
-                z-index: 40;
+                z-index: 120;
             }}
             .posts-sheet-actions-item {{
                 display: inline-flex;
@@ -10071,7 +10478,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 color: #e2e8f0;
             }}
             .posts-sheet-list-cell-metric {{
-                font-size: 13px;
+                font-size: 12px;
                 font-weight: 800;
                 color: #f8fafc;
                 white-space: nowrap;
@@ -10266,7 +10673,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     display: grid;
                 }}
                 .posts-sheet-list-table {{
-                    min-width: 1320px;
+                    min-width: 1160px;
                 }}
                 .schedule-track-list-table {{
                     min-width: 1040px;
@@ -10275,7 +10682,55 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     grid-template-columns: repeat(2, minmax(0, 1fr));
                 }}
             }}
+            @media (max-width: 1480px) {{
+                .posts-table {{
+                    min-width: 1080px;
+                }}
+                .posts-table thead th {{
+                    padding: 12px 10px;
+                    font-size: 10.5px;
+                }}
+                .posts-cell {{
+                    padding: 11px 10px;
+                }}
+                .posts-cell-metric {{
+                    min-width: 76px;
+                    font-size: 12px;
+                }}
+                .posts-col-content {{
+                    width: 13.5%;
+                }}
+                .posts-col-creator {{
+                    width: 14%;
+                }}
+                .posts-col-status {{
+                    width: 8%;
+                }}
+                .posts-col-plan {{
+                    width: 5.5%;
+                }}
+                .posts-col-line {{
+                    width: 4.5%;
+                }}
+                .posts-col-tier {{
+                    width: 3.2%;
+                }}
+                .posts-col-date {{
+                    width: 6.5%;
+                }}
+                .posts-col-metric {{
+                    width: 8.95%;
+                }}
+            }}
             @media (max-width: 1360px) {{
+                .posts-sheet-list-head,
+                .posts-sheet-list-row {{
+                    grid-template-columns: minmax(210px, 1.7fr) minmax(132px, 0.82fr) minmax(110px, 0.68fr) minmax(76px, 0.46fr) repeat(5, minmax(80px, 0.5fr)) minmax(84px, 0.54fr) 52px;
+                    gap: 8px;
+                }}
+                .posts-sheet-list-table {{
+                    min-width: 1120px;
+                }}
                 .schedule-track-list-head,
                 .schedule-track-list-row {{
                     grid-template-columns: minmax(220px, 1.3fr) minmax(240px, 1.2fr) minmax(130px, 0.72fr) minmax(120px, 0.68fr) minmax(190px, 0.95fr);
@@ -11038,25 +11493,54 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 color: #94a3b8;
             }}
             .posts-table {{
+                width: 100%;
+                table-layout: fixed;
                 border-collapse: separate;
                 border-spacing: 0;
+            }}
+            .posts-col-check {{
+                width: 42px;
+            }}
+            .posts-col-content {{
+                width: 14.5%;
+            }}
+            .posts-col-creator {{
+                width: 15%;
+            }}
+            .posts-col-status {{
+                width: 8.5%;
+            }}
+            .posts-col-plan {{
+                width: 6%;
+            }}
+            .posts-col-line {{
+                width: 5%;
+            }}
+            .posts-col-tier {{
+                width: 3.5%;
+            }}
+            .posts-col-date {{
+                width: 7%;
+            }}
+            .posts-col-metric {{
+                width: 8.1%;
             }}
             .posts-table thead th {{
                 position: sticky;
                 top: 0;
                 z-index: 1;
                 background: rgba(51, 65, 85, 0.9);
-                padding: 16px 20px;
+                padding: 14px 14px;
                 color: #cbd5e1;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 800;
-                letter-spacing: 0.12em;
+                letter-spacing: 0.1em;
                 text-transform: uppercase;
                 text-align: left;
                 white-space: nowrap;
             }}
             .posts-check-col {{
-                width: 44px;
+                width: 38px;
             }}
             .posts-table-row {{
                 transition: background 0.2s ease;
@@ -11068,34 +11552,38 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 border-top: 1px solid rgba(148, 163, 184, 0.12);
             }}
             .posts-cell {{
-                padding: 14px 16px;
+                padding: 12px 12px;
                 vertical-align: top;
                 color: #e2e8f0;
             }}
             .posts-cell-check {{
-                width: 44px;
+                width: 38px;
                 text-align: center;
             }}
             .posts-cell-content {{
-                min-width: 200px;
-                max-width: 320px;
+                min-width: 0;
+                max-width: none;
             }}
             .post-content-wrap {{
                 min-width: 0;
                 max-width: 100%;
+                overflow: hidden;
             }}
             .posts-cell-date {{
                 color: #cbd5e1;
                 white-space: nowrap;
+                min-width: 104px;
             }}
             .posts-cell-metric {{
                 text-align: right;
                 white-space: nowrap;
                 font-weight: 800;
+                font-size: 13px;
                 color: #f8fafc;
                 font-variant-numeric: tabular-nums;
                 font-feature-settings: "tnum" 1, "lnum" 1;
                 font-kerning: none;
+                min-width: 88px;
             }}
             .posts-cell-metric-strong {{
                 color: #dbeafe;
@@ -11106,7 +11594,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
             .posts-table thead th[data-post-col="comment"],
             .posts-table thead th[data-post-col="buzz"] {{
                 text-align: right;
-                padding-right: 16px;
+                padding-right: 12px;
                 font-variant-numeric: tabular-nums;
                 font-feature-settings: "tnum" 1, "lnum" 1;
                 font-kerning: none;
@@ -11134,17 +11622,19 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 color: #93c5fd;
             }}
             .post-content-meta {{
-                display: block;
-                margin-top: 8px;
-                font-size: 12px;
+                display: -webkit-box;
+                margin-top: 6px;
+                font-size: 11px;
                 color: #64748b;
-                white-space: normal;
+                overflow: hidden;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
                 overflow-wrap: anywhere;
                 word-break: break-word;
             }}
             .post-avatar {{
-                width: 42px;
-                height: 42px;
+                width: 38px;
+                height: 38px;
                 border-radius: 999px;
                 display: inline-flex;
                 align-items: center;
@@ -11154,14 +11644,165 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.24);
             }}
             .post-creator-name {{
-                font-size: 15px;
+                display: -webkit-box;
+                font-size: 14px;
                 font-weight: 800;
                 color: #f8fafc;
+                overflow: hidden;
+                -webkit-line-clamp: 2;
+                -webkit-box-orient: vertical;
             }}
             .post-creator-handle {{
+                display: block;
+                margin-top: 3px;
+                font-size: 11px;
+                color: #93c5fd;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }}
+            .post-creator-trigger {{
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 0;
+                padding: 0;
+                border: 0;
+                background: transparent;
+                text-align: left;
+                cursor: pointer;
+            }}
+            .post-creator-trigger:hover .post-creator-name {{
+                color: #93c5fd;
+            }}
+            .posts-creator-modal {{
+                position: fixed;
+                inset: 0;
+                z-index: 95;
+            }}
+            .posts-creator-modal-backdrop {{
+                position: absolute;
+                inset: 0;
+                background: rgba(2, 6, 23, 0.72);
+                backdrop-filter: blur(2px);
+            }}
+            .posts-creator-modal-card {{
+                position: relative;
+                width: min(760px, calc(100% - 24px));
+                max-height: calc(100vh - 40px);
+                overflow: hidden;
+                margin: 20px auto;
+                border-radius: 20px;
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                background: linear-gradient(180deg, rgba(15, 23, 42, 0.98), rgba(15, 23, 42, 0.95));
+                box-shadow: 0 22px 48px rgba(2, 6, 23, 0.5);
+                display: flex;
+                flex-direction: column;
+            }}
+            .posts-creator-modal-head {{
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 16px;
+                padding: 18px 20px 14px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+            }}
+            .posts-creator-modal-kicker {{
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: 0.16em;
+                text-transform: uppercase;
+                color: #94a3b8;
+            }}
+            .posts-creator-modal-title {{
+                margin-top: 4px;
+                font-size: 22px;
+                line-height: 1.2;
+                font-weight: 900;
+                color: #f8fafc;
+                word-break: break-word;
+            }}
+            .posts-creator-modal-sub {{
                 margin-top: 4px;
                 font-size: 12px;
+                font-weight: 700;
                 color: #93c5fd;
+            }}
+            .posts-creator-modal-close {{
+                width: 36px;
+                height: 36px;
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 0.24);
+                background: rgba(30, 41, 59, 0.75);
+                color: #e2e8f0;
+                cursor: pointer;
+            }}
+            .posts-creator-modal-close:hover {{
+                background: rgba(51, 65, 85, 0.84);
+            }}
+            .posts-creator-modal-list {{
+                padding: 10px 20px 20px;
+                overflow: auto;
+                display: grid;
+                gap: 10px;
+            }}
+            .posts-creator-post-item {{
+                border: 1px solid rgba(96, 165, 250, 0.2);
+                background: rgba(30, 41, 59, 0.54);
+                border-radius: 14px;
+                padding: 12px 14px;
+            }}
+            .posts-creator-post-top {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                margin-bottom: 6px;
+            }}
+            .posts-creator-post-index {{
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: 0.08em;
+                color: #cbd5e1;
+            }}
+            .posts-creator-post-chip {{
+                font-size: 11px;
+                font-weight: 800;
+                color: #bfdbfe;
+                border: 1px solid rgba(96, 165, 250, 0.3);
+                border-radius: 999px;
+                padding: 3px 8px;
+                white-space: nowrap;
+            }}
+            .posts-creator-post-title {{
+                margin: 0;
+                font-size: 14px;
+                font-weight: 800;
+                color: #f8fafc;
+                line-height: 1.45;
+            }}
+            .posts-creator-post-link {{
+                display: inline-block;
+                margin-top: 5px;
+                font-size: 12px;
+                color: #60a5fa;
+                word-break: break-all;
+            }}
+            .posts-creator-post-link:hover {{
+                color: #93c5fd;
+            }}
+            .posts-creator-post-date {{
+                margin-top: 5px;
+                font-size: 12px;
+                color: #94a3b8;
+            }}
+            .posts-creator-post-empty {{
+                padding: 14px;
+                border-radius: 12px;
+                border: 1px dashed rgba(148, 163, 184, 0.28);
+                color: #94a3b8;
+                font-size: 13px;
+                text-align: center;
             }}
             .post-avatar-tiktok {{ background: linear-gradient(135deg, #111827, #ec4899); }}
             .post-avatar-facebook {{ background: linear-gradient(135deg, #1d4ed8, #38bdf8); }}
@@ -11824,6 +12465,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
             html[data-theme="light"] .overview-stat-card,
             html[data-theme="light"] .overview-campaign-card,
             html[data-theme="light"] .overview-chart-card,
+            html[data-theme="light"] .overview-platform-card,
             html[data-theme="light"] .posts-counter-pill,
             html[data-theme="light"] .employee-summary-pill,
             html[data-theme="light"] .posts-empty-card,
@@ -11843,6 +12485,26 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 background: rgba(255, 255, 255, 0.92) !important;
                 border-color: rgba(148, 163, 184, 0.18) !important;
                 box-shadow: 0 10px 24px rgba(148, 163, 184, 0.1);
+            }}
+            html[data-theme="light"] .overview-platform-head {{
+                color: #64748b;
+                border-bottom-color: rgba(148, 163, 184, 0.2);
+            }}
+            html[data-theme="light"] .overview-platform-row {{
+                color: #334155;
+                border-bottom-color: rgba(148, 163, 184, 0.14);
+            }}
+            html[data-theme="light"] .overview-platform-cell-name,
+            html[data-theme="light"] .overview-platform-cell-value,
+            html[data-theme="light"] .overview-platform-total {{
+                color: #0f172a;
+            }}
+            html[data-theme="light"] .overview-platform-ratio-bar-shell {{
+                background: rgba(148, 163, 184, 0.28);
+            }}
+            html[data-theme="light"] .overview-platform-total {{
+                background: rgba(241, 245, 249, 0.92);
+                border-top-color: rgba(148, 163, 184, 0.2);
             }}
             html[data-theme="light"] .metric-posts {{
                 background: rgba(99, 102, 241, 0.1);
@@ -12311,6 +12973,32 @@ def home(request: Request, background_tasks: BackgroundTasks):
             html[data-theme="light"] .post-creator-handle {{
                 color: #2563eb;
             }}
+            html[data-theme="light"] .posts-creator-modal-card {{
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.98));
+                border-color: rgba(148, 163, 184, 0.26);
+                box-shadow: 0 20px 36px rgba(148, 163, 184, 0.2);
+            }}
+            html[data-theme="light"] .posts-creator-modal-title,
+            html[data-theme="light"] .posts-creator-post-title {{
+                color: #0f172a;
+            }}
+            html[data-theme="light"] .posts-creator-modal-kicker,
+            html[data-theme="light"] .posts-creator-post-date,
+            html[data-theme="light"] .posts-creator-post-index {{
+                color: #64748b;
+            }}
+            html[data-theme="light"] .posts-creator-post-item {{
+                background: rgba(241, 245, 249, 0.8);
+                border-color: rgba(96, 165, 250, 0.26);
+            }}
+            html[data-theme="light"] .posts-creator-modal-close {{
+                background: rgba(248, 250, 252, 0.95);
+                border-color: rgba(148, 163, 184, 0.28);
+                color: #0f172a;
+            }}
+            html[data-theme="light"] .posts-creator-modal-close:hover {{
+                background: rgba(226, 232, 240, 0.9);
+            }}
             html[data-theme="light"] .text-amber-200,
             html[data-theme="light"] .text-amber-300,
             html[data-theme="light"] .text-amber-400,
@@ -12503,6 +13191,24 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 .overview-campaign-metrics {{
                     grid-template-columns: 1fr;
                 }}
+                .overview-platform-head,
+                .overview-platform-row,
+                .overview-platform-total {{
+                    grid-template-columns: minmax(100px, 1.2fr) minmax(74px, 0.7fr) minmax(64px, 0.55fr);
+                    gap: 6px;
+                }}
+                .overview-platform-head,
+                .overview-platform-row,
+                .overview-platform-total {{
+                    padding-left: 8px;
+                    padding-right: 8px;
+                }}
+                .overview-platform-wrap {{
+                    width: 100%;
+                }}
+                .overview-platform-card {{
+                    max-width: 100%;
+                }}
                 .overview-chart-single-grid {{
                     grid-template-columns: 1fr;
                 }}
@@ -12557,45 +13263,45 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 let colConfigApplyNote = document.getElementById("col-config-apply-note");
                 let colConfigActiveTabInput = document.getElementById("col-config-active-tab-input");
                 let autoFillColumnsBtn = document.getElementById("auto-fill-columns-btn");
-                const scheduleForm = document.querySelector("form[action='/set-schedule']");
-                const scheduleSheetSearch = document.getElementById("schedule-sheet-search");
-                const scheduleSheetDatalist = document.getElementById("schedule-sheet-datalist");
-                const scheduleSheetSelect = document.getElementById("schedule-sheet-select");
-                const scheduleModeSelect = document.getElementById("schedule-mode-select");
-                const scheduleWeekdayShell = document.getElementById("schedule-weekday-shell");
-                const scheduleMonthdateShell = document.getElementById("schedule-monthdate-shell");
-                const weekdaySelect = document.getElementById("schedule-weekday-select");
-                const monthDateInput = document.getElementById("schedule-monthdate-input");
-                const monthDayInput = document.querySelector("input[name='monthday']");
-                const endDateInput = document.getElementById("schedule-enddate-input");
-                const monthDateBtn = document.getElementById("monthdate-picker-btn");
-                const endDateBtn = document.getElementById("enddate-picker-btn");
-                const scheduleMonthdateHelp = document.getElementById("schedule-monthdate-help");
-                const scheduleBoundSheetName = document.getElementById("schedule-bound-sheet-name");
-                const scheduleBoundSheetId = document.getElementById("schedule-bound-sheet-id");
-                const scheduleBoundScope = document.getElementById("schedule-bound-scope");
-                const scheduleBoundLink = document.getElementById("schedule-bound-link");
-                const scheduleTrackNext = document.getElementById("schedule-track-next");
-                const scheduleTrackStarted = document.getElementById("schedule-track-started");
-                const scheduleTrackFinished = document.getElementById("schedule-track-finished");
-                const scheduleTrackDuration = document.getElementById("schedule-track-duration");
-                const scheduleTrackRunning = document.getElementById("schedule-track-running");
-                const scheduleTrackStatus = document.getElementById("schedule-track-status");
-                const scheduleTrackSource = document.getElementById("schedule-track-source");
-                const scheduleTrackSheet = document.getElementById("schedule-track-sheet");
-                const scheduleTrackProcessed = document.getElementById("schedule-track-processed");
-                const scheduleTrackSuccess = document.getElementById("schedule-track-success");
-                const scheduleTrackFailed = document.getElementById("schedule-track-failed");
-                const scheduleTrackHistory = document.getElementById("schedule-track-history");
-                const scheduleTrackList = document.getElementById("schedule-track-list");
-                const scheduleTrackActiveName = document.getElementById("schedule-track-active-name");
-                const scheduleTrackCalendarTitle = document.getElementById("schedule-track-calendar-title");
-                const scheduleTrackCalendarSubtext = document.getElementById("schedule-track-calendar-subtext");
-                const scheduleTrackCalendar = document.getElementById("schedule-track-calendar");
-                const scheduleTrackDetailShell = document.getElementById("schedule-track-detail-shell");
-                const scheduleTrackDetailBody = document.getElementById("schedule-track-detail-body");
-                const scheduleTrackEmptyState = document.getElementById("schedule-track-empty-state");
-                const scheduleTargetSummary = document.getElementById("schedule-target-summary");
+                let scheduleForm = document.querySelector("form[action='/set-schedule']");
+                let scheduleSheetSearch = document.getElementById("schedule-sheet-search");
+                let scheduleSheetDatalist = document.getElementById("schedule-sheet-datalist");
+                let scheduleSheetSelect = document.getElementById("schedule-sheet-select");
+                let scheduleModeSelect = document.getElementById("schedule-mode-select");
+                let scheduleWeekdayShell = document.getElementById("schedule-weekday-shell");
+                let scheduleMonthdateShell = document.getElementById("schedule-monthdate-shell");
+                let weekdaySelect = document.getElementById("schedule-weekday-select");
+                let monthDateInput = document.getElementById("schedule-monthdate-input");
+                let monthDayInput = document.querySelector("input[name='monthday']");
+                let endDateInput = document.getElementById("schedule-enddate-input");
+                let monthDateBtn = document.getElementById("monthdate-picker-btn");
+                let endDateBtn = document.getElementById("enddate-picker-btn");
+                let scheduleMonthdateHelp = document.getElementById("schedule-monthdate-help");
+                let scheduleBoundSheetName = document.getElementById("schedule-bound-sheet-name");
+                let scheduleBoundSheetId = document.getElementById("schedule-bound-sheet-id");
+                let scheduleBoundScope = document.getElementById("schedule-bound-scope");
+                let scheduleBoundLink = document.getElementById("schedule-bound-link");
+                let scheduleTrackNext = document.getElementById("schedule-track-next");
+                let scheduleTrackStarted = document.getElementById("schedule-track-started");
+                let scheduleTrackFinished = document.getElementById("schedule-track-finished");
+                let scheduleTrackDuration = document.getElementById("schedule-track-duration");
+                let scheduleTrackRunning = document.getElementById("schedule-track-running");
+                let scheduleTrackStatus = document.getElementById("schedule-track-status");
+                let scheduleTrackSource = document.getElementById("schedule-track-source");
+                let scheduleTrackSheet = document.getElementById("schedule-track-sheet");
+                let scheduleTrackProcessed = document.getElementById("schedule-track-processed");
+                let scheduleTrackSuccess = document.getElementById("schedule-track-success");
+                let scheduleTrackFailed = document.getElementById("schedule-track-failed");
+                let scheduleTrackHistory = document.getElementById("schedule-track-history");
+                let scheduleTrackList = document.getElementById("schedule-track-list");
+                let scheduleTrackActiveName = document.getElementById("schedule-track-active-name");
+                let scheduleTrackCalendarTitle = document.getElementById("schedule-track-calendar-title");
+                let scheduleTrackCalendarSubtext = document.getElementById("schedule-track-calendar-subtext");
+                let scheduleTrackCalendar = document.getElementById("schedule-track-calendar");
+                let scheduleTrackDetailShell = document.getElementById("schedule-track-detail-shell");
+                let scheduleTrackDetailBody = document.getElementById("schedule-track-detail-body");
+                let scheduleTrackEmptyState = document.getElementById("schedule-track-empty-state");
+                let scheduleTargetSummary = document.getElementById("schedule-target-summary");
                 const dashboardShell = document.getElementById("dashboard-shell");
                 const sidebarCollapseToggle = document.getElementById("sidebar-collapse-toggle");
                 const sidebarCollapseIcon = document.getElementById("sidebar-collapse-icon");
@@ -12685,6 +13391,48 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     colConfigApplyNote = document.getElementById("col-config-apply-note");
                     colConfigActiveTabInput = document.getElementById("col-config-active-tab-input");
                     autoFillColumnsBtn = document.getElementById("auto-fill-columns-btn");
+                }};
+
+                const refreshScheduleDomRefs = () => {{
+                    scheduleForm = document.querySelector("form[action='/set-schedule']");
+                    scheduleSheetSearch = document.getElementById("schedule-sheet-search");
+                    scheduleSheetDatalist = document.getElementById("schedule-sheet-datalist");
+                    scheduleSheetSelect = document.getElementById("schedule-sheet-select");
+                    scheduleModeSelect = document.getElementById("schedule-mode-select");
+                    scheduleWeekdayShell = document.getElementById("schedule-weekday-shell");
+                    scheduleMonthdateShell = document.getElementById("schedule-monthdate-shell");
+                    weekdaySelect = document.getElementById("schedule-weekday-select");
+                    monthDateInput = document.getElementById("schedule-monthdate-input");
+                    monthDayInput = document.querySelector("input[name='monthday']");
+                    endDateInput = document.getElementById("schedule-enddate-input");
+                    monthDateBtn = document.getElementById("monthdate-picker-btn");
+                    endDateBtn = document.getElementById("enddate-picker-btn");
+                    scheduleMonthdateHelp = document.getElementById("schedule-monthdate-help");
+                    scheduleBoundSheetName = document.getElementById("schedule-bound-sheet-name");
+                    scheduleBoundSheetId = document.getElementById("schedule-bound-sheet-id");
+                    scheduleBoundScope = document.getElementById("schedule-bound-scope");
+                    scheduleBoundLink = document.getElementById("schedule-bound-link");
+                    scheduleTrackNext = document.getElementById("schedule-track-next");
+                    scheduleTrackStarted = document.getElementById("schedule-track-started");
+                    scheduleTrackFinished = document.getElementById("schedule-track-finished");
+                    scheduleTrackDuration = document.getElementById("schedule-track-duration");
+                    scheduleTrackRunning = document.getElementById("schedule-track-running");
+                    scheduleTrackStatus = document.getElementById("schedule-track-status");
+                    scheduleTrackSource = document.getElementById("schedule-track-source");
+                    scheduleTrackSheet = document.getElementById("schedule-track-sheet");
+                    scheduleTrackProcessed = document.getElementById("schedule-track-processed");
+                    scheduleTrackSuccess = document.getElementById("schedule-track-success");
+                    scheduleTrackFailed = document.getElementById("schedule-track-failed");
+                    scheduleTrackHistory = document.getElementById("schedule-track-history");
+                    scheduleTrackList = document.getElementById("schedule-track-list");
+                    scheduleTrackActiveName = document.getElementById("schedule-track-active-name");
+                    scheduleTrackCalendarTitle = document.getElementById("schedule-track-calendar-title");
+                    scheduleTrackCalendarSubtext = document.getElementById("schedule-track-calendar-subtext");
+                    scheduleTrackCalendar = document.getElementById("schedule-track-calendar");
+                    scheduleTrackDetailShell = document.getElementById("schedule-track-detail-shell");
+                    scheduleTrackDetailBody = document.getElementById("schedule-track-detail-body");
+                    scheduleTrackEmptyState = document.getElementById("schedule-track-empty-state");
+                    scheduleTargetSummary = document.getElementById("schedule-target-summary");
                 }};
 
                 const applySidebarCollapsed = (collapsed) => {{
@@ -13680,85 +14428,101 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 window.bindSheetTabLookupControls = bindSheetTabLookupControls;
                 bindSheetTabLookupControls();
 
+                const hardenInlineDashboardForms = () => {{
+                    document.querySelectorAll("form[action='/set-sheet'], form[action='/set-columns']").forEach((formEl) => {{
+                        if (formEl.dataset.nativeSubmitBlocked === "1") return;
+                        formEl.dataset.nativeSubmitBlocked = "1";
+                        formEl.addEventListener("submit", (event) => {{
+                            event.preventDefault();
+                        }}, true);
+                    }});
+                }};
+                window.hardenInlineDashboardForms = hardenInlineDashboardForms;
+                hardenInlineDashboardForms();
+
+                const submitSetColumnsFormInline = async () => {{
+                    void pushRealtimeLog("Bắt đầu lưu cấu hình cột nhập liệu...");
+                    const params = new URLSearchParams();
+                    document.querySelectorAll("[form='set-columns-form'][name]").forEach((field) => {{
+                        const rawValue = (field.value || "").trim();
+                        if (field.matches("[data-column-input]")) {{
+                            if (!rawValue) {{
+                                params.set(field.name, "");
+                            }} else {{
+                                params.set(field.name, rawValue);
+                            }}
+                            return;
+                        }}
+                        params.set(field.name, rawValue);
+                    }});
+                    if (!String(params.get("tab_name") || "").trim() && colConfigActiveTab) {{
+                        params.set("tab_name", String(colConfigActiveTab || "").trim());
+                    }}
+                    try {{
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 8000);
+                        const response = await fetch(`/set-columns?${{params.toString()}}`, {{
+                            headers: {{ "X-Requested-With": "fetch" }},
+                            cache: "no-store",
+                            signal: controller.signal,
+                        }});
+                        clearTimeout(timeoutId);
+                        const data = await response.json();
+                        applyStatusState(data);
+                        applyScheduleConfigState(data);
+                        applyScheduleTrackingState(data);
+                        if (data.ok) {{
+                            applyColumnConfigState(data);
+                            pendingSheetMetadataReveal = true;
+                            applySheetMetadataState(data);
+                            if (typeof data.overview_html === "string") {{
+                                replaceOverviewPanelHtml(data.overview_html);
+                            }}
+                            if (typeof data.posts_html === "string") {{
+                                replacePostsPanelHtml(data.posts_html);
+                            }}
+                            if (typeof data.campaign_html === "string") {{
+                                replaceCampaignPanelHtml(data.campaign_html);
+                            }}
+                            if (data.defer_panel_refresh) {{
+                                setTimeout(() => {{
+                                    try {{ loadAsyncDashboardData(); }} catch (_) {{}}
+                                }}, 0);
+                            }}
+                        }}
+                        showNotice(
+                            data.message || (data.ok ? "Đã lưu sheet thành công." : "Không lưu được sheet."),
+                            data.level || (data.ok ? "success" : "error")
+                        );
+                        if (data.ok) {{
+                            void pushRealtimeLog(data.message || "Đã lưu cấu hình cột nhập liệu thành công.");
+                        }} else {{
+                            void pushRealtimeLog(data.message || "Không lưu được cấu hình cột nhập liệu.");
+                        }}
+                        await refreshStatusNow();
+                    }} catch (err) {{
+                        const isTimeout = err?.name === "AbortError";
+                        showNotice(
+                            isTimeout
+                                ? "Lưu cấu hình cột quá lâu, tạm dừng để tránh treo. Bạn thử bấm Lưu lại."
+                                : "Không lưu được sheet. Vui lòng thử lại.",
+                            isTimeout ? "warning" : "error"
+                        );
+                        void pushRealtimeLog(
+                            isTimeout
+                                ? "Lưu cấu hình cột quá lâu, đã timeout để tránh treo. Bạn thử bấm Lưu lại."
+                                : "Lưu cấu hình cột thất bại. Vui lòng thử lại."
+                        );
+                    }}
+                }};
+
                 const bindSetColumnsFormInline = () => {{
                     const activeSetColumnsForm = document.querySelector("form[action='/set-columns']");
                     if (!activeSetColumnsForm || activeSetColumnsForm.dataset.inlineBound === "1") return;
                     activeSetColumnsForm.dataset.inlineBound = "1";
                     activeSetColumnsForm.addEventListener("submit", async (event) => {{
                         event.preventDefault();
-                        void pushRealtimeLog("Bắt đầu lưu cấu hình cột nhập liệu...");
-                        const params = new URLSearchParams();
-                        document.querySelectorAll("[form='set-columns-form'][name]").forEach((field) => {{
-                            const rawValue = (field.value || "").trim();
-                            if (field.matches("[data-column-input]")) {{
-                                if (!rawValue) {{
-                                    params.set(field.name, "");
-                                }} else {{
-                                    params.set(field.name, rawValue);
-                                }}
-                                return;
-                            }}
-                            params.set(field.name, rawValue);
-                        }});
-                        if (!String(params.get("tab_name") || "").trim() && colConfigActiveTab) {{
-                            params.set("tab_name", String(colConfigActiveTab || "").trim());
-                        }}
-                        try {{
-                            const controller = new AbortController();
-                            const timeoutId = setTimeout(() => controller.abort(), 8000);
-                            const response = await fetch(`/set-columns?${{params.toString()}}`, {{
-                                headers: {{ "X-Requested-With": "fetch" }},
-                                cache: "no-store",
-                                signal: controller.signal,
-                            }});
-                            clearTimeout(timeoutId);
-                            const data = await response.json();
-                            applyStatusState(data);
-                            applyScheduleConfigState(data);
-                            applyScheduleTrackingState(data);
-                            if (data.ok) {{
-                                applyColumnConfigState(data);
-                                pendingSheetMetadataReveal = true;
-                                applySheetMetadataState(data);
-                                if (typeof data.overview_html === "string") {{
-                                    replaceOverviewPanelHtml(data.overview_html);
-                                }}
-                                if (typeof data.posts_html === "string") {{
-                                    replacePostsPanelHtml(data.posts_html);
-                                }}
-                                if (typeof data.campaign_html === "string") {{
-                                    replaceCampaignPanelHtml(data.campaign_html);
-                                }}
-                                if (data.defer_panel_refresh) {{
-                                    setTimeout(() => {{
-                                        try {{ loadAsyncDashboardData(); }} catch (_) {{}}
-                                    }}, 0);
-                                }}
-                            }}
-                            showNotice(
-                                data.message || (data.ok ? "Đã lưu sheet thành công." : "Không lưu được sheet."),
-                                data.level || (data.ok ? "success" : "error")
-                            );
-                            if (data.ok) {{
-                                void pushRealtimeLog(data.message || "Đã lưu cấu hình cột nhập liệu thành công.");
-                            }} else {{
-                                void pushRealtimeLog(data.message || "Không lưu được cấu hình cột nhập liệu.");
-                            }}
-                            await refreshStatusNow();
-                        }} catch (err) {{
-                            const isTimeout = err?.name === "AbortError";
-                            showNotice(
-                                isTimeout
-                                    ? "Lưu cấu hình cột quá lâu, tạm dừng để tránh treo. Bạn thử bấm Lưu lại."
-                                    : "Không lưu được sheet. Vui lòng thử lại.",
-                                isTimeout ? "warning" : "error"
-                            );
-                            void pushRealtimeLog(
-                                isTimeout
-                                    ? "Lưu cấu hình cột quá lâu, đã timeout để tránh treo. Bạn thử bấm Lưu lại."
-                                    : "Lưu cấu hình cột thất bại. Vui lòng thử lại."
-                            );
-                        }}
+                        await submitSetColumnsFormInline();
                     }});
                 }};
                 window.bindSetColumnsFormInline = bindSetColumnsFormInline;
@@ -13918,12 +14682,21 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }}
                 }};
 
-                if (setSheetForm) {{
-                    setSheetForm.addEventListener("submit", async (event) => {{
-                        event.preventDefault();
+                document.addEventListener("submit", async (event) => {{
+                    const target = event.target;
+                    if (!target || !target.matches || !target.matches("form")) return;
+                    const action = String(target.getAttribute("action") || "").trim();
+                    if (action !== "/set-sheet" && action !== "/set-columns") return;
+                    if (event.__dashboardInlineHandled) return;
+                    event.__dashboardInlineHandled = true;
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                    if (action === "/set-sheet") {{
                         await submitSheetFormInline();
-                    }});
-                }}
+                        return;
+                    }}
+                    await submitSetColumnsFormInline();
+                }}, true);
 
                 if (typeof window.bindSetColumnsFormInline === "function") {{
                     window.bindSetColumnsFormInline();
@@ -14393,6 +15166,160 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 syncScheduleModeFields();
                 redrawScheduleCalendar();
 
+                const ensureScheduleControlsBound = () => {{
+                    refreshScheduleDomRefs();
+
+                    if (monthPicker && monthPicker.input !== monthDateInput) {{
+                        try {{
+                            monthPicker.destroy();
+                        }} catch (_) {{}}
+                        monthPicker = null;
+                    }}
+                    if (endPicker && endPicker.input !== endDateInput) {{
+                        try {{
+                            endPicker.destroy();
+                        }} catch (_) {{}}
+                        endPicker = null;
+                    }}
+
+                    if (monthDateInput && typeof flatpickr === "function" && !monthPicker) {{
+                        monthPicker = flatpickr(monthDateInput, {{
+                            dateFormat: "Y-m-d",
+                            altInput: true,
+                            altFormat: "d/m/Y",
+                            locale: (window.flatpickr && flatpickr.l10ns && flatpickr.l10ns.vn) ? "vn" : "default",
+                            disableMobile: true,
+                            allowInput: true,
+                            onDayCreate: (_, __, fp, dayElem) => {{
+                                dayElem.classList.remove("schedule-weekday-match");
+                                dayElem.classList.remove("schedule-today-muted");
+                                const mode = scheduleModeSelect?.value || "off";
+                                if (mode !== "weekly" || !dayElem.dateObj) return;
+                                if (isScheduleWeekdayMatch(dayElem.dateObj, fp.currentYear, fp.currentMonth)) {{
+                                    dayElem.classList.add("schedule-weekday-match");
+                                }} else if (dayElem.classList.contains("today")) {{
+                                    dayElem.classList.add("schedule-today-muted");
+                                }}
+                            }},
+                            onMonthChange: () => redrawScheduleCalendar(),
+                            onYearChange: () => redrawScheduleCalendar(),
+                            onOpen: () => redrawScheduleCalendar(),
+                            onReady: () => redrawScheduleCalendar(),
+                            onValueUpdate: () => redrawScheduleCalendar(),
+                        }});
+                    }}
+
+                    if (endDateInput && typeof flatpickr === "function" && !endPicker) {{
+                        endPicker = flatpickr(endDateInput, {{
+                            dateFormat: "Y-m-d",
+                            altInput: true,
+                            altFormat: "d/m/Y",
+                            locale: (window.flatpickr && flatpickr.l10ns && flatpickr.l10ns.vn) ? "vn" : "default",
+                            disableMobile: true,
+                            allowInput: true,
+                            onChange: () => updateSchedulePreview(),
+                        }});
+                    }}
+
+                    if (scheduleForm && monthDateInput && monthDayInput && scheduleForm.dataset.bound !== "1") {{
+                        const syncMonthday = () => {{
+                            if (!monthDateInput.value) return;
+                            const parts = monthDateInput.value.split("-");
+                            const day = parseInt(parts[2], 10);
+                            if (!Number.isNaN(day)) {{
+                                monthDayInput.value = Math.max(1, Math.min(28, day));
+                            }}
+                        }};
+                        monthDateInput.addEventListener("change", syncMonthday);
+                        scheduleForm.addEventListener("submit", syncMonthday);
+                        scheduleForm.addEventListener("submit", async (event) => {{
+                            event.preventDefault();
+                            syncMonthday();
+                            if (scheduleSheetSearch && scheduleSheetOptionItems.length) {{
+                                await commitScheduleSheetSearch(false);
+                                if (!String(scheduleSheetSelect?.value || "").trim()) {{
+                                    showNotice("Hãy chọn đúng một sheet từ gợi ý trước khi lưu lịch.", "warning");
+                                    scheduleSheetSearch.focus();
+                                    return;
+                                }}
+                            }}
+                            const params = new URLSearchParams(new FormData(scheduleForm));
+                            try {{
+                                const response = await fetch(`/set-schedule?${{params.toString()}}`, {{
+                                    headers: {{ "X-Requested-With": "fetch" }},
+                                    cache: "no-store",
+                                }});
+                                const data = await response.json();
+                                applyStatusState(data);
+                                applyScheduleConfigState(data);
+                                applyScheduleTrackingState(data);
+                                showNotice(
+                                    data.message || (data.ok ? "Đã cập nhật lịch tự động." : "Không lưu được lịch tự động."),
+                                    data.level || (data.ok ? "success" : "error")
+                                );
+                            }} catch (_) {{
+                                showNotice("Không lưu được lịch tự động. Vui lòng thử lại.", "error");
+                            }}
+                        }});
+                        scheduleForm.dataset.bound = "1";
+                        syncMonthday();
+                    }}
+
+                    if (scheduleModeSelect && scheduleModeSelect.dataset.bound !== "1") {{
+                        scheduleModeSelect.addEventListener("change", () => {{
+                            syncScheduleModeFields();
+                            redrawScheduleCalendar();
+                        }});
+                        scheduleModeSelect.dataset.bound = "1";
+                    }}
+                    if (weekdaySelect && weekdaySelect.dataset.bound !== "1") {{
+                        weekdaySelect.addEventListener("change", redrawScheduleCalendar);
+                        weekdaySelect.dataset.bound = "1";
+                    }}
+                    if (endDateInput && endDateInput.dataset.bound !== "1") {{
+                        endDateInput.addEventListener("change", updateSchedulePreview);
+                        endDateInput.dataset.bound = "1";
+                    }}
+                    if (monthDateInput && monthDateBtn && monthDateBtn.dataset.bound !== "1") {{
+                        monthDateBtn.addEventListener("click", () => {{
+                            try {{
+                                if (monthPicker && typeof monthPicker.open === "function") {{
+                                    monthPicker.open();
+                                }} else if (typeof monthDateInput.showPicker === "function") {{
+                                    monthDateInput.showPicker();
+                                }} else {{
+                                    monthDateInput.focus();
+                                    monthDateInput.click();
+                                }}
+                            }} catch (_) {{
+                                monthDateInput.focus();
+                            }}
+                        }});
+                        monthDateBtn.dataset.bound = "1";
+                    }}
+                    if (endDateInput && endDateBtn && endDateBtn.dataset.bound !== "1") {{
+                        endDateBtn.addEventListener("click", () => {{
+                            try {{
+                                if (endPicker && typeof endPicker.open === "function") {{
+                                    endPicker.open();
+                                }} else if (typeof endDateInput.showPicker === "function") {{
+                                    endDateInput.showPicker();
+                                }} else {{
+                                    endDateInput.focus();
+                                    endDateInput.click();
+                                }}
+                            }} catch (_) {{
+                                endDateInput.focus();
+                            }}
+                        }});
+                        endDateBtn.dataset.bound = "1";
+                    }}
+
+                    updateSchedulePreview();
+                    syncScheduleModeFields();
+                    redrawScheduleCalendar();
+                }};
+
                 const statusBadge = document.getElementById("status-badge");
                 const currentTaskLabel = document.getElementById("current-task");
                 const progressBar = document.getElementById("progress-bar");
@@ -14556,6 +15483,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     document.querySelectorAll("[data-posts-sheet-action-menu]").forEach((menu) => {{
                         const shouldKeepOpen = exceptMenu && menu === exceptMenu;
                         menu.classList.toggle("hidden", !shouldKeepOpen);
+                        const row = menu.closest(".posts-sheet-list-row");
+                        if (row) {{
+                            row.classList.toggle("is-menu-open", shouldKeepOpen);
+                        }}
                         const toggle = menu.parentElement?.querySelector("[data-posts-sheet-action-toggle]");
                         if (toggle) {{
                             toggle.setAttribute("aria-expanded", shouldKeepOpen ? "true" : "false");
@@ -15480,11 +16411,17 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             payload = {{ entries: [] }};
                         }}
                         const rawEntries = Array.isArray(payload.entries) ? payload.entries : [];
+                        const allBrandNames = Array.from(new Set(
+                            (Array.isArray(payload.brands) ? payload.brands : [])
+                                .map((item) => String(item?.name || "").trim())
+                                .concat(rawEntries.map((item) => String(item?.brand || "").trim()))
+                                .filter(Boolean)
+                        ));
                         const customFromInput = card.querySelector("[data-overview-custom-from]");
                         const customToInput = card.querySelector("[data-overview-custom-to]");
                         const customApplyButton = card.querySelector("[data-overview-apply-custom]");
                         if (!card._overviewChartState) {{
-                            card._overviewChartState = {{ range: "7d", granularity: "day", customFrom: "", customTo: "" }};
+                            card._overviewChartState = {{ range: "30d", granularity: "day", customFrom: "", customTo: "", selectedBrand: "" }};
                         }}
                         const setChartControlActiveState = () => {{
                             card.querySelectorAll("[data-overview-range]").forEach((button) => {{
@@ -15519,11 +16456,21 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 filterTrigger.setAttribute("aria-expanded", isOpen ? "true" : "false");
                             }}
                         }};
+                        const escapeLegendHtml = (value) => String(value || "")
+                            .replace(/&/g, "&amp;")
+                            .replace(/</g, "&lt;")
+                            .replace(/>/g, "&gt;")
+                            .replace(/"/g, "&quot;")
+                            .replace(/'/g, "&#39;");
                         setFilterPanelOpen(false);
 
                         const renderChart = () => {{
                             try {{
-                                const points = aggregateAirDateForChart(rawEntries, card._overviewChartState);
+                                const selectedBrand = String(card._overviewChartState.selectedBrand || "").trim();
+                                const scopedEntries = selectedBrand
+                                    ? rawEntries.filter((item) => String(item?.brand || "").trim() === selectedBrand)
+                                    : rawEntries;
+                                const points = aggregateAirDateForChart(scopedEntries, card._overviewChartState);
 
                                 tooltip.classList.add("hidden");
                                 svg.replaceChildren();
@@ -15533,8 +16480,19 @@ def home(request: Request, background_tasks: BackgroundTasks):
 
                                 if (!points.length) {{
                                     emptyState.classList.remove("hidden");
-                                    if (periodLabel) periodLabel.textContent = "Chưa có dữ liệu ngày air bài";
-                                    if (brandLegend) brandLegend.innerHTML = "";
+                                    if (periodLabel) periodLabel.textContent = selectedBrand ? `Không có dữ liệu ngày air bài cho ${{selectedBrand}}` : "Chưa có dữ liệu ngày air bài";
+                                    if (brandLegend) {{
+                                        const legendItems = ['<button type="button" class="overview-chart-brand-pill' + (!selectedBrand ? ' is-active' : '') + '" data-overview-brand-filter="">'
+                                            + '<span class="overview-chart-dot" style="background:#38bdf8;"></span><span>Tất cả</span></button>']
+                                            .concat(allBrandNames.map((name, index) => {{
+                                                const color = [
+                                                    "#f59e0b", "#10b981", "#38bdf8", "#a78bfa", "#f43f5e",
+                                                    "#22d3ee", "#84cc16", "#fb7185", "#f97316", "#6366f1"
+                                                ][index % 10];
+                                                return `<button type="button" class="overview-chart-brand-pill${{selectedBrand === name ? " is-active" : ""}}" data-overview-brand-filter="${{escapeLegendHtml(name)}}" aria-pressed="${{selectedBrand === name ? "true" : "false"}}"><span class="overview-chart-dot" style="background:${{color}};"></span><span>${{escapeLegendHtml(name)}}</span></button>`;
+                                            }}));
+                                        brandLegend.innerHTML = legendItems.join("");
+                                    }}
                                     return;
                                 }}
 
@@ -15570,21 +16528,27 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     "#22d3ee", "#84cc16", "#fb7185", "#f97316", "#6366f1"
                                 ];
                                 const brandColorByName = new Map(
-                                    brandOrder.map((name, idx) => [name, brandPalette[idx % brandPalette.length]])
+                                    allBrandNames.map((name, idx) => [name, brandPalette[idx % brandPalette.length]])
                                 );
                                 const firstPoint = points[0];
                                 const lastPoint = points[points.length - 1];
                                 const spanText = firstPoint && lastPoint
                                     ? `${{formatOverviewLongDate(firstPoint.date)}} - ${{formatOverviewLongDate(lastPoint.date)}}`
                                     : "";
-                                if (periodLabel) periodLabel.textContent = "Tổng cộng " + fBuzz + " buzz, " + formatMetric(totalViews) + " views" + (spanText ? (" | " + spanText) : "");
+                                if (periodLabel) {{
+                                    const prefix = selectedBrand ? (selectedBrand + " | ") : "";
+                                    periodLabel.textContent = prefix + "Tổng cộng " + fBuzz + " buzz, " + formatMetric(totalViews) + " views" + (spanText ? (" | " + spanText) : "");
+                                }}
                                 if (brandLegend) {{
-                                    brandLegend.innerHTML = brandOrder
-                                        .map((name) => {{
+                                    const legendItems = [
+                                        `<button type="button" class="overview-chart-brand-pill${{selectedBrand ? "" : " is-active"}}" data-overview-brand-filter="" aria-pressed="${{selectedBrand ? "false" : "true"}}"><span class="overview-chart-dot" style="background:#38bdf8;"></span><span>Tất cả</span></button>`
+                                    ].concat(
+                                        allBrandNames.map((name) => {{
                                             const color = brandColorByName.get(name) || "#f59e0b";
-                                            return `<span class="overview-chart-legend-item"><span class="overview-chart-dot" style="background:${{color}};"></span><span>${{name}}</span></span>`;
+                                            return `<button type="button" class="overview-chart-brand-pill${{selectedBrand === name ? " is-active" : ""}}" data-overview-brand-filter="${{escapeLegendHtml(name)}}" aria-pressed="${{selectedBrand === name ? "true" : "false"}}"><span class="overview-chart-dot" style="background:${{color}};"></span><span>${{escapeLegendHtml(name)}}</span></button>`;
                                         }})
-                                        .join("");
+                                    );
+                                    brandLegend.innerHTML = legendItems.join("");
                                 }}
                                 const showTooltip = (event, pointData) => {{
                                     if (!tooltip || !pointData) return;
@@ -15594,6 +16558,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     const mutedColor = isLightTheme ? "#475569" : "#94a3b8";
                                     const topBrandColor = isLightTheme ? "#1d4ed8" : "#93c5fd";
                                     const topSheetColor = isLightTheme ? "#4338ca" : "#a5b4fc";
+                                    const isBrandBarTooltip = Boolean(pointData.__brandName);
                                     const topBrands = (Array.isArray(pointData.topBrands) ? pointData.topBrands : []).slice(0, 2);
                                     const topSheets = (Array.isArray(pointData.topSheets) ? pointData.topSheets : []).slice(0, 2);
                                     const topBrandHtml = topBrands.length
@@ -15602,23 +16567,37 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     const topSheetHtml = topSheets.length
                                         ? topSheets.map((item, idx) => `<div style="color:${{topSheetColor}};font-size:11px;line-height:1.35;">${{idx + 1}}. ${{item.name}} · ${{new Intl.NumberFormat("vi-VN").format(item.views || 0)}} views</div>`).join("")
                                         : `<div style="color:${{mutedColor}};">Chưa có dữ liệu sheet</div>`;
+                                    const brandViewsDetailHtml = pointData.__brandViews != null
+                                        ? `<div style="color:${{bodyColor}};font-size:11px;">Lượt xem (brand): <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.__brandViews || 0)}}</strong></div>`
+                                        : "";
                                     const brandDetailBlock = pointData.__brandName
                                         ? `
                                             <div style="margin-top:6px;color:${{pointData.__brandColor || "#f59e0b"}};font-weight:800;font-size:11px;">
                                                 Thương hiệu: ${{pointData.__brandName}}
                                             </div>
+                                            ${{brandViewsDetailHtml}}
                                             <div style="color:${{bodyColor}};font-size:11px;">Buzz (brand): <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.__brandBuzz || 0)}}</strong></div>
                                         `
                                         : "";
+                                    const topBrandBlock = isBrandBarTooltip
+                                        ? ""
+                                        : `
+                                            <div style="margin-top:6px;color:${{mutedColor}};font-weight:700;font-size:11px;">Thương hiệu (${{topBrands.length}}):</div>
+                                            <div style="margin-top:2px;">${{topBrandHtml}}</div>
+                                        `;
+                                    const topSheetBlock = isBrandBarTooltip
+                                        ? ""
+                                        : `
+                                            <div style="margin-top:6px;color:${{mutedColor}};font-weight:700;font-size:11px;">Sheet (${{topSheets.length}}):</div>
+                                            <div style="margin-top:2px;">${{topSheetHtml}}</div>
+                                        `;
                                     tooltip.innerHTML = `
                                         <div style="font-weight:800;color:${{titleColor}};font-size:12px;">${{pointData.label || pointData.key || "N/A"}}</div>
                                         <div style="margin-top:3px;color:${{bodyColor}};font-size:11px;">Buzz: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.buzz || 0)}}</strong></div>
                                         <div style="color:${{bodyColor}};font-size:11px;">Lượt xem: <strong>${{new Intl.NumberFormat("vi-VN").format(pointData.views || 0)}}</strong></div>
                                         ${{brandDetailBlock}}
-                                        <div style="margin-top:6px;color:${{mutedColor}};font-weight:700;font-size:11px;">Thương hiệu (${{topBrands.length}}):</div>
-                                        <div style="margin-top:2px;">${{topBrandHtml}}</div>
-                                        <div style="margin-top:6px;color:${{mutedColor}};font-weight:700;font-size:11px;">Sheet (${{topSheets.length}}):</div>
-                                        <div style="margin-top:2px;">${{topSheetHtml}}</div>
+                                        ${{topBrandBlock}}
+                                        ${{topSheetBlock}}
                                     `;
                                     tooltip.classList.remove("hidden");
                                     const svgRect = svg.getBoundingClientRect();
@@ -15656,7 +16635,14 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                         return maxBrandBuzz || Number(bucket.buzz || 0) || 0;
                                     }})
                                 );
-                                const rawMaxViews = Math.max(1, ...points.map(b => b.views || 0));
+                                const rawMaxViews = Math.max(
+                                    1,
+                                    ...points.map((bucket) => {{
+                                        const brands = Array.isArray(bucket.topBrands) ? bucket.topBrands : [];
+                                        const maxBrandViews = Math.max(0, ...brands.map((brandItem) => Number(brandItem?.views || 0) || 0));
+                                        return maxBrandViews || Number(bucket.views || 0) || 0;
+                                    }})
+                                );
                                 const maxBuzz = Math.max(1, Math.ceil(rawMaxBuzz * 1.15));
                                 const maxViews = Math.max(1, Math.ceil(rawMaxViews * 1.15));
                                 const tickCount = 4;
@@ -15741,16 +16727,26 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     svg.appendChild(lblRight);
                                 }}
 
-                                const viewLinePoints = [];
+                                const brandViewSeries = brandOrder.map((brandName) => ({{
+                                    name: brandName,
+                                    color: brandColorByName.get(brandName) || "#38bdf8",
+                                    points: [],
+                                }}));
                                 const xLabelStep = Math.max(1, Math.ceil(points.length / 10));
                                 points.forEach((b, i) => {{
                                     const x = xAt(i);
-                                    const viewY = yViews(b.views);
-                                    const brandBuzzMap = new Map(
+                                    const brandStatsMap = new Map(
                                         (Array.isArray(b.topBrands) ? b.topBrands : []).map((brandItem) => [
                                             String(brandItem?.name || "").trim(),
-                                            Number(brandItem?.buzz || 0) || 0
+                                            {{
+                                                views: Number(brandItem?.views || 0) || 0,
+                                                buzz: Number(brandItem?.buzz || 0) || 0,
+                                                posts: Number(brandItem?.posts || 0) || 0,
+                                            }}
                                         ])
+                                    );
+                                    const brandBuzzMap = new Map(
+                                        Array.from(brandStatsMap.entries()).map(([brandName, stat]) => [brandName, Number(stat?.buzz || 0) || 0])
                                     );
                                     const clusterStartX = x - clusterWidth / 2;
                                     brandOrder.forEach((brandName, brandIndex) => {{
@@ -15769,12 +16765,29 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                             ...b,
                                             __brandName: brandName,
                                             __brandBuzz: brandBuzz,
+                                            __brandViews: Number(brandStatsMap.get(brandName)?.views || 0) || 0,
                                             __brandColor: barColor,
                                         }}));
                                         bar.addEventListener("mouseleave", hideTooltip);
                                         svg.appendChild(bar);
                                     }});
-                                    viewLinePoints.push({{ x, y: viewY, data: b }});
+                                    brandViewSeries.forEach((series) => {{
+                                        const stat = brandStatsMap.get(series.name) || null;
+                                        const brandViews = Number(stat?.views || 0) || 0;
+                                        const brandBuzz = Number(stat?.buzz || 0) || 0;
+                                        series.points.push({{
+                                            x,
+                                            y: yViews(brandViews),
+                                            data: {{
+                                                ...b,
+                                                __brandName: series.name,
+                                                __brandViews: brandViews,
+                                                __brandBuzz: brandBuzz,
+                                                __brandColor: series.color,
+                                            }},
+                                            value: brandViews,
+                                        }});
+                                    }});
 
                                     if (i % xLabelStep === 0 || i === points.length - 1) {{
                                         const dateTxt = createSvgNode("text", {{
@@ -15790,32 +16803,34 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     }}
                                 }});
 
-                                if (viewLinePoints.length > 0) {{
-                                    const linePathData = viewLinePoints
+                                brandViewSeries.forEach((series) => {{
+                                    const activeLinePoints = series.points.filter((pt) => (pt.value || 0) > 0);
+                                    if (!activeLinePoints.length) return;
+                                    const linePathData = activeLinePoints
                                         .map((pt, idx) => `${{idx === 0 ? "M" : "L"}}${{pt.x}} ${{pt.y}}`)
                                         .join(" ");
                                     const linePath = createSvgNode("path", {{
                                         d: linePathData,
                                         fill: "none",
-                                        stroke: "#38bdf8",
-                                        "stroke-width": 3,
+                                        stroke: series.color,
+                                        "stroke-width": 2.5,
                                         "stroke-linecap": "round",
                                         "stroke-linejoin": "round",
-                                        opacity: "0.95"
+                                        opacity: "0.92"
                                     }});
                                     svg.appendChild(linePath);
 
                                     const findNearestPointData = (evt) => {{
-                                        if (!viewLinePoints.length) return null;
+                                        if (!activeLinePoints.length) return null;
                                         const svgRect = svg.getBoundingClientRect();
                                         const x = (evt?.clientX || 0) - svgRect.left;
-                                        let nearest = viewLinePoints[0];
+                                        let nearest = activeLinePoints[0];
                                         let minDist = Math.abs(x - nearest.x);
-                                        for (let i = 1; i < viewLinePoints.length; i += 1) {{
-                                            const dist = Math.abs(x - viewLinePoints[i].x);
+                                        for (let i = 1; i < activeLinePoints.length; i += 1) {{
+                                            const dist = Math.abs(x - activeLinePoints[i].x);
                                             if (dist < minDist) {{
                                                 minDist = dist;
-                                                nearest = viewLinePoints[i];
+                                                nearest = activeLinePoints[i];
                                             }}
                                         }}
                                         return nearest?.data || null;
@@ -15825,7 +16840,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                         d: linePathData,
                                         fill: "none",
                                         stroke: "transparent",
-                                        "stroke-width": 18,
+                                        "stroke-width": 14,
                                         "stroke-linecap": "round",
                                         "stroke-linejoin": "round",
                                         style: "cursor:pointer;"
@@ -15841,26 +16856,24 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     lineHoverPath.addEventListener("mouseleave", hideTooltip);
                                     svg.appendChild(lineHoverPath);
 
-                                    viewLinePoints.forEach((pt) => {{
+                                    activeLinePoints.forEach((pt) => {{
                                         const pointViews = Number(pt.data?.views || 0) || 0;
-                                        if (pointViews > 0) {{
-                                            const point = createSvgNode("circle", {{
-                                                cx: pt.x,
-                                                cy: pt.y,
-                                                r: 5,
-                                                fill: pointFillColor,
-                                                stroke: "#38bdf8",
-                                                "stroke-width": 3
-                                            }});
-                                            point.addEventListener("mouseenter", (e) => showTooltip(e, pt.data));
-                                            point.addEventListener("mouseleave", hideTooltip);
-                                            svg.appendChild(point);
-                                        }}
-                                        if (pointViews > 0) {{
+                                        const point = createSvgNode("circle", {{
+                                            cx: pt.x,
+                                            cy: pt.y,
+                                            r: 4,
+                                            fill: pointFillColor,
+                                            stroke: series.color,
+                                            "stroke-width": 2.5
+                                        }});
+                                        point.addEventListener("mouseenter", (e) => showTooltip(e, pt.data));
+                                        point.addEventListener("mouseleave", hideTooltip);
+                                        svg.appendChild(point);
+                                        if (brandOrder.length === 1 && pointViews > 0) {{
                                             const viewTxt = createSvgNode("text", {{
                                                 x: pt.x,
                                                 y: pt.y - 12,
-                                                fill: "#38bdf8",
+                                                fill: series.color,
                                                 "font-size": 11,
                                                 "font-weight": 800,
                                                 "text-anchor": "middle"
@@ -15869,7 +16882,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                             svg.appendChild(viewTxt);
                                         }}
                                     }});
-                                }}
+                                }});
                             }} catch (error) {{
                                 emptyState.classList.add("hidden");
                                 svg.classList.add("hidden");
@@ -15879,9 +16892,18 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         }};
 
                                                 if (!card._overviewChartBound) {{
+                            if (brandLegend) {{
+                                brandLegend.addEventListener("click", (event) => {{
+                                    const trigger = event.target.closest("[data-overview-brand-filter]");
+                                    if (!trigger) return;
+                                    const nextBrand = String(trigger.dataset.overviewBrandFilter || "").trim();
+                                    card._overviewChartState.selectedBrand = nextBrand;
+                                    renderChart();
+                                }});
+                            }}
                             card.querySelectorAll("[data-overview-range]").forEach((button) => {{
                                 button.addEventListener("click", () => {{
-                                    card._overviewChartState.range = button.dataset.overviewRange || "7d";
+                                    card._overviewChartState.range = button.dataset.overviewRange || "30d";
                                     setChartControlActiveState();
                                     renderChart();
                                 }});
@@ -16393,6 +17415,56 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     if (!modal) return;
                     modal.classList.add("hidden");
                     modal.classList.remove("flex");
+                    modal.style.display = "none";
+                    modal.setAttribute("aria-hidden", "true");
+                }};
+
+                const applySavedSheetMetadataPatch = (meta = {{}}) => {{
+                    const sheetId = String(meta?.sheet_id || "").trim();
+                    if (!sheetId) return;
+                    const technicalName = String(meta?.sheet_name || "").trim();
+                    const displayName = String(meta?.display_name || technicalName || "").trim();
+                    const brandLabel = String(meta?.brand_label || "").trim();
+                    const industryLabel = String(meta?.industry_label || "").trim();
+                    const escapedDisplayName = escapeMarkup(displayName || technicalName || "");
+                    const escapedBrandLabel = escapeMarkup(brandLabel);
+                    const escapedIndustryLabel = escapeMarkup(industryLabel);
+                    const brandHtml = brandLabel
+                        ? `<div class="posts-sheet-list-campaign-main" title="${{escapedBrandLabel}}"><i class="fa-solid fa-tag"></i><span>${{escapedBrandLabel}}</span></div>`
+                        : '<div class="posts-sheet-list-brand-empty">-</div>';
+
+                    document.querySelectorAll(`.posts-sheet-list-row[data-posts-sheet-id="${{CSS.escape(sheetId)}}"]`).forEach((row) => {{
+                        row.dataset.postsSheetName = technicalName;
+                        row.dataset.postsSheetDisplayName = displayName;
+                        row.dataset.postsSheetBrand = brandLabel;
+                        row.dataset.postsSheetIndustry = industryLabel;
+                        row.dataset.postsTabTitle = displayName;
+                        row.dataset.postsMasterSearch = `${{displayName}} ${{brandLabel}} ${{industryLabel}}`.trim().toLowerCase();
+                        const titleEl = row.querySelector(".posts-sheet-list-title");
+                        if (titleEl) titleEl.textContent = displayName || technicalName;
+                        const brandCell = row.querySelector(".posts-sheet-list-brand");
+                        if (brandCell) brandCell.innerHTML = brandHtml;
+                    }});
+
+                    document.querySelectorAll(`.posts-sheet-actions-item[data-posts-sheet-action="edit-metadata"][data-posts-sheet-id="${{CSS.escape(sheetId)}}"]`).forEach((button) => {{
+                        button.dataset.postsSheetName = technicalName;
+                        button.dataset.postsSheetDisplayName = displayName;
+                        button.dataset.postsSheetBrand = brandLabel;
+                        button.dataset.postsSheetIndustry = industryLabel;
+                    }});
+
+                    document.querySelectorAll(`.posts-tab-panel[data-posts-sheet-id="${{CSS.escape(sheetId)}}"]`).forEach((panel) => {{
+                        panel.dataset.postsTabTitle = displayName || technicalName;
+                        const titleEl = panel.querySelector(".posts-tab-panel-title");
+                        if (titleEl) titleEl.textContent = displayName || technicalName;
+                    }});
+
+                    if (postsActiveTabLabel && postsActiveTabLabel.textContent && technicalName) {{
+                        const activeText = String(postsActiveTabLabel.textContent || "").trim();
+                        if (!activeText || activeText === technicalName || activeText === displayName) {{
+                            postsActiveTabLabel.textContent = displayName || technicalName;
+                        }}
+                    }}
                 }};
 
                 const editMetaForm = document.getElementById("edit-metadata-form");
@@ -16401,10 +17473,23 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         e.preventDefault();
                         const formData = new FormData(editMetaForm);
                         const p = Object.fromEntries(formData.entries());
+                        p.sheet_id = String(p.sheet_id || "").trim();
+                        p.original_name = String(p.original_name || "").trim();
+                        p.sheet_name = String(p.sheet_name || "").trim();
+                        p.brand_label = String(p.brand_label || "").trim();
+                        p.industry_label = String(p.industry_label || "").trim();
+                        if (!p.sheet_id) {{
+                            showNotice("Thiếu thông tin sheet để lưu thay đổi.", "error");
+                            return;
+                        }}
+                        if (!p.sheet_name) {{
+                            showNotice("Tên hiển thị không được để trống.", "warning");
+                            return;
+                        }}
                         const submitBtn = editMetaForm.querySelector('button[type="submit"]');
-                        let savedSuccessfully = false;
                         if (submitBtn) submitBtn.disabled = true;
-                        
+                        let savedSuccessfully = false;
+
                         try {{
                             const res = await fetch("/api/update-sheet-metadata", {{
                                 method: "POST",
@@ -16420,39 +17505,45 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             }} catch (_) {{
                                 data = null;
                             }}
-                            savedSuccessfully = Boolean(data?.ok || (res?.ok && data?.ok !== false));
-                            if (savedSuccessfully) {{
-                                closeEditMetadataModal();
-                                showNotice(data?.message || "Cập nhật thành công", "success");
-                                let hasPatchedUi = false;
-                                if (typeof data.overview_html === "string") {{
-                                    replaceOverviewPanelHtml(data.overview_html);
-                                    hasPatchedUi = true;
-                                }}
-                                if (typeof data.posts_html === "string") {{
-                                    replacePostsPanelHtml(data.posts_html);
-                                    hasPatchedUi = true;
-                                }}
-                                if (typeof data.campaign_html === "string") {{
-                                    replaceCampaignPanelHtml(data.campaign_html);
-                                    hasPatchedUi = true;
-                                }}
-                                if (!hasPatchedUi || data?.needs_refresh) {{
-                                    try {{
-                                        refreshDashboard();
-                                    }} catch (_) {{}}
-                                }}
-                                // Safety close in case DOM update keeps modal state stale
-                                setTimeout(() => closeEditMetadataModal(), 0);
-                                setTimeout(() => closeEditMetadataModal(), 120);
-                            }} else {{
+                            savedSuccessfully = Boolean((res && res.ok) && (data?.ok !== false));
+                            if (!savedSuccessfully) {{
                                 showNotice(data?.message || "Lỗi cập nhật", "error");
+                                return;
+                            }}
+
+                            closeEditMetadataModal();
+                            applySavedSheetMetadataPatch(data?.metadata_update || {{
+                                sheet_id: p.sheet_id,
+                                sheet_name: p.original_name,
+                                display_name: p.sheet_name,
+                                brand_label: p.brand_label,
+                                industry_label: p.industry_label,
+                            }});
+                            showNotice(data?.message || "Cập nhật thành công", "success");
+                            let hasPatchedUi = false;
+                            if (typeof data.overview_html === "string") {{
+                                replaceOverviewPanelHtml(data.overview_html);
+                                hasPatchedUi = true;
+                            }}
+                            if (typeof data.posts_html === "string") {{
+                                replacePostsPanelHtml(data.posts_html);
+                                hasPatchedUi = true;
+                            }}
+                            if (typeof data.campaign_html === "string") {{
+                                replaceCampaignPanelHtml(data.campaign_html);
+                                hasPatchedUi = true;
+                            }}
+                            if (!hasPatchedUi || data?.needs_refresh) {{
+                                try {{
+                                    refreshDashboard();
+                                }} catch (_) {{}}
                             }}
                         }} catch (err) {{
                             showNotice("Lỗi kết nối server", "error");
                         }} finally {{
                             if (savedSuccessfully) {{
                                 closeEditMetadataModal();
+                                setTimeout(() => closeEditMetadataModal(), 60);
                             }}
                             if (submitBtn) submitBtn.disabled = false;
                         }}
@@ -16460,23 +17551,45 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 }}
 
                 const ensurePostsDetailPanelLoaded = async (tabSlug, card = null) => {{
+                    const setPostsDetailPlaceholder = (title, message, tone = "info") => {{
+                        if (!postsSelectionPlaceholder) return;
+                        const accentClass = tone === "error" ? "text-rose-300" : "text-slate-500";
+                        postsSelectionPlaceholder.classList.remove("hidden");
+                        postsSelectionPlaceholder.innerHTML = `
+                            <div class="text-sm uppercase tracking-[0.32em] ${{accentClass}} font-bold">Chi tiết</div>
+                            <div class="mt-3 text-2xl font-black text-slate-100">${{title}}</div>
+                            <p class="mt-2 text-sm text-slate-400">${{message}}</p>
+                        `;
+                    }};
+
                     const safeSlug = String(tabSlug || "").trim();
                     if (!safeSlug) return null;
                     syncPostsDomRefs();
-                    const existingPanel = postsTabPanels.find((panel) => panel.dataset.postsTabPanel === safeSlug);
-                    if (existingPanel) return existingPanel;
                     const sourceCard = card || postsTabCards.find((item) => (item.dataset.postsTabTrigger || "") === safeSlug);
-                    if (!sourceCard || !postsTabPanelsWrap) return null;
+                    if (!sourceCard || !postsTabPanelsWrap) {{
+                        setPostsDetailPlaceholder("Không mở được sheet", "Không tìm thấy vùng hiển thị chi tiết của sheet này.", "error");
+                        return null;
+                    }}
 
                     const sheetId = String(sourceCard.dataset.postsSheetId || "").trim();
                     const sheetName = String(sourceCard.dataset.postsSheetName || "").trim();
-                    if (!sheetId || !sheetName) return null;
+                    if (!sheetId || !sheetName) {{
+                        setPostsDetailPlaceholder("Thiếu thông tin sheet", "Sheet này chưa có đủ `sheet_id` hoặc `sheet_name` để tải dữ liệu.", "error");
+                        return null;
+                    }}
+                    const existingPanel = postsTabPanels.find((panel) => panel.dataset.postsTabPanel === safeSlug);
+                    if (existingPanel) {{
+                        const existingSheetId = String(existingPanel.dataset.postsSheetId || "").trim();
+                        const existingSheetName = String(existingPanel.dataset.postsSheetName || "").trim();
+                        if (existingSheetId === sheetId && existingSheetName === sheetName) {{
+                            return existingPanel;
+                        }}
+                        existingPanel.remove();
+                        syncPostsDomRefs();
+                    }}
 
                     try {{
-                        if (postsSelectionPlaceholder) {{
-                            postsSelectionPlaceholder.classList.remove("hidden");
-                            postsSelectionPlaceholder.innerHTML = '<div class="text-sm uppercase tracking-[0.32em] text-slate-500 font-bold">Chi tiết</div><div class="mt-3 text-2xl font-black text-slate-100">Đang tải dữ liệu sheet...</div><p class="mt-2 text-sm text-slate-400">Vui lòng chờ trong giây lát.</p>';
-                        }}
+                        setPostsDetailPlaceholder("Đang tải dữ liệu sheet...", "Vui lòng chờ trong giây lát.", "info");
                         const params = new URLSearchParams({{
                             sheet_id: sheetId,
                             sheet_name: sheetName,
@@ -16491,20 +17604,33 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         }});
                         const data = await response.json();
                         if (!response.ok || !data?.ok || typeof data.html !== "string" || !data.html.trim()) {{
+                            setPostsDetailPlaceholder(
+                                "Không tải được dữ liệu sheet",
+                                data?.message || "Server không trả về nội dung chi tiết cho sheet này.",
+                                "error"
+                            );
                             showNotice(data?.message || "Không tải được chi tiết sheet.", "error");
                             return null;
                         }}
                         const template = document.createElement("template");
                         template.innerHTML = data.html.trim();
                         const panel = template.content.firstElementChild;
-                        if (!panel) return null;
+                        if (!panel) {{
+                            setPostsDetailPlaceholder("Dữ liệu sheet không hợp lệ", "Server có phản hồi nhưng không dựng được bảng chi tiết.", "error");
+                            return null;
+                        }}
                         postsTabPanelsWrap.appendChild(panel);
                         syncPostsDomRefs();
                         const freshPanel = postsTabPanels.find((item) => (item.dataset.postsTabPanel || "") === safeSlug) || panel;
                         compactPostsMetricCells();
                         initializePostsPanel();
                         return freshPanel;
-                    }} catch (_) {{
+                    }} catch (error) {{
+                        setPostsDetailPlaceholder(
+                            "Tải sheet bị gián đoạn",
+                            error?.message ? `Lỗi: ${{error.message}}` : "Không tải được chi tiết sheet. Vui lòng thử lại.",
+                            "error"
+                        );
                         showNotice("Không tải được chi tiết sheet. Vui lòng thử lại.", "error");
                         return null;
                     }}
@@ -16512,6 +17638,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
 
                 const setActivePostsTab = (tabSlug) => {{
                     syncPostsDomRefs();
+                    document.querySelectorAll("[data-posts-creator-modal]").forEach((modal) => {{
+                        modal.classList.add("hidden");
+                        modal.setAttribute("aria-hidden", "true");
+                    }});
                     const safeSlug = postsTabCards.some((card) => card.dataset.postsTabTrigger === tabSlug)
                         ? tabSlug
                         : "";
@@ -16537,6 +17667,14 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 }};
 
                 const initializePostsPanel = () => {{
+                    const escapeMarkup = (value) => String(value || "").replace(/[&<>"']/g, (ch) => ({{
+                        "&": "&amp;",
+                        "<": "&lt;",
+                        ">": "&gt;",
+                        '"': "&quot;",
+                        "'": "&#39;",
+                    }})[ch] || ch);
+
                     if (!postsSheetActionsCloseBound) {{
                         document.addEventListener("click", () => closePostsSheetActionMenus());
                         postsSheetActionsCloseBound = true;
@@ -16565,8 +17703,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             closePostsSheetActionMenus();
                             closePostsColumnMenus();
                             const targetSlug = card.dataset.postsTabTrigger || "";
-                            await ensurePostsDetailPanelLoaded(targetSlug, card);
-                            setActivePostsTab(targetSlug);
+                            const panel = await ensurePostsDetailPanelLoaded(targetSlug, card);
+                            setActivePostsTab(panel ? targetSlug : "");
                         }});
                     }});
 
@@ -16593,8 +17731,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             closePostsSheetActionMenus();
                             closePostsColumnMenus();
                             const targetSlug = button.dataset.postsSheetTarget || "";
-                            await ensurePostsDetailPanelLoaded(targetSlug);
-                            setActivePostsTab(targetSlug);
+                            const panel = await ensurePostsDetailPanelLoaded(targetSlug);
+                            setActivePostsTab(panel ? targetSlug : "");
                         }});
                     }});
 
@@ -16612,10 +17750,12 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             
                             modal.querySelector("[data-edit-meta-id]").value = button.dataset.postsSheetId || "";
                             modal.querySelector("[data-edit-meta-orig-name]").value = button.dataset.postsSheetName || "";
-                            modal.querySelector("[data-edit-meta-name]").value = button.dataset.postsSheetName || "";
+                            modal.querySelector("[data-edit-meta-name]").value = button.dataset.postsSheetDisplayName || button.dataset.postsSheetName || "";
                             modal.querySelector("[data-edit-meta-brand]").value = button.dataset.postsSheetBrand || "";
                             modal.querySelector("[data-edit-meta-industry]").value = button.dataset.postsSheetIndustry || "";
                             
+                            modal.style.display = "";
+                            modal.removeAttribute("aria-hidden");
                             modal.classList.remove("hidden");
                             modal.classList.add("flex");
                         }});
@@ -16785,6 +17925,106 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         rowChecks.forEach((checkbox) => {{
                             checkbox.addEventListener("change", () => {{
                                 syncPostsSelectionState();
+                            }});
+                        }});
+
+                        const creatorModal = panel.querySelector("[data-posts-creator-modal]");
+                        const creatorModalTitle = creatorModal?.querySelector("[data-posts-creator-modal-title]");
+                        const creatorModalCount = creatorModal?.querySelector("[data-posts-creator-modal-count]");
+                        const creatorModalList = creatorModal?.querySelector("[data-posts-creator-modal-list]");
+
+                        const closeCreatorModal = () => {{
+                            if (!creatorModal) return;
+                            creatorModal.classList.add("hidden");
+                            creatorModal.setAttribute("aria-hidden", "true");
+                            if (creatorModalList) creatorModalList.innerHTML = "";
+                        }};
+
+                        const openCreatorModal = (creatorKey, creatorName) => {{
+                            if (!creatorModal || !creatorModalList) return;
+                            const normalizedKey = String(creatorKey || "").trim();
+                            const normalizedName = String(creatorName || "").trim();
+                            const allRows = Array.from(document.querySelectorAll("#bai-dang .post-row"));
+                            const matchedRows = allRows.filter((row) => {{
+                                const rowKey = String(row.dataset.creatorKey || "").trim();
+                                const rowName = String(row.dataset.creatorName || "").trim().toLowerCase();
+                                if (normalizedKey) return rowKey === normalizedKey;
+                                return normalizedName && rowName === normalizedName.toLowerCase();
+                            }});
+                            const linkSeen = new Set();
+                            const posts = [];
+                            matchedRows.forEach((row, idx) => {{
+                                const link = String(row.dataset.postLink || "").trim();
+                                const title = String(row.dataset.postTitle || "").trim();
+                                const platform = String(row.dataset.postPlatform || "").trim() || "Khác";
+                                const dateText = String(row.dataset.postDate || "").trim() || "-";
+                                const sheetName = String(row.dataset.postSheet || row.closest("[data-posts-tab-panel]")?.dataset.postsTabTitle || "").trim();
+                                const rowIdx = String(row.querySelector("[data-post-select]")?.dataset.rowIdx || "").trim();
+                                const numericRowIdx = Number.parseInt(rowIdx, 10);
+                                const dedupeKey = link ? link.toLowerCase() : `row-${{sheetName.toLowerCase()}}-${{rowIdx || idx + 1}}-${{title.toLowerCase()}}`;
+                                if (linkSeen.has(dedupeKey)) return;
+                                linkSeen.add(dedupeKey);
+                                posts.push({{
+                                    link,
+                                    title,
+                                    platform,
+                                    dateText,
+                                    sheetName,
+                                    rowIdx,
+                                    sortRow: Number.isFinite(numericRowIdx) ? numericRowIdx : 10_000_000 + idx,
+                                }});
+                            }});
+                            posts.sort((a, b) => a.sortRow - b.sortRow);
+
+                            const headingName = normalizedName || "Creator";
+                            if (creatorModalTitle) creatorModalTitle.textContent = headingName;
+                            if (creatorModalCount) creatorModalCount.textContent = `${{posts.length}} bài`;
+
+                            if (!posts.length) {{
+                                creatorModalList.innerHTML = '<div class="posts-creator-post-empty">Không tìm thấy bài nào cho creator này.</div>';
+                            }} else {{
+                                creatorModalList.innerHTML = posts.map((item, index) => {{
+                                    const safeTitle = escapeMarkup(item.title || "Bài đăng không có tiêu đề");
+                                    const safeLink = escapeMarkup(item.link || "");
+                                    const safePlatform = escapeMarkup(item.platform || "Khác");
+                                    const safeDate = escapeMarkup(item.dateText || "-");
+                                    const safeRow = escapeMarkup(item.rowIdx || "-");
+                                    const safeSheet = escapeMarkup(item.sheetName || "Không rõ sheet");
+                                    return `
+                                        <article class="posts-creator-post-item">
+                                            <div class="posts-creator-post-top">
+                                                <span class="posts-creator-post-index">Dòng ${{safeRow}}</span>
+                                                <span class="posts-creator-post-chip">${{safePlatform}}</span>
+                                            </div>
+                                            <p class="posts-creator-post-title">${{index + 1}}. ${{safeTitle}}</p>
+                                            ${{safeLink ? `<a href="${{safeLink}}" target="_blank" rel="noreferrer" class="posts-creator-post-link">${{safeLink}}</a>` : ""}}
+                                            <div class="posts-creator-post-date">Sheet: ${{safeSheet}} • Ngày quét: ${{safeDate}}</div>
+                                        </article>
+                                    `;
+                                }}).join("");
+                            }}
+
+                            creatorModal.classList.remove("hidden");
+                            creatorModal.setAttribute("aria-hidden", "false");
+                        }};
+
+                        if (creatorModal && creatorModal.dataset.bound !== "1") {{
+                            creatorModal.dataset.bound = "1";
+                            creatorModal.querySelectorAll("[data-posts-creator-close]").forEach((node) => {{
+                                node.addEventListener("click", (event) => {{
+                                    event.preventDefault();
+                                    closeCreatorModal();
+                                }});
+                            }});
+                        }}
+
+                        panel.querySelectorAll("[data-post-creator-open]").forEach((button) => {{
+                            if (button.dataset.bound === "1") return;
+                            button.dataset.bound = "1";
+                            button.addEventListener("click", (event) => {{
+                                event.preventDefault();
+                                event.stopPropagation();
+                                openCreatorModal(button.dataset.creatorKey || "", button.dataset.creatorName || "");
                             }});
                         }});
 
@@ -17095,12 +18335,14 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         {{ id: "config", url: "/api/dashboard/config", replacer: (html) => {{
                             const el = document.getElementById("cau-hinh");
                             if (el) el.innerHTML = html;
+                            window.hardenInlineDashboardForms?.();
                             window.bindSheetTabLookupControls?.();
                             window.bindSetColumnsFormInline?.();
                         }} }},
                         {{ id: "schedule", url: "/api/dashboard/schedule", replacer: (html) => {{
                             const el = document.getElementById("lich-tu-dong");
                             if (el) el.innerHTML = html;
+                            ensureScheduleControlsBound();
                         }} }}
                     ];
                     const panelSectionIdMap = {{
@@ -17145,7 +18387,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 console.error(`[DASH] ${{panel.id}} load error:`, e);
                             }}
                         }};
-                        const startDelay = panelIndex === 0 ? 0 : Math.min(2200, panelIndex * 450);
+                        const isActivePanel = panelSectionIdMap[panel.id] === activePanelIdNow;
+                        const startDelay = isActivePanel ? 0 : (2200 + panelIndex * 700);
                         setTimeout(fetchData, startDelay);
                     }});
                 }};
@@ -17238,7 +18481,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         <div class="dashboard-section-title">Lịch tự động</div>
                         <div class="bg-black/20 rounded-2xl p-4 md:p-5 border border-white/5">
                             <div class="flex justify-between items-center mb-3 text-sm font-bold text-slate-500 uppercase">
-                                <span>Lịch tự động</span><span class="hidden" data-schedule-label>{schedule_text}</span>
+                                <span>Lịch tự động</span>
                             </div>
                             <form action="/set-schedule" method="get" class="flex flex-col gap-2">
                                 <div>
@@ -17347,33 +18590,33 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 <div class="dashboard-footer-note">Bản quyền thuộc về Fanscom</div>
 
                 <div id="edit-metadata-modal" class="fixed inset-0 z-[100] hidden items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
-                    <div class="bg-slate-900 border border-white/10 rounded-[2.5rem] w-full max-w-lg p-8 shadow-2xl shadow-black/50">
-                        <div class="mb-6">
-                            <h3 class="text-2xl font-black text-white">Chỉnh sửa thông tin sheet</h3>
+                    <div class="bg-slate-900 border border-white/10 rounded-[2.1rem] w-full max-w-md p-6 md:p-7 shadow-2xl shadow-black/50">
+                        <div class="mb-4">
+                            <h3 class="text-xl md:text-2xl font-black text-white">Chỉnh sửa thông tin sheet</h3>
                             <p class="text-slate-400 text-sm mt-1">Cập nhật các nhãn hiển thị cho sheet này trong danh sách.</p>
                         </div>
-                        <form id="edit-metadata-form" class="space-y-5">
+                        <form id="edit-metadata-form" class="space-y-4">
                             <input type="hidden" data-edit-meta-id name="sheet_id" />
                             <input type="hidden" data-edit-meta-orig-name name="original_name" />
                             
                             <div class="space-y-1.5">
                                 <label class="text-[11px] uppercase tracking-widest text-slate-500 font-black ml-1">Tên hiển thị</label>
-                                <input type="text" data-edit-meta-name name="sheet_name" class="w-full bg-slate-800 border-0 rounded-2xl p-4 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Nhập tên mới cho sheet..." />
+                                <input type="text" data-edit-meta-name name="sheet_name" class="w-full bg-slate-800 border-0 rounded-2xl px-4 py-3 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Nhập tên mới cho sheet..." />
                             </div>
 
                             <div class="space-y-1.5">
                                 <label class="text-[11px] uppercase tracking-widest text-slate-500 font-black ml-1">Thương hiệu</label>
-                                <input type="text" data-edit-meta-brand name="brand_label" class="w-full bg-slate-800 border-0 rounded-2xl p-4 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Tên thương hiệu..." />
+                                <input type="text" data-edit-meta-brand name="brand_label" class="w-full bg-slate-800 border-0 rounded-2xl px-4 py-3 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Tên thương hiệu..." />
                             </div>
 
                             <div class="space-y-1.5">
                                 <label class="text-[11px] uppercase tracking-widest text-slate-500 font-black ml-1">Ngành hàng / Mục lục</label>
-                                <input type="text" data-edit-meta-industry name="industry_label" class="w-full bg-slate-800 border-0 rounded-2xl p-4 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Ngành hàng..." />
+                                <input type="text" data-edit-meta-industry name="industry_label" class="w-full bg-slate-800 border-0 rounded-2xl px-4 py-3 text-white placeholder-slate-500 focus:ring-2 focus:ring-emerald-500 transition-all" placeholder="Ngành hàng..." />
                             </div>
 
-                            <div class="flex gap-3 pt-4">
-                                <button type="button" onclick="(function(){{const m=document.getElementById('edit-metadata-modal'); if(m){{m.classList.add('hidden'); m.classList.remove('flex');}}}})()" class="flex-1 py-4 bg-slate-700 hover:bg-slate-600 text-white rounded-2xl font-black border border-white/10 transition-all">Hủy</button>
-                                <button type="submit" class="flex-[2] py-4 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black shadow-lg shadow-emerald-900/20 transition-all">Lưu thay đổi</button>
+                            <div class="flex gap-3 pt-3">
+                                <button type="button" onclick="(function(){{const m=document.getElementById('edit-metadata-modal'); if(m){{m.classList.add('hidden'); m.classList.remove('flex');}}}})()" class="flex-1 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-2xl font-black border border-white/10 transition-all">Hủy</button>
+                                <button type="submit" class="flex-[1.6] py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-2xl font-black shadow-lg shadow-emerald-900/20 transition-all">Lưu thay đổi</button>
                             </div>
                         </form>
                     </div>
