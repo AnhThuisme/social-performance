@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
     fonts-liberation \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

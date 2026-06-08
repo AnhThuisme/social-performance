@@ -4,6 +4,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from calendar import monthrange
@@ -61,6 +62,10 @@ _TIKTOK_TIMEOUT_STREAK = 0
 _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
 LOCAL_STRICT_VISIBLE = str(os.getenv("SELENIUM_LOCAL_STRICT_VISIBLE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 ALLOW_VISIBLE_BROWSER_RETRY = str(os.getenv("SELENIUM_ALLOW_VISIBLE_RETRY", "0")).strip().lower() in {"1", "true", "yes", "on"}
+XVFB_AUTO_START = str(os.getenv("SELENIUM_XVFB_AUTO_START", "1")).strip().lower() not in {"0", "false", "no", "off"}
+XVFB_DISPLAY = str(os.getenv("SELENIUM_XVFB_DISPLAY", ":99")).strip() or ":99"
+_XVFB_PROCESS = None
+_XVFB_LOCK = threading.Lock()
 
 
 def _get_remote_selenium_url() -> str:
@@ -88,6 +93,46 @@ def _is_local_desktop_runtime() -> bool:
         or sys.platform == "darwin"
         or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     )
+
+
+def _ensure_virtual_display(logger: Optional[Callable[[str], None]] = None) -> bool:
+    global _XVFB_PROCESS
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    if not XVFB_AUTO_START:
+        return False
+    with _XVFB_LOCK:
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return True
+        if _XVFB_PROCESS is not None and _XVFB_PROCESS.poll() is None:
+            os.environ.setdefault("DISPLAY", XVFB_DISPLAY)
+            return True
+        try:
+            proc = subprocess.Popen(
+                [
+                    "Xvfb",
+                    XVFB_DISPLAY,
+                    "-screen",
+                    "0",
+                    "1440x2200x24",
+                    "-ac",
+                    "+extension",
+                    "RANDR",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(0.7)
+            if proc.poll() is not None:
+                _emit(logger, "Không khởi động được Xvfb cho Chrome thường.")
+                return False
+            _XVFB_PROCESS = proc
+            os.environ["DISPLAY"] = XVFB_DISPLAY
+            _emit(logger, f"Đã bật Xvfb tại {XVFB_DISPLAY} để hỗ trợ Chrome thường trong container.")
+            return True
+        except Exception as exc:
+            _emit(logger, f"Khởi động Xvfb thất bại: {str(exc)[:120]}")
+            return False
 
 
 def reset_stale_selenium_sessions(logger: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
@@ -448,6 +493,8 @@ def create_selenium_driver(
     headless: bool = True,
     preferred_browser: str = "",
 ):
+    if not headless:
+        _ensure_virtual_display(logger=logger)
     remote_url = _get_remote_selenium_url()
     use_remote = bool(remote_url)
     local_strict_visible = (not use_remote) and LOCAL_STRICT_VISIBLE and _is_local_desktop_runtime()
@@ -655,6 +702,8 @@ def _can_use_visible_browser_retry() -> bool:
     # Headful Chrome retry is only reliable on environments that actually expose a desktop
     # session. Docker/VPS without DISPLAY tends to crash immediately with "Chrome instance exited".
     if _is_local_desktop_runtime():
+        return True
+    if _ensure_virtual_display():
         return True
     if _get_remote_selenium_url() and ALLOW_VISIBLE_BROWSER_RETRY:
         return True
