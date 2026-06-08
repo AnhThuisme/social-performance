@@ -6866,6 +6866,8 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         stats = dict(stats)
                         stats["v"] = 0
                     if stats and runtime_state["is_running"]:
+                        if col_map.get("air_date") and not str((stats or {}).get("air_date", "") or "").strip():
+                            locked_log(f"[{tab_name}] Dòng {i}: có số liệu nhưng chưa tách được air date")
                         row_updates = build_row_updates(col_map, platform, now_str, stats)
                         update_values = {field: value for field, _, value in row_updates}
                         with state_lock:
