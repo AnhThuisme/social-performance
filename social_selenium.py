@@ -64,6 +64,8 @@ LOCAL_STRICT_VISIBLE = str(os.getenv("SELENIUM_LOCAL_STRICT_VISIBLE", "1")).stri
 ALLOW_VISIBLE_BROWSER_RETRY = str(os.getenv("SELENIUM_ALLOW_VISIBLE_RETRY", "0")).strip().lower() in {"1", "true", "yes", "on"}
 XVFB_AUTO_START = str(os.getenv("SELENIUM_XVFB_AUTO_START", "1")).strip().lower() not in {"0", "false", "no", "off"}
 XVFB_DISPLAY = str(os.getenv("SELENIUM_XVFB_DISPLAY", ":99")).strip() or ":99"
+CHROME_USER_DATA_DIR = str(os.getenv("SELENIUM_CHROME_USER_DATA_DIR") or "").strip()
+CHROME_PROFILE_DIRECTORY = str(os.getenv("SELENIUM_CHROME_PROFILE_DIRECTORY") or "").strip()
 _XVFB_PROCESS = None
 _XVFB_LOCK = threading.Lock()
 
@@ -164,6 +166,21 @@ def reset_stale_selenium_sessions(logger: Optional[Callable[[str], None]] = None
     return True, f"killed={killed}"
 
 
+def _load_cookie_payload(raw_env_name: str, file_env_name: str, logger: Optional[Callable[[str], None]] = None) -> tuple[str, str]:
+    raw = (os.getenv(raw_env_name) or "").strip()
+    if raw:
+        return raw, "env"
+    file_path = str(os.getenv(file_env_name) or "").strip()
+    if not file_path:
+        return "", ""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read().strip(), f"file:{file_path}"
+    except Exception as exc:
+        _emit(logger, f"{file_env_name} không đọc được: {str(exc)[:120]}")
+        return "", ""
+
+
 def _load_fb_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
     global _FB_COOKIES_CACHE, _FB_COOKIES_CACHE_KEY
     raw = (os.getenv("FB_COOKIES_JSON") or "").strip()
@@ -248,7 +265,7 @@ def _ensure_facebook_cookies(driver, logger: Optional[Callable[[str], None]] = N
 
 def _load_tt_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
     global _TT_COOKIES_CACHE, _TT_COOKIES_CACHE_KEY
-    raw = (os.getenv("TT_COOKIES_JSON") or "").strip()
+    raw, source = _load_cookie_payload("TT_COOKIES_JSON", "TT_COOKIES_FILE", logger=logger)
     if not raw:
         _TT_COOKIES_CACHE = []
         _TT_COOKIES_CACHE_KEY = ""
@@ -284,9 +301,11 @@ def _load_tt_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
             normalized.append(cookie)
         _TT_COOKIES_CACHE_KEY = raw
         _TT_COOKIES_CACHE = normalized
+        if source:
+            _emit(logger, f"Đã nạp TT cookies từ {source}.")
         return normalized
     except Exception as exc:
-        _emit(logger, f"TT_COOKIES_JSON không hợp lệ: {str(exc)[:120]}")
+        _emit(logger, f"TT cookies không hợp lệ ({source or 'env'}): {str(exc)[:120]}")
         _TT_COOKIES_CACHE_KEY = raw
         _TT_COOKIES_CACHE = []
         return []
@@ -297,7 +316,7 @@ def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = Non
         return
     cookies = _load_tt_cookies_from_env(logger=logger)
     if not cookies:
-        _emit(logger, "TT_COOKIES_JSON đang trống/chưa set, quét TikTok sẽ chạy không có session.")
+        _emit(logger, "TT_COOKIES_JSON/TT_COOKIES_FILE đang trống/chưa set, quét TikTok sẽ chạy không có session.")
         driver._tt_cookies_applied = True
         return
     try:
@@ -433,6 +452,10 @@ def _add_common_browser_args(options, headless: bool = True):
         "--lang=en-US",
         f"--user-agent={DEFAULT_USER_AGENT}",
     ]
+    if CHROME_USER_DATA_DIR:
+        args.append(f"--user-data-dir={CHROME_USER_DATA_DIR}")
+    if CHROME_PROFILE_DIRECTORY:
+        args.append(f"--profile-directory={CHROME_PROFILE_DIRECTORY}")
     if headless:
         args.insert(0, "--headless=new")
     for arg in args:
@@ -1239,10 +1262,14 @@ def _extract_air_date_from_bundle(bundle, prefer_source_datetime: bool = False) 
 def _has_tiktok_challenge(bundle) -> bool:
     text = (bundle.get("text") or "").strip().lower()
     source = (bundle.get("source") or "").lower()
+    title = str(bundle.get("title") or "").strip().lower()
+    if text == "please wait..." or title == "please wait...":
+        return True
     visible_markers = (
         "drag the slider to fit the puzzle",
         "verify to continue",
         "complete the puzzle",
+        "please wait...",
     )
     if any(marker in text for marker in visible_markers):
         return True
@@ -1251,6 +1278,8 @@ def _has_tiktok_challenge(bundle) -> bool:
         "captcha-verify-container",
         "captcha_container",
         "drag the slider to fit the puzzle",
+        "slardarwaf",
+        "_wafchallengeid",
     )
     return any(marker in source for marker in source_markers)
 

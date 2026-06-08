@@ -4,6 +4,8 @@ __pycache__/
 
 # Local secrets and runtime config
 credential.json
+tiktok_cookies.json
+tiktok-profile/
 auth_settings.json
 .env
 .env.*
