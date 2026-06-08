@@ -1294,6 +1294,39 @@ def _extract_tiktok_photo_from_text(bundle):
     return payload
 
 
+def _extract_tiktok_metrics_from_text(bundle):
+    text = bundle.get("text") or ""
+    if not text:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    payload = {
+        "cap": _extract_tiktok_caption(bundle),
+    }
+    metric_map = {
+        "v": ["views", "view"],
+        "l": ["likes", "like"],
+        "c": ["comments", "comment"],
+        "s": ["shares", "share"],
+        "save": ["favorites", "favorite", "saves", "save", "bookmarks", "bookmark", "collects", "collect"],
+    }
+    for field, labels in metric_map.items():
+        parsed = _extract_metric_from_lines_by_labels(lines, labels)
+        if parsed is not None:
+            payload[field] = parsed
+
+    air_date = _extract_air_date_from_text(text)
+    if air_date:
+        payload["air_date"] = air_date
+
+    if any(field in payload for field in ("v", "l", "c", "s", "save")):
+        payload.setdefault("v", 0)
+        return payload
+    return None
+
+
 def _extract_tiktok(bundle):
     source = bundle["source"]
     metas = bundle["metas"]
@@ -1349,6 +1382,10 @@ def _extract_tiktok(bundle):
         if text_payload and any(text_payload.get(key) for key in ("l", "s", "c", "save")):
             return text_payload
 
+    text_metric_payload = _extract_tiktok_metrics_from_text(bundle)
+    if text_metric_payload and any(text_metric_payload.get(key) for key in ("v", "l", "s", "c", "save")):
+        return text_metric_payload
+
     payload = {
         "v": _extract_number(source, [r'"playCount"\s*:\s*("?[\d.,KMB]+"?)', r'"videoViewCount"\s*:\s*("?[\d.,KMB]+"?)']) or 0,
         "l": _extract_number(source, [r'"diggCount"\s*:\s*("?[\d.,KMB]+"?)', r'"likeCount"\s*:\s*("?[\d.,KMB]+"?)']) or 0,
@@ -1379,6 +1416,10 @@ def _extract_tiktok(bundle):
         text_payload = _extract_tiktok_photo_from_text(bundle)
         if text_payload:
             return text_payload
+    if not any(payload.get(key) for key in ("v", "l", "s", "c", "save")):
+        text_metric_payload = _extract_tiktok_metrics_from_text(bundle)
+        if text_metric_payload:
+            return text_metric_payload
     return payload
 
 
@@ -1964,10 +2005,10 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                     payload = None
         if not payload:
             return None
-        if not str(payload.get("air_date") or "").strip():
+        if platform != "facebook" and not str(payload.get("air_date") or "").strip():
             fallback_air_date = _extract_air_date_from_bundle(
                 bundle,
-                prefer_source_datetime=(platform == "facebook"),
+                prefer_source_datetime=False,
             )
             if fallback_air_date:
                 payload["air_date"] = fallback_air_date
