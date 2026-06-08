@@ -505,6 +505,38 @@ def _is_tiktok_url(url: str) -> bool:
     return _detect_platform_from_url(url) == "tiktok"
 
 
+def _resolve_tiktok_url(url: str, logger: Optional[Callable[[str], None]] = None) -> str:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return raw_url
+    try:
+        parsed = urllib.parse.urlparse(raw_url)
+        host = (parsed.netloc or "").lower()
+    except Exception:
+        return raw_url
+    if not (host.startswith("vt.tiktok.com") or host.startswith("vm.tiktok.com")):
+        return raw_url
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+    }
+    for method in ("head", "get"):
+        try:
+            request_fn = requests.head if method == "head" else requests.get
+            resp = request_fn(raw_url, allow_redirects=True, timeout=10, headers=headers, stream=(method == "get"))
+            final_url = str(resp.url or raw_url).split("#")[0]
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if final_url and final_url != raw_url:
+                _emit(logger, f"Đã resolve TikTok short-link -> {final_url[:120]}")
+                return final_url
+        except Exception as exc:
+            _emit(logger, f"Resolve TikTok short-link ({method}) lỗi: {str(exc)[:120]}")
+    return raw_url
+
+
 def _is_facebook_login_gate(url: str) -> bool:
     raw = str(url or "").strip().lower()
     return "facebook.com/login" in raw and "next=" in raw
@@ -1236,12 +1268,12 @@ def _extract_tiktok_photo_from_text(bundle):
         "v": 0,
         "cap": _extract_tiktok_caption(bundle),
     }
-    like_count = _extract_metric_from_lines_by_labels(lines, ["likes", "like"])
-    comment_count = _extract_metric_from_lines_by_labels(lines, ["comments", "comment"])
-    share_count = _extract_metric_from_lines_by_labels(lines, ["shares", "share"])
+    like_count = _extract_metric_from_lines_by_labels(lines, ["likes", "like", "lượt thích", "thích"])
+    comment_count = _extract_metric_from_lines_by_labels(lines, ["comments", "comment", "bình luận", "binh luan"])
+    share_count = _extract_metric_from_lines_by_labels(lines, ["shares", "share", "chia sẻ", "chia se"])
     save_count = _extract_metric_from_lines_by_labels(
         lines,
-        ["favorites", "favorite", "saves", "save", "bookmarks", "bookmark", "collects", "collect"],
+        ["favorites", "favorite", "saves", "save", "bookmarks", "bookmark", "collects", "collect", "lưu", "da luu", "đã lưu"],
     )
     if like_count is not None:
         payload["l"] = like_count
@@ -1306,11 +1338,11 @@ def _extract_tiktok_metrics_from_text(bundle):
         "cap": _extract_tiktok_caption(bundle),
     }
     metric_map = {
-        "v": ["views", "view"],
-        "l": ["likes", "like"],
-        "c": ["comments", "comment"],
-        "s": ["shares", "share"],
-        "save": ["favorites", "favorite", "saves", "save", "bookmarks", "bookmark", "collects", "collect"],
+        "v": ["views", "view", "lượt xem", "luot xem", "xem"],
+        "l": ["likes", "like", "lượt thích", "luot thich", "thích", "thich"],
+        "c": ["comments", "comment", "bình luận", "binh luan"],
+        "s": ["shares", "share", "chia sẻ", "chia se"],
+        "save": ["favorites", "favorite", "saves", "save", "bookmarks", "bookmark", "collects", "collect", "lưu", "luu", "đã lưu", "da luu"],
     }
     for field, labels in metric_map.items():
         parsed = _extract_metric_from_lines_by_labels(lines, labels)
@@ -1901,6 +1933,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
             remaining = int(max(1, _TIKTOK_TIMEOUT_COOLDOWN_UNTIL - now_ts))
             _emit(logger, f"TikTok đang cooldown {remaining}s sau nhiều timeout liên tiếp, bỏ qua nhanh link này.")
             return None
+        url = _resolve_tiktok_url(url, logger=logger)
         if driver is not None:
             _ensure_tiktok_cookies(driver, logger=logger)
     elif platform == "instagram":
