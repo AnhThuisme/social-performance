@@ -6,7 +6,8 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from datetime import datetime
+from calendar import monthrange
+from datetime import datetime, timedelta
 from typing import Callable, Optional
 
 import requests
@@ -929,17 +930,210 @@ def _format_air_date_from_datetime(value) -> str:
         return ""
 
 
+_MONTH_NAME_MAP = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
+
+
+def _month_name_to_number(value: str) -> int:
+    return int(_MONTH_NAME_MAP.get(str(value or "").strip().lower(), 0) or 0)
+
+
+def _extract_air_date_from_match(day_token, month_token) -> str:
+    if day_token is None or month_token is None:
+        return ""
+    month_number = _month_name_to_number(month_token)
+    if month_number:
+        return _format_air_date(day_token, month_number)
+    try:
+        first = int(str(day_token).strip())
+        second = int(str(month_token).strip())
+    except Exception:
+        return ""
+    # Prefer DD/MM for explicit slash-dates in VN-facing sheets, but still recover MM/DD
+    # when the first token cannot be a valid day.
+    if 1 <= first <= 31 and 1 <= second <= 12:
+        return _format_air_date(first, second)
+    if 1 <= second <= 31 and 1 <= first <= 12:
+        return _format_air_date(second, first)
+    return ""
+
+
+def _shift_datetime_by_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _shift_datetime_by_years(value: datetime, years: int) -> datetime:
+    year = value.year + years
+    day = min(value.day, monthrange(year, value.month)[1])
+    return value.replace(year=year, day=day)
+
+
+def _extract_relative_air_date_from_text_line(line: str) -> str:
+    cleaned = str(line or "").strip()
+    if not cleaned or len(cleaned) > 80:
+        return ""
+    lowered = cleaned.lower()
+    now = datetime.now()
+    if re.search(r"\b(today|hôm nay|hom nay|just now|vừa xong|vua xong)\b", lowered):
+        return _format_air_date(now.day, now.month)
+    if re.search(r"\b(yesterday|hôm qua|hom qua)\b", lowered):
+        target = now - timedelta(days=1)
+        return _format_air_date(target.day, target.month)
+
+    match = re.search(
+        r"(?:^|\s)(\d{1,3})\s*(m|ph|p|phút|phut|min|mins|minute|minutes|h|hr|hrs|hour|hours|gio|giờ|tieng|tiếng|d|day|days|ngày|ngay|w|wk|wks|week|weeks|tuần|tuan|mo|mon|mos|month|months|tháng|thang|y|yr|yrs|year|years|năm|nam)\b",
+        lowered,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    amount = int(match.group(1))
+    unit = str(match.group(2) or "").lower()
+    suffix = lowered[match.end():].strip(" .,:;!-")
+    if suffix and not re.fullmatch(
+        r"(?:ago|trước|truoc|at\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|lúc\s+\d{1,2}(?::\d{2})?)",
+        suffix,
+        re.IGNORECASE,
+    ):
+        return ""
+    if amount < 0:
+        return ""
+    if unit in {"m", "ph", "p", "phút", "phut", "min", "mins", "minute", "minutes", "h", "hr", "hrs", "hour", "hours"}:
+        return _format_air_date(now.day, now.month)
+    if unit in {"gio", "giờ", "tieng", "tiếng"}:
+        return _format_air_date(now.day, now.month)
+    if unit in {"d", "day", "days", "ngày", "ngay"}:
+        target = now - timedelta(days=amount)
+        return _format_air_date(target.day, target.month)
+    if unit in {"w", "wk", "wks", "week", "weeks", "tuần", "tuan"}:
+        target = now - timedelta(days=amount * 7)
+        return _format_air_date(target.day, target.month)
+    if unit in {"mo", "mon", "mos", "month", "months", "tháng", "thang"}:
+        target = _shift_datetime_by_months(now, -amount)
+        return _format_air_date(target.day, target.month)
+    if unit in {"y", "yr", "yrs", "year", "years", "năm", "nam"}:
+        target = _shift_datetime_by_years(now, -amount)
+        return _format_air_date(target.day, target.month)
+    return ""
+
+
 def _extract_air_date_from_text(text: str) -> str:
     if not text:
         return ""
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
-    for line in lines[:20]:
+    for line in lines[:30]:
         cleaned = line.replace("·", " ").replace("•", " ").strip()
-        match = re.fullmatch(r"([01]?\d)\s*[-/.]\s*([0-3]?\d)", cleaned)
-        if match:
-            month_token, day_token = match.groups()
-            return _format_air_date(day_token, month_token)
+        relative_parsed = _extract_relative_air_date_from_text_line(cleaned)
+        if relative_parsed:
+            return relative_parsed
+        vn_patterns = (
+            r"\b([0-3]?\d)\s+tháng\s+([01]?\d)\b",
+            r"\b([0-3]?\d)\s+thg\.?\s*([01]?\d)\b",
+        )
+        for pattern in vn_patterns:
+            match = re.search(pattern, cleaned, re.IGNORECASE)
+            if match:
+                day_token, month_token = match.groups()
+                parsed = _format_air_date(day_token, month_token)
+                if parsed:
+                    return parsed
+        compact_match = re.fullmatch(r"([0-3]?\d)\s*[-/.]\s*([01]?\d)", cleaned)
+        if compact_match:
+            day_token, month_token = compact_match.groups()
+            return _extract_air_date_from_match(day_token, month_token)
+        for pattern in (
+            r"\b([0-3]?\d)\s*[-/.]\s*([01]?\d)(?:\s*[-/.]\s*\d{2,4})?\b",
+            r"\b([01]?\d)\s*[-/.]\s*([0-3]?\d)(?:\s*[-/.]\s*\d{2,4})?\b",
+        ):
+            match = re.search(pattern, cleaned)
+            if match:
+                first_token, second_token = match.groups()
+                parsed = _extract_air_date_from_match(first_token, second_token)
+                if parsed:
+                    return parsed
+        iso_match = re.search(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b", cleaned)
+        if iso_match:
+            _, month_token, day_token = iso_match.groups()
+            parsed = _format_air_date(day_token, month_token)
+            if parsed:
+                return parsed
+        english_patterns = (
+            r"\b(" + "|".join(_MONTH_NAME_MAP.keys()) + r")\.?\s+([0-3]?\d)\b",
+            r"\b([0-3]?\d)\s+(" + "|".join(_MONTH_NAME_MAP.keys()) + r")\.?\b",
+        )
+        for pattern in english_patterns:
+            match = re.search(pattern, cleaned, re.IGNORECASE)
+            if match:
+                first_token, second_token = match.groups()
+                parsed = _extract_air_date_from_match(first_token, second_token)
+                if parsed:
+                    return parsed
     return ""
+
+
+def _extract_air_date_from_bundle(bundle, prefer_source_datetime: bool = False) -> str:
+    if not isinstance(bundle, dict):
+        return ""
+    metas = bundle.get("metas", {}) or {}
+    source = str(bundle.get("source") or "")
+    source_datetime = (
+        _extract_string(
+            source,
+            [
+                r'"createTime"\s*:\s*"?(\d{10,13})"?',
+                r'"created_at"\s*:\s*"?(\d{10,13})"?',
+                r'"create_time"\s*:\s*"?(\d{10,13})"?',
+                r'"publish_time"\s*:\s*"?(\d{10,13})"?',
+                r'"published_at"\s*:\s*"?(\d{10,13})"?',
+                r'"taken_at"\s*:\s*"?(\d{10,13})"?',
+                r'"taken_at_timestamp"\s*:\s*"?(\d{10,13})"?',
+                r'"uploadDate"\s*:\s*"([^"]+)"',
+                r'"datePublished"\s*:\s*"([^"]+)"',
+            ],
+        )
+    )
+    parsed_source_datetime = _format_air_date_from_datetime(source_datetime)
+    if prefer_source_datetime and parsed_source_datetime:
+        return parsed_source_datetime
+    for candidate in (
+        bundle.get("text"),
+        bundle.get("title"),
+        metas.get("og:description"),
+        metas.get("og:title"),
+        metas.get("description"),
+    ):
+        parsed = _extract_air_date_from_text(str(candidate or ""))
+        if parsed:
+            return parsed
+    return parsed_source_datetime or _extract_air_date_from_text(source)
 
 
 def _has_tiktok_challenge(bundle) -> bool:
@@ -1697,6 +1891,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 retry_bundle = _collect_page_bundle(driver, url, logger=logger)
                 retry_payload = extractor(retry_bundle)
                 if retry_payload:
+                    bundle = retry_bundle
                     payload = retry_payload
                     break
         if platform == "facebook" and not payload and FACEBOOK_SOFT_RETRY_ATTEMPTS > 0:
@@ -1707,6 +1902,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 retry_bundle = _collect_page_bundle(driver, url, logger=logger)
                 retry_payload = extractor(retry_bundle)
                 if retry_payload:
+                    bundle = retry_bundle
                     payload = retry_payload
                     break
         if platform == "instagram" and not payload and INSTAGRAM_SOFT_RETRY_ATTEMPTS > 0:
@@ -1717,6 +1913,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 retry_bundle = _collect_page_bundle(driver, url, logger=logger)
                 retry_payload = extractor(retry_bundle)
                 if retry_payload:
+                    bundle = retry_bundle
                     payload = retry_payload
                     break
         if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
@@ -1739,11 +1936,20 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 try:
                     payload = extractor(fallback_bundle)
                     if payload:
+                        bundle = fallback_bundle
                         _emit(logger, f"{platform.capitalize()} lấy được dữ liệu qua fallback requests.")
                 except Exception:
                     payload = None
         if not payload:
             return None
+        if not str(payload.get("air_date") or "").strip():
+            fallback_air_date = _extract_air_date_from_bundle(
+                bundle,
+                prefer_source_datetime=(platform == "facebook"),
+            )
+            if fallback_air_date:
+                payload["air_date"] = fallback_air_date
+                _emit(logger, f"{platform.capitalize()} bổ sung air date fallback: {fallback_air_date}")
         warning_message = str(payload.get("_warning", "") or "").strip()
         if warning_message:
             _emit(logger, warning_message)
