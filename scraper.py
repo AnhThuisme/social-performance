@@ -6623,19 +6623,22 @@ def get_youtube_stats(url):
 def get_social_stats(url, platform_name, driver=None, logger=None):
     return fetch_social_stats(url, platform_name, driver=driver, logger=logger or add_log)
 
-def resolve_target_row_index(target, urls, min_row: int = 2):
+def resolve_target_row_index(target, urls, min_row: int = 2, start_row: Optional[int] = None):
     fallback_row = parse_start_row_input(str(target.get("row_idx") or ""))
-    stored_link = str(target.get("link") or "").strip()
-    if fallback_row and 0 < fallback_row <= len(urls):
-        current_link = str(urls[fallback_row - 1] or "").strip()
-        if not stored_link or current_link == stored_link:
-            return fallback_row
+    effective_start_row = max(2, int(start_row or min_row or 2))
+    stored_link = extract_scannable_url(str(target.get("link") or "").strip())
+    if fallback_row and fallback_row >= effective_start_row:
+        fallback_offset = fallback_row - effective_start_row
+        if 0 <= fallback_offset < len(urls):
+            current_link = extract_scannable_url(str(urls[fallback_offset] or "").strip())
+            if not stored_link or current_link == stored_link:
+                return fallback_row
     if stored_link:
-        for idx, current_link in enumerate(urls, start=1):
-            if idx < max(2, min_row):
-                continue
-            if str(current_link or "").strip() == stored_link:
-                return idx
+        for offset, current_link in enumerate(urls):
+            row_idx = effective_start_row + offset
+            normalized_current_link = extract_scannable_url(str(current_link or "").strip())
+            if normalized_current_link == stored_link:
+                return row_idx
     return fallback_row
 
 # --- Logic quet du lieu ---
@@ -6741,19 +6744,27 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
             start_row = resolve_effective_start_row(header_row, runtime_state)
 
             if selected_targets:
+                urls = get_sheet_column_values(sheet, link_col, use_cache=True, start_row=start_row)
                 row_plan = []
                 seen_rows = set()
                 for target in selected_targets:
-                    resolved_row = parse_start_row_input(str(target.get("row_idx") or ""))
+                    fallback_row = parse_start_row_input(str(target.get("row_idx") or ""))
+                    resolved_row = resolve_target_row_index(target, urls, min_row=start_row, start_row=start_row)
                     if resolved_row is None or resolved_row < start_row or resolved_row in seen_rows:
                         continue
-                    url = extract_scannable_url(str(target.get("link") or "").strip())
+                    if fallback_row and resolved_row != fallback_row:
+                        logger(
+                            f"Tab '{selected_sheet}': dòng lịch {fallback_row} đã đổi vị trí, map lại sang dòng {resolved_row} theo URL hiện tại."
+                        )
+                    current_offset = resolved_row - start_row
+                    current_sheet_url = urls[current_offset] if 0 <= current_offset < len(urls) else target.get("link")
+                    url = extract_scannable_url(str(current_sheet_url or "").strip()) or extract_scannable_url(str(target.get("link") or "").strip())
                     if not url:
                         continue
                     seen_rows.add(resolved_row)
                     row_plan.append((resolved_row, target, url))
                 row_plan.sort(key=lambda item: item[0])
-                logger(f"Tab '{selected_sheet}': dùng danh sách mục tiêu có sẵn, bỏ qua bước đọc toàn bộ cột link")
+                logger(f"Tab '{selected_sheet}': đã đối chiếu {len(urls)} dòng cột link để map lại mục tiêu theo URL hiện tại")
                 logger(f"Tab '{selected_sheet}': quét {len(row_plan)} bài đã chọn")
             else:
                 urls = get_sheet_column_values(sheet, link_col, use_cache=True, start_row=start_row)

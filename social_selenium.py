@@ -986,6 +986,31 @@ def _extract_tiktok_caption(bundle) -> str:
     return metas.get("og:description", "") or metas.get("og:title", "")
 
 
+def _extract_metric_from_lines_by_labels(lines, labels) -> Optional[int]:
+    if not lines:
+        return None
+    normalized_labels = [str(label or "").strip().lower() for label in labels if str(label or "").strip()]
+    if not normalized_labels:
+        return None
+    label_patterns = [re.compile(rf"\b{re.escape(label)}\b", re.IGNORECASE) for label in normalized_labels]
+    for idx, line in enumerate(lines):
+        line_text = str(line or "").strip()
+        if not line_text:
+            continue
+        if not any(pattern.search(line_text) for pattern in label_patterns):
+            continue
+        inline_value = _extract_text_metric(line_text, normalized_labels)
+        if inline_value is not None:
+            return inline_value
+        for neighbor_idx in (idx - 1, idx + 1, idx - 2, idx + 2):
+            if neighbor_idx < 0 or neighbor_idx >= len(lines):
+                continue
+            parsed = _parse_compact_number(lines[neighbor_idx])
+            if parsed is not None:
+                return parsed
+    return None
+
+
 def _extract_tiktok_photo_from_text(bundle):
     text = bundle.get("text") or ""
     if not text:
@@ -993,6 +1018,31 @@ def _extract_tiktok_photo_from_text(bundle):
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
         return None
+
+    payload = {
+        "v": 0,
+        "cap": _extract_tiktok_caption(bundle),
+    }
+    like_count = _extract_metric_from_lines_by_labels(lines, ["likes", "like"])
+    comment_count = _extract_metric_from_lines_by_labels(lines, ["comments", "comment"])
+    share_count = _extract_metric_from_lines_by_labels(lines, ["shares", "share"])
+    save_count = _extract_metric_from_lines_by_labels(
+        lines,
+        ["favorites", "favorite", "saves", "save", "bookmarks", "bookmark", "collects", "collect"],
+    )
+    if like_count is not None:
+        payload["l"] = like_count
+    if comment_count is not None:
+        payload["c"] = comment_count
+    if share_count is not None:
+        payload["s"] = share_count
+    if save_count is not None:
+        payload["save"] = save_count
+    air_date = _extract_air_date_from_text(text)
+    if air_date:
+        payload["air_date"] = air_date
+    if any(key in payload for key in ("l", "c", "s", "save")):
+        return payload
 
     comment_index = -1
     for idx, line in enumerate(lines):
@@ -1016,18 +1066,18 @@ def _extract_tiktok_photo_from_text(bundle):
     if len(metric_values) < 3:
         return None
 
-    payload = {
-        "v": 0,
-        "l": metric_values[-4] if len(metric_values) >= 4 else metric_values[-3],
-        "c": metric_values[-3] if len(metric_values) >= 4 else metric_values[-2],
-        "s": metric_values[-1],
-        "cap": _extract_tiktok_caption(bundle),
-    }
+    payload = {"v": 0, "cap": _extract_tiktok_caption(bundle)}
+    if len(metric_values) >= 4:
+        payload["l"] = metric_values[-4]
+        payload["c"] = metric_values[-3]
+        payload["save"] = metric_values[-2]
+        payload["s"] = metric_values[-1]
+    else:
+        payload["c"] = metric_values[-2]
+        payload["s"] = metric_values[-1]
     air_date = _extract_air_date_from_text(text)
     if air_date:
         payload["air_date"] = air_date
-    if len(metric_values) >= 4:
-        payload["save"] = metric_values[-2]
     return payload
 
 
