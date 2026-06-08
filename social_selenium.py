@@ -60,6 +60,7 @@ _IG_COOKIES_CACHE_KEY = None
 _TIKTOK_TIMEOUT_STREAK = 0
 _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
 LOCAL_STRICT_VISIBLE = str(os.getenv("SELENIUM_LOCAL_STRICT_VISIBLE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+ALLOW_VISIBLE_BROWSER_RETRY = str(os.getenv("SELENIUM_ALLOW_VISIBLE_RETRY", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_remote_selenium_url() -> str:
@@ -372,6 +373,14 @@ def _add_common_browser_args(options, headless: bool = True):
         "--disable-gpu",
         "--no-sandbox",
         "--disable-dev-shm-usage",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--remote-debugging-pipe",
         "--disable-notifications",
         "--disable-popup-blocking",
         "--disable-blink-features=AutomationControlled",
@@ -608,6 +617,16 @@ def _focus_visible_browser_window(driver):
         driver.execute_script("window.focus();")
     except Exception:
         pass
+
+
+def _can_use_visible_browser_retry() -> bool:
+    # Headful Chrome retry is only reliable on environments that actually expose a desktop
+    # session. Docker/VPS without DISPLAY tends to crash immediately with "Chrome instance exited".
+    if _is_local_desktop_runtime():
+        return True
+    if _get_remote_selenium_url() and ALLOW_VISIBLE_BROWSER_RETRY:
+        return True
+    return False
 
 
 def _read_current_page_bundle(driver):
@@ -1793,6 +1812,9 @@ def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[
 def _retry_tiktok_with_visible_browser(url: str, logger: Optional[Callable[[str], None]] = None):
     retry_driver = None
     best_payload = None
+    if not _can_use_visible_browser_retry():
+        _emit(logger, "Bỏ qua TikTok visual retry: môi trường hiện tại không hỗ trợ Chrome thường ổn định.")
+        return None
     try:
         _emit(logger, "TikTok/headless bị chặn, thử lại bằng Chrome thường 1 lần")
         retry_driver = create_selenium_driver(logger=logger, headless=False, preferred_browser="chrome")
