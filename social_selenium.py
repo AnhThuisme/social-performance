@@ -47,6 +47,9 @@ READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
 READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
 TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS", 12.0, 5.0)
 TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS", 0.8, 0.2)
+TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS = _env_float("TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS", 26.0, 8.0)
+TIKTOK_AUTO_WAIT_POLL_SECONDS = _env_float("TIKTOK_AUTO_WAIT_POLL_SECONDS", 1.0, 0.2)
+TIKTOK_VISUAL_RETRY_WAIT_SECONDS = _env_float("TIKTOK_VISUAL_RETRY_WAIT_SECONDS", 18.0, 5.0)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1284,6 +1287,15 @@ def _has_tiktok_challenge(bundle) -> bool:
     return any(marker in source for marker in source_markers)
 
 
+def _is_tiktok_auto_wait(bundle) -> bool:
+    text = (bundle.get("text") or "").strip().lower()
+    title = str(bundle.get("title") or "").strip().lower()
+    source = (bundle.get("source") or "").lower()
+    if text == "please wait..." or title == "please wait...":
+        return True
+    return "slardarwaf" in source or "_wafchallengeid" in source
+
+
 def _payload_has_tiktok_signal(payload) -> bool:
     if not isinstance(payload, dict):
         return False
@@ -1904,15 +1916,24 @@ def _wait_for_tiktok_manual_challenge(
         return bundle
 
     _focus_visible_browser_window(driver)
+    auto_wait_mode = _is_tiktok_auto_wait(bundle)
     _emit(
         logger,
-        "TikTok đang hiện captcha slider. Chrome thường đã mở ra, bạn kéo captcha xong thì tool sẽ tự đọc tiếp số liệu.",
+        (
+            "TikTok đang hiện lớp chờ/WAF. Chrome thường sẽ tiếp tục chờ và tự thử tải lại dữ liệu."
+            if auto_wait_mode
+            else "TikTok đang hiện captcha slider. Chrome thường đã mở ra, bạn kéo captcha xong thì tool sẽ tự đọc tiếp số liệu."
+        ),
     )
 
     best_bundle = bundle
-    deadline = time.time() + TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS
+    deadline = time.time() + (
+        TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS if auto_wait_mode else TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS
+    )
+    poll_seconds = TIKTOK_AUTO_WAIT_POLL_SECONDS if auto_wait_mode else TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS
+    refresh_attempted = False
     while time.time() < deadline:
-        time.sleep(TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS)
+        time.sleep(poll_seconds)
         try:
             current_bundle = _read_current_page_bundle(driver)
         except Exception:
@@ -1929,8 +1950,24 @@ def _wait_for_tiktok_manual_challenge(
             except Exception:
                 pass
             return best_bundle
+        if auto_wait_mode and not refresh_attempted and time.time() + max(4.0, poll_seconds * 2) < deadline:
+            try:
+                _emit(logger, "TikTok vẫn đang ở lớp chờ, thử refresh 1 lần để lấy trang nội dung thật...")
+                driver.refresh()
+                _wait_until_ready(driver)
+                time.sleep(min(2.5, max(1.0, DEFAULT_SETTLE_SECONDS)))
+                refreshed_bundle = _read_current_page_bundle(driver)
+                if len(refreshed_bundle.get("text", "")) >= len(best_bundle.get("text", "")):
+                    best_bundle = refreshed_bundle
+                refresh_attempted = True
+                continue
+            except Exception:
+                refresh_attempted = True
 
-    _emit(logger, "TikTok captcha chưa được giải xong trong thời gian chờ, bỏ qua lần đọc này.")
+    _emit(
+        logger,
+        "TikTok vẫn chưa qua lớp chờ/captcha trong thời gian đợi, bỏ qua lần đọc này.",
+    )
     return best_bundle
 
 
@@ -1949,14 +1986,42 @@ def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[
 
     best_bundle = _read_current_page_bundle(driver)
     best_bundle = _wait_for_tiktok_manual_challenge(driver, best_bundle, logger=logger)
-    deadline = time.time() + 12
+    best_payload = _extract_tiktok(best_bundle)
+    if best_payload and any(best_payload.get(key) for key in ("v", "l", "s", "c", "save")):
+        return best_bundle
+
+    deadline = time.time() + TIKTOK_VISUAL_RETRY_WAIT_SECONDS
+    refreshed_once = False
     while time.time() < deadline:
         time.sleep(1)
         current_bundle = _read_current_page_bundle(driver)
         if len(current_bundle.get("text", "")) > len(best_bundle.get("text", "")):
             best_bundle = current_bundle
+        current_payload = _extract_tiktok(current_bundle)
+        if current_payload and any(current_payload.get(key) for key in ("v", "l", "s", "c", "save")):
+            return current_bundle
         if _extract_tiktok_photo_from_text(current_bundle):
             return current_bundle
+        if (
+            not refreshed_once
+            and time.time() + 4 < deadline
+            and (
+                _is_tiktok_auto_wait(current_bundle)
+                or len(str(current_bundle.get("text") or "").strip()) < 64
+            )
+        ):
+            try:
+                _emit(logger, "TikTok visual retry chưa có dữ liệu, refresh thêm 1 lần để chờ JS/render hoàn tất...")
+                driver.refresh()
+                _wait_until_ready(driver)
+                time.sleep(min(2.5, max(1.0, DEFAULT_SETTLE_SECONDS)))
+                refreshed_bundle = _read_current_page_bundle(driver)
+                if len(refreshed_bundle.get("text", "")) >= len(best_bundle.get("text", "")):
+                    best_bundle = refreshed_bundle
+                refreshed_once = True
+                continue
+            except Exception:
+                refreshed_once = True
     return best_bundle
 
 
