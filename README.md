@@ -100,6 +100,37 @@ docker run --env-file .env -p 8000:8000 social-performance
 
 Container da cai `chromium` va `chromedriver` de Selenium chay headless.
 
+## TikTok session tren VPS/Docker
+
+Neu TikTok lien tuc tra `Please wait...`, `WAF`, hoac `Khong lay duoc so lieu`, ban can cap session that cho scraper. Repo nay da ho tro 2 cach:
+
+- `TT_COOKIES_FILE=/app/tiktok_cookies.json`
+- `SELENIUM_CHROME_USER_DATA_DIR=/app/tiktok-profile`
+- `SELENIUM_CHROME_PROFILE_DIRECTORY=Default`
+
+Quy trinh toi thieu:
+
+1. Export cookie TikTok JSON tu browser dang login.
+2. Copy len server:
+   `scp /path/to/tiktok_cookies.json root@SERVER:/opt/social-scraper/tiktok_cookies.json`
+3. Neu muon dung profile that, copy thu muc profile len server:
+   `scp -r /path/to/tiktok-profile root@SERVER:/opt/social-scraper/tiktok-profile`
+4. Set `.env`:
+   - `SELENIUM_ALLOW_VISIBLE_RETRY=1`
+   - `SELENIUM_XVFB_AUTO_START=1`
+   - `TT_COOKIES_FILE=/app/tiktok_cookies.json`
+   - `SELENIUM_CHROME_USER_DATA_DIR=/app/tiktok-profile`
+   - `SELENIUM_CHROME_PROFILE_DIRECTORY=Default`
+5. Tren server, chay:
+   `./scripts/deploy_server.sh`
+
+Script `scripts/deploy_server.sh` se tu mount:
+
+- `credential.json` neu co
+- `tiktok_cookies.json` neu co
+- `tiktok-profile/` neu co
+- cac file data ben vung trong `/opt/social-scraper-data`
+
 ## Deploy len Render
 
 Khuyen dung tao `Web Service` voi `Environment = Docker` de Render build tu `Dockerfile`.
