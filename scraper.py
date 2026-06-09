@@ -14565,6 +14565,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     refreshSheetTabDomRefs();
                     const activeSetSheetForm = document.querySelector("form[action='/set-sheet']");
                     if (!activeSetSheetForm) return null;
+                    const preSaveInputSnapshot = readColConfigInputs();
+                    const preSaveActiveTab = String(colConfigActiveTab || "").trim();
+                    const preSaveSelectedTabs = Array.from(selectedSheetTabs);
                     void pushRealtimeLog("Bắt đầu xử lý nhập/lưu sheet...");
                     if (configLocked) {{
                         const message = "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập sheet.";
@@ -14598,7 +14601,12 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 sessionStorage.removeItem("draft_sheet_url");
                                 sessionStorage.removeItem("draft_sheet_name");
                                 applyActiveSheetMeta(data, true);
-                                applyColumnConfigState(data);
+                                applyColumnConfigState(data, {{
+                                    preserveCurrentInputs: true,
+                                    preferredActiveTab: preSaveActiveTab,
+                                    inputSnapshot: preSaveInputSnapshot,
+                                    selectedTabsSnapshot: preSaveSelectedTabs,
+                                }});
                                 applySheetMetadataState(data);
                                 applyScheduleConfigState(data);
                                 applyScheduleTrackingState(data);
@@ -14616,9 +14624,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 if (typeof data.campaign_html === "string") {{
                                     replaceCampaignPanelHtml(data.campaign_html);
                                 }}
-                                if (sheetUrlInput?.value) {{
-                                    fetchSheetTabs(sheetUrlInput.value, true);
-                                }}
+                                // Do not re-fetch tabs immediately after save.
+                                // The save response already contains the canonical state, and re-fetching here
+                                // can overwrite the user's in-progress per-tab config inputs.
                             }}
                             applyStatusState(data);
 	                            showNotice(
@@ -14654,7 +14662,12 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             sessionStorage.removeItem("draft_sheet_url");
                             sessionStorage.removeItem("draft_sheet_name");
                             applyActiveSheetMeta(data, true);
-                            applyColumnConfigState(data);
+                            applyColumnConfigState(data, {{
+                                preserveCurrentInputs: true,
+                                preferredActiveTab: preSaveActiveTab,
+                                inputSnapshot: preSaveInputSnapshot,
+                                selectedTabsSnapshot: preSaveSelectedTabs,
+                            }});
                             applySheetMetadataState(data);
                             applyScheduleConfigState(data);
                             applyScheduleTrackingState(data);
@@ -14672,9 +14685,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             if (typeof data.campaign_html === "string") {{
                                 replaceCampaignPanelHtml(data.campaign_html);
                             }}
-                            if (sheetUrlInput?.value) {{
-                                fetchSheetTabs(sheetUrlInput.value, true);
-                            }}
+                            // Avoid immediate tab re-fetch here for the same reason as above: keep current form state stable.
                         }}
                         applyStatusState(data);
 	                        showNotice(
@@ -15820,9 +15831,17 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }}
                 }};
 
-                const applyColumnConfigState = (data) => {{
+                const applyColumnConfigState = (data, options = {{}}) => {{
                     const columnConfig = data?.column_config;
                     if (!columnConfig) return;
+                    const preserveCurrentInputs = Boolean(options?.preserveCurrentInputs);
+                    const inputSnapshot = options?.inputSnapshot && typeof options.inputSnapshot === "object"
+                        ? options.inputSnapshot
+                        : null;
+                    const preferredActiveTab = String(options?.preferredActiveTab || "").trim();
+                    const selectedTabsSnapshot = Array.isArray(options?.selectedTabsSnapshot)
+                        ? options.selectedTabsSnapshot.map((item) => String(item || "").trim()).filter(Boolean)
+                        : [];
                     const inputValues = columnConfig.input_values || {{}};
                     const detectedInputs = columnConfig.detected_inputs || {{}};
                     const manualInputs = columnConfig.manual_inputs || {{}};
@@ -15830,12 +15849,13 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"].forEach((field) => {{
                         const el = document.querySelector(`[data-column-input="${{field}}"]`);
                         if (!el) return;
-                        const nextValue = inputValues[field] || "";
+                        const snapshotValue = inputSnapshot ? String(inputSnapshot[field] || "") : "";
+                        const nextValue = preserveCurrentInputs ? snapshotValue : (inputValues[field] || "");
                         if (document.activeElement !== el) {{
                             el.value = nextValue;
                         }}
                         el.dataset.detectedValue = detectedInputs[field] || "";
-                        el.dataset.manualValue = manualInputs[field] || "";
+                        el.dataset.manualValue = preserveCurrentInputs ? snapshotValue : (manualInputs[field] || "");
                     }});
                     ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"].forEach((field) => {{
                         const el = document.querySelector(`[data-column-source="${{field}}"]`);
@@ -15844,12 +15864,26 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     }});
                     const startRowField = setColumnsForm?.querySelector("[name='start_row']");
                     if (startRowField && document.activeElement !== startRowField) {{
-                        startRowField.value = `${{columnConfig.start_row || 2}}`;
+                        startRowField.value = preserveCurrentInputs
+                            ? `${{inputSnapshot?.start_row || startRowField.value || columnConfig.start_row || 2}}`
+                            : `${{columnConfig.start_row || 2}}`;
                     }}
                     const detectedText = columnConfig.detected_text || "";
                     document.querySelectorAll("[data-column-detected-text]").forEach((el) => {{
                         el.textContent = detectedText;
                     }});
+                    if (preserveCurrentInputs && selectedTabsSnapshot.length) {{
+                        applySelectedTabsState(selectedTabsSnapshot);
+                    }}
+                    if (preserveCurrentInputs && preferredActiveTab) {{
+                        colConfigActiveTab = preferredActiveTab;
+                        if (colConfigActiveTabInput) {{
+                            colConfigActiveTabInput.value = preferredActiveTab;
+                        }}
+                        tabColConfigCache[preferredActiveTab] = readColConfigInputs();
+                        renderColConfigTabBar(preferredActiveTab);
+                        return;
+                    }}
                     // Re-apply active tab's per-tab overrides on top of the global defaults
                     if (colConfigActiveTab) {{
                         const latestByTab = data?.column_overrides_by_tab;
