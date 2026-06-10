@@ -4849,17 +4849,33 @@ def shorten_text(text, limit: int = 88) -> str:
 
 AUTH_SETTINGS = load_auth_settings()
 
+def _extract_platform_handle_from_link(link: str, platform: str, keep_at: bool = False) -> str:
+    parsed = urllib.parse.urlparse(link or "")
+    path_parts = [part for part in parsed.path.split("/") if part]
+    handle = ""
+    if platform in {"TikTok", "YouTube"}:
+        handle = next((part for part in path_parts if part.startswith("@")), "")
+    elif platform == "Instagram":
+        handle = path_parts[0] if path_parts else ""
+    normalized_handle = str(handle or "").strip()
+    if not normalized_handle:
+        return ""
+    if keep_at:
+        return normalized_handle if normalized_handle.startswith("@") else f"@{normalized_handle}"
+    return normalized_handle[1:] if normalized_handle.startswith("@") else normalized_handle
+
 def infer_creator_name(link: str, platform: str) -> str:
     parsed = urllib.parse.urlparse(link or "")
     path_parts = [part for part in parsed.path.split("/") if part]
     host = (parsed.netloc or "").replace("www.", "")
     if platform == "TikTok":
-        handle = next((part for part in path_parts if part.startswith("@")), "")
+        handle = _extract_platform_handle_from_link(link, platform, keep_at=False)
         return handle or "TikTok creator"
     if platform == "Instagram":
-        return f"@{path_parts[0]}" if path_parts else "Instagram creator"
+        handle = _extract_platform_handle_from_link(link, platform, keep_at=False)
+        return handle or "Instagram creator"
     if platform == "YouTube":
-        handle = next((part for part in path_parts if part.startswith("@")), "")
+        handle = _extract_platform_handle_from_link(link, platform, keep_at=False)
         return handle or "YouTube channel"
     if platform == "Facebook":
         if path_parts and path_parts[0] == "groups":
@@ -4918,10 +4934,36 @@ def resolve_creator_link(url: str) -> str:
     return final_url
 
 
+def _sanitize_creator_value(value) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = normalize_header(raw)
+    if normalized in {
+        "khac",
+        "other",
+        "others",
+        "unknown",
+        "unk",
+        "na",
+        "n_a",
+        "none",
+        "null",
+        "creator",
+        "kol",
+        "account",
+        "channel",
+    }:
+        return ""
+    if raw in {"-", "--", "---", "_", "."}:
+        return ""
+    return raw
+
+
 def resolve_post_creator_name(normalized_record, link: str, platform: str) -> str:
     normalized_record = normalized_record if isinstance(normalized_record, dict) else {}
     if platform == "Facebook":
-        facebook_creator = str(
+        facebook_creator = _sanitize_creator_value(
             first_nonempty_value(
                 normalized_record,
                 "groupprofile",
@@ -4959,12 +5001,30 @@ def resolve_post_creator_name(normalized_record, link: str, platform: str) -> st
                 "page/profile",
             )
             or ""
-        ).strip()
+        )
         return facebook_creator or infer_creator_name(link, platform)
-    return str(
-        first_nonempty_value(normalized_record, "kol", "creator", "author", "username", "account", "channel")
+    creator_value = _sanitize_creator_value(
+        first_nonempty_value(
+            normalized_record,
+            "kol",
+            "creator",
+            "author",
+            "username",
+            "account",
+            "channel",
+            "creatorhandle",
+            "creatorusername",
+            "authorhandle",
+            "authorusername",
+            "authoruniqueid",
+            "uniqueid",
+            "nickname",
+        )
         or ""
-    ).strip() or infer_creator_name(link, platform)
+    )
+    if creator_value.startswith("@") and platform in {"TikTok", "Instagram", "YouTube"}:
+        creator_value = creator_value[1:]
+    return creator_value or infer_creator_name(link, platform)
 
 def infer_post_title(link: str, platform: str) -> str:
     parsed = urllib.parse.urlparse(link or "")
@@ -4989,13 +5049,13 @@ def infer_creator_handle(link: str, creator: str, platform: str) -> str:
     path_parts = [part for part in parsed.path.split("/") if part]
 
     if platform == "TikTok":
-        handle = next((part for part in path_parts if part.startswith("@")), "")
+        handle = _extract_platform_handle_from_link(link, platform, keep_at=True)
         return handle or "@tiktok"
     if platform == "Instagram":
-        handle = path_parts[0] if path_parts else ""
-        return f"@{handle}" if handle and not handle.startswith("@") else (handle or "@instagram")
+        handle = _extract_platform_handle_from_link(link, platform, keep_at=True)
+        return handle or "@instagram"
     if platform == "YouTube":
-        handle = next((part for part in path_parts if part.startswith("@")), "")
+        handle = _extract_platform_handle_from_link(link, platform, keep_at=True)
         return handle or "@youtube"
     if platform == "Facebook":
         if path_parts and path_parts[0] == "groups" and len(path_parts) > 1:
@@ -5485,7 +5545,24 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             normalize_header(key)
             for key in ("thuonghieu", "tenthuonghieu", "brand", "brandname", "nhanhang", "tennhanhang", "client", "clientname")
         )
-        creator_norm_keys = tuple(normalize_header(key) for key in ("kol", "creator", "author", "username", "account", "channel"))
+        creator_norm_keys = tuple(
+            normalize_header(key)
+            for key in (
+                "kol",
+                "creator",
+                "author",
+                "username",
+                "account",
+                "channel",
+                "creatorhandle",
+                "creatorusername",
+                "authorhandle",
+                "authorusername",
+                "authoruniqueid",
+                "uniqueid",
+                "nickname",
+            )
+        )
         facebook_creator_norm_keys = tuple(
             normalize_header(key)
             for key in (
@@ -5527,9 +5604,9 @@ def build_overview_panel_html(sheet, snapshot_url: str, status_payload, schedule
             # Overview is an aggregated view; avoid per-row network URL resolving to keep loading fast.
             platform = detect_platform(link)
             if platform == "Facebook":
-                creator = str(read_first_value_by_norm_keys(row_values, facebook_creator_norm_keys) or "").strip() or infer_creator_name(link, platform)
+                creator = _sanitize_creator_value(read_first_value_by_norm_keys(row_values, facebook_creator_norm_keys) or "") or infer_creator_name(link, platform)
             else:
-                creator = str(read_first_value_by_norm_keys(row_values, creator_norm_keys) or "").strip() or infer_creator_name(link, platform)
+                creator = _sanitize_creator_value(read_first_value_by_norm_keys(row_values, creator_norm_keys) or "") or infer_creator_name(link, platform)
             brand_name = entry_brand_label or str(read_first_value_by_norm_keys(row_values, brand_norm_keys) or "").strip() or "Chưa gắn"
             campaign_name = str(
                 entry_campaign_label

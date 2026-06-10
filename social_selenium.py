@@ -1321,6 +1321,70 @@ def _extract_tiktok_caption(bundle) -> str:
     return metas.get("og:description", "") or metas.get("og:title", "")
 
 
+def _sanitize_creator_name(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    raw = raw.lstrip("@").strip()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[^a-z0-9._]", "", raw.lower())
+    if len(normalized) < 2:
+        return ""
+    return raw
+
+
+def _extract_tiktok_creator_from_text(text: str) -> str:
+    if not text:
+        return ""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    for line in lines:
+        match = re.match(
+            r"^@?([A-Za-z0-9._]{2,40})\s*[·•]\s*(?:\d{1,2}[-/.]\d{1,2}|\d+\s*(?:s|m|h|d)|\d+\s*(?:phút|gio|giờ|ngày|tuan|tuần|week|weeks|day|days|month|months))",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            return _sanitize_creator_name(match.group(1))
+    return ""
+
+
+def _extract_tiktok_creator(bundle, item=None, detail=None) -> str:
+    if isinstance(item, dict):
+        author = item.get("author") if isinstance(item.get("author"), dict) else {}
+        for candidate in (
+            author.get("uniqueId"),
+            author.get("unique_id"),
+            author.get("nickname"),
+            item.get("authorUniqueId"),
+            item.get("authorName"),
+            item.get("nickname"),
+        ):
+            creator = _sanitize_creator_name(str(candidate or ""))
+            if creator:
+                return creator
+    source = str((bundle or {}).get("source") or "")
+    metas = (bundle or {}).get("metas", {}) or {}
+    for candidate in (
+        _extract_string(
+            source,
+            [
+                r'"uniqueId"\s*:\s*"([^"]+)"',
+                r'"authorUniqueId"\s*:\s*"([^"]+)"',
+                r'"nickname"\s*:\s*"([^"]+)"',
+            ],
+        ),
+        _extract_string(str(metas.get("og:title") or ""), [r"@?([A-Za-z0-9._]{2,40})\s+on\s+TikTok"]),
+        _extract_tiktok_creator_from_text((bundle or {}).get("text") or ""),
+    ):
+        creator = _sanitize_creator_name(str(candidate or ""))
+        if creator:
+            return creator
+    parsed = urllib.parse.urlparse(str((bundle or {}).get("url") or "").strip())
+    handle = next((part for part in parsed.path.split("/") if part.startswith("@")), "")
+    return _sanitize_creator_name(handle)
+
+
 def _extract_metric_from_lines_by_labels(lines, labels) -> Optional[int]:
     if not lines:
         return None
@@ -1358,6 +1422,9 @@ def _extract_tiktok_photo_from_text(bundle):
         "v": 0,
         "cap": _extract_tiktok_caption(bundle),
     }
+    creator = _extract_tiktok_creator(bundle)
+    if creator:
+        payload["creator"] = creator
     like_count = _extract_metric_from_lines_by_labels(lines, ["likes", "like", "lượt thích", "thích"])
     comment_count = _extract_metric_from_lines_by_labels(lines, ["comments", "comment", "bình luận", "binh luan"])
     share_count = _extract_metric_from_lines_by_labels(lines, ["shares", "share", "chia sẻ", "chia se"])
@@ -1402,6 +1469,9 @@ def _extract_tiktok_photo_from_text(bundle):
         return None
 
     payload = {"v": 0, "cap": _extract_tiktok_caption(bundle)}
+    creator = _extract_tiktok_creator(bundle)
+    if creator:
+        payload["creator"] = creator
     if len(metric_values) >= 4:
         payload["l"] = metric_values[-4]
         payload["c"] = metric_values[-3]
@@ -1427,6 +1497,9 @@ def _extract_tiktok_metrics_from_text(bundle):
     payload = {
         "cap": _extract_tiktok_caption(bundle),
     }
+    creator = _extract_tiktok_creator(bundle)
+    if creator:
+        payload["creator"] = creator
     metric_map = {
         "v": ["views", "view", "lượt xem", "luot xem", "xem"],
         "l": ["likes", "like", "lượt thích", "luot thich", "thích", "thich"],
@@ -1481,6 +1554,9 @@ def _extract_tiktok(bundle):
             or metas.get("og:description", "")
             or metas.get("og:title", ""),
         }
+        creator = _extract_tiktok_creator(bundle, item=item, detail=detail)
+        if creator:
+            payload["creator"] = creator
         if air_date:
             payload["air_date"] = air_date
         save_count = _parse_compact_number(_pick_dict_value(stats_v2, stats, "collectCount"))
@@ -1517,6 +1593,9 @@ def _extract_tiktok(bundle):
         or metas.get("og:description", "")
         or metas.get("og:title", ""),
     }
+    creator = _extract_tiktok_creator(bundle)
+    if creator:
+        payload["creator"] = creator
     air_date = _format_air_date_from_datetime(
         _extract_string(source, [r'"createTime"\s*:\s*"?(\d{10,13})"?'])
     ) or _extract_air_date_from_text(bundle.get("text") or "")
