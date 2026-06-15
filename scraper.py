@@ -200,6 +200,8 @@ YOUTUBE_API_KEY = "AIzaSyAbMDEzmIVpsVTASYhTaXI6oC7BudQWzlU"
 ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.0"))
 ROW_SCRAPE_RETRY_ATTEMPTS = max(0, int(os.getenv("ROW_SCRAPE_RETRY_ATTEMPTS", "1")))
 ROW_SCRAPE_RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("ROW_SCRAPE_RETRY_DELAY_SECONDS", "1.2")))
+FAILED_ROW_RETRY_PASSES = max(0, int(os.getenv("FAILED_ROW_RETRY_PASSES", "1")))
+FAILED_ROW_RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("FAILED_ROW_RETRY_DELAY_SECONDS", "2.0")))
 POSTS_TAB_BUILD_STAGGER_SECONDS = max(0.0, float(os.getenv("POSTS_TAB_BUILD_STAGGER_SECONDS", "0.0")))
 POSTS_LAYOUT_SAMPLE_ROWS = max(10, int(os.getenv("POSTS_LAYOUT_SAMPLE_ROWS", "24")))
 POSTS_LAYOUT_USE_CACHE = str(os.getenv("POSTS_LAYOUT_USE_CACHE", "true")).strip().lower() in {"1", "true", "yes", "on"}
@@ -6880,6 +6882,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
             tab_driver = None
             tab_driver_failed = False
             now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+            deferred_failed_rows = []
 
             def locked_log(msg):
                 with state_lock:
@@ -6969,6 +6972,118 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         time.sleep(ROW_SCRAPE_RETRY_DELAY_SECONDS)
                 return None
 
+            def record_row_success(row_idx: int, platform: str, url: str, stats, rescued: bool = False):
+                if stats and "v" not in stats and is_optional_view_metric(url, platform):
+                    stats = dict(stats)
+                    stats["v"] = 0
+                if col_map.get("air_date") and not str((stats or {}).get("air_date", "") or "").strip():
+                    locked_log(f"[{tab_name}] Dòng {row_idx}: có số liệu nhưng chưa tách được air date")
+                row_updates = build_row_updates(col_map, platform, now_str, stats)
+                update_values = {field: value for field, _, value in row_updates}
+                with state_lock:
+                    set_pending_updates(row_idx, row_updates, runtime_state)
+                sheet_requests = []
+                for field, col_idx, value in row_updates:
+                    value = normalize_cell_value(field, value)
+                    if isinstance(value, (int, float)):
+                        cell_value = {"numberValue": value}
+                        sheet_requests.append({
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": ws.id,
+                                    "startRowIndex": row_idx - 1,
+                                    "endRowIndex": row_idx,
+                                    "startColumnIndex": col_idx - 1,
+                                    "endColumnIndex": col_idx,
+                                },
+                                "cell": {
+                                    "userEnteredValue": cell_value,
+                                    "userEnteredFormat": {
+                                        "numberFormat": {
+                                            "type": "NUMBER",
+                                            "pattern": "#,##0",
+                                        }
+                                    },
+                                },
+                                "fields": "userEnteredValue,userEnteredFormat.numberFormat",
+                            }
+                        })
+                    else:
+                        cell_value = {"stringValue": str(value)}
+                        sheet_requests.append({
+                            "repeatCell": {
+                                "range": {
+                                    "sheetId": ws.id,
+                                    "startRowIndex": row_idx - 1,
+                                    "endRowIndex": row_idx,
+                                    "startColumnIndex": col_idx - 1,
+                                    "endColumnIndex": col_idx,
+                                },
+                                "cell": {"userEnteredValue": cell_value},
+                                "fields": "userEnteredValue",
+                            }
+                        })
+                if sheet_requests:
+                    _reqs = sheet_requests
+                    retry_with_backoff(
+                        lambda: ws.spreadsheet.batch_update({"requests": _reqs}),
+                        max_retries=3,
+                        handle_quota=True
+                    )
+                red_fields = []
+                if ENABLE_SUCCESS_METRIC_ZERO_CHECK:
+                    red_fields = get_red_metric_fields_from_sheet(ws, row_idx, col_map, url, platform)
+                    update_metric_highlights(ws, row_idx, col_map, red_fields)
+                with state_lock:
+                    run_rows_snapshot.append(
+                        {
+                            "tab": tab_name,
+                            "row": row_idx,
+                            "platform": platform,
+                            "url": url,
+                            "status": "success",
+                            "reason": "",
+                            "date": str(update_values.get("air_date") or update_values.get("date") or ""),
+                            "view": parse_metric_number(update_values.get("view")),
+                            "like": parse_metric_number(update_values.get("like")),
+                            "share": parse_metric_number(update_values.get("share")),
+                            "comment": parse_metric_number(update_values.get("comment")),
+                            "buzz": parse_metric_number(update_values.get("buzz")),
+                        }
+                    )
+                    if red_fields:
+                        logger(f"[{tab_name}] Dòng {row_idx}: {', '.join(f.upper() for f in red_fields)} đang bằng 0/trống nên đã tô đỏ")
+                    logger(
+                        f"[{tab_name}] Dòng {row_idx}: "
+                        + ("Cập nhật thành công sau lượt quét lại" if rescued else "Cập nhật thành công")
+                    )
+                    shared["success"] += 1
+
+            def record_row_failure(row_idx: int, platform: str, url: str, reason: str = "Không lấy được số liệu"):
+                add_failed_item(tab_name, row_idx, platform, url, reason, runtime_state, sheet_id=tab_sheet_id)
+                if ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE:
+                    red_fields = get_red_metric_fields_from_sheet(ws, row_idx, col_map, url, platform)
+                    update_metric_highlights(ws, row_idx, col_map, red_fields)
+                locked_log(f"[{tab_name}] Dòng {row_idx}: {reason}")
+                with state_lock:
+                    run_rows_snapshot.append(
+                        {
+                            "tab": tab_name,
+                            "row": row_idx,
+                            "platform": platform,
+                            "url": url,
+                            "status": "failed",
+                            "reason": reason,
+                            "date": "",
+                            "view": 0,
+                            "like": 0,
+                            "share": 0,
+                            "comment": 0,
+                            "buzz": 0,
+                        }
+                    )
+                    shared["failed"] += 1
+
             locked_log(f"[{tab_name}] ▶ Bắt đầu thread quét {len(row_plan)} bài...")
             try:
                 for i, target, url in row_plan:
@@ -6979,113 +7094,10 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         runtime_state["current_task"] = f"[{tab_name}] Dòng {i}: {platform}"
                     locked_log(f"[{tab_name}] Dòng {i}: {platform}...")
                     stats = fetch_stats_with_row_retry(i, url, platform)
-                    if stats and "v" not in stats and is_optional_view_metric(url, platform):
-                        stats = dict(stats)
-                        stats["v"] = 0
                     if stats and runtime_state["is_running"]:
-                        if col_map.get("air_date") and not str((stats or {}).get("air_date", "") or "").strip():
-                            locked_log(f"[{tab_name}] Dòng {i}: có số liệu nhưng chưa tách được air date")
-                        row_updates = build_row_updates(col_map, platform, now_str, stats)
-                        update_values = {field: value for field, _, value in row_updates}
-                        with state_lock:
-                            set_pending_updates(i, row_updates, runtime_state)
-                        sheet_requests = []
-                        for field, col_idx, value in row_updates:
-                            value = normalize_cell_value(field, value)
-                            if isinstance(value, (int, float)):
-                                cell_value = {"numberValue": value}
-                                sheet_requests.append({
-                                    "repeatCell": {
-                                        "range": {
-                                            "sheetId": ws.id,
-                                            "startRowIndex": i - 1,
-                                            "endRowIndex": i,
-                                            "startColumnIndex": col_idx - 1,
-                                            "endColumnIndex": col_idx,
-                                        },
-                                        "cell": {
-                                            "userEnteredValue": cell_value,
-                                            "userEnteredFormat": {
-                                                "numberFormat": {
-                                                    "type": "NUMBER",
-                                                    "pattern": "#,##0",
-                                                }
-                                            },
-                                        },
-                                        "fields": "userEnteredValue,userEnteredFormat.numberFormat",
-                                    }
-                                })
-                            else:
-                                cell_value = {"stringValue": str(value)}
-                                sheet_requests.append({
-                                    "repeatCell": {
-                                        "range": {
-                                            "sheetId": ws.id,
-                                            "startRowIndex": i - 1,
-                                            "endRowIndex": i,
-                                            "startColumnIndex": col_idx - 1,
-                                            "endColumnIndex": col_idx,
-                                        },
-                                        "cell": {"userEnteredValue": cell_value},
-                                        "fields": "userEnteredValue",
-                                    }
-                                })
-                        if sheet_requests:
-                            _reqs = sheet_requests
-                            retry_with_backoff(
-                                lambda: ws.spreadsheet.batch_update({"requests": _reqs}),
-                                max_retries=3,
-                                handle_quota=True
-                            )
-                        red_fields = []
-                        if ENABLE_SUCCESS_METRIC_ZERO_CHECK:
-                            red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
-                            update_metric_highlights(ws, i, col_map, red_fields)
-                        with state_lock:
-                            run_rows_snapshot.append(
-                                {
-                                    "tab": tab_name,
-                                    "row": i,
-                                    "platform": platform,
-                                    "url": url,
-                                    "status": "success",
-                                    "reason": "",
-                                    "date": str(update_values.get("air_date") or update_values.get("date") or ""),
-                                    "view": parse_metric_number(update_values.get("view")),
-                                    "like": parse_metric_number(update_values.get("like")),
-                                    "share": parse_metric_number(update_values.get("share")),
-                                    "comment": parse_metric_number(update_values.get("comment")),
-                                    "buzz": parse_metric_number(update_values.get("buzz")),
-                                }
-                            )
-                            if red_fields:
-                                logger(f"[{tab_name}] Dòng {i}: {', '.join(f.upper() for f in red_fields)} đang bằng 0/trống nên đã tô đỏ")
-                            logger(f"[{tab_name}] Dòng {i}: Cập nhật thành công")
-                            shared["success"] += 1
+                        record_row_success(i, platform, url, stats)
                     elif runtime_state["is_running"]:
-                        add_failed_item(tab_name, i, platform, url, "Không lấy được số liệu", runtime_state, sheet_id=tab_sheet_id)
-                        if ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE:
-                            red_fields = get_red_metric_fields_from_sheet(ws, i, col_map, url, platform)
-                            update_metric_highlights(ws, i, col_map, red_fields)
-                        locked_log(f"[{tab_name}] Dòng {i}: Không lấy được số liệu")
-                        with state_lock:
-                            run_rows_snapshot.append(
-                                {
-                                    "tab": tab_name,
-                                    "row": i,
-                                    "platform": platform,
-                                    "url": url,
-                                    "status": "failed",
-                                    "reason": "Không lấy được số liệu",
-                                    "date": "",
-                                    "view": 0,
-                                    "like": 0,
-                                    "share": 0,
-                                    "comment": 0,
-                                    "buzz": 0,
-                                }
-                            )
-                            shared["failed"] += 1
+                        deferred_failed_rows.append((i, target, url, platform))
                     with state_lock:
                         shared["processed"] += 1
                         runtime_state["schedule_last_run_processed"] = shared["processed"]
@@ -7096,6 +7108,32 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         if tp:
                             tp["current"] = tp.get("current", 0) + 1
                     time.sleep(max(0.0, ROW_SCAN_DELAY_SECONDS))
+                if runtime_state["is_running"] and deferred_failed_rows and FAILED_ROW_RETRY_PASSES > 0:
+                    locked_log(f"[{tab_name}] Quét lại {len(deferred_failed_rows)} dòng còn thiếu số liệu...")
+                    remaining_rows = list(deferred_failed_rows)
+                    for retry_pass in range(FAILED_ROW_RETRY_PASSES):
+                        if not remaining_rows or not runtime_state["is_running"]:
+                            break
+                        restart_tab_driver("Làm mới driver trước lượt quét lại các dòng lỗi...")
+                        if FAILED_ROW_RETRY_DELAY_SECONDS > 0:
+                            time.sleep(FAILED_ROW_RETRY_DELAY_SECONDS)
+                        next_remaining_rows = []
+                        for row_idx, target, url, platform in remaining_rows:
+                            if not runtime_state["is_running"]:
+                                break
+                            with state_lock:
+                                runtime_state["current_task"] = f"[{tab_name}] Dòng {row_idx}: quét lại"
+                            locked_log(f"[{tab_name}] Dòng {row_idx}: quét lại lượt cuối {retry_pass + 1}/{FAILED_ROW_RETRY_PASSES}...")
+                            stats = fetch_stats_with_row_retry(row_idx, url, platform)
+                            if stats and runtime_state["is_running"]:
+                                record_row_success(row_idx, platform, url, stats, rescued=True)
+                            else:
+                                next_remaining_rows.append((row_idx, target, url, platform))
+                        remaining_rows = next_remaining_rows
+                    deferred_failed_rows = remaining_rows
+                if runtime_state["is_running"] and deferred_failed_rows:
+                    for row_idx, target, url, platform in deferred_failed_rows:
+                        record_row_failure(row_idx, platform, url)
                 # Mark this tab's final status
                 with state_lock:
                     tp = runtime_state["tab_progress"].get(tab_name)
