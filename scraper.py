@@ -198,6 +198,8 @@ GMAIL_SMTP_APP_PASSWORD = "btqtzotpeyhnzzac"
 GMAIL_SMTP_FROM_EMAIL = "fanscom.ecom@gmail.com"
 YOUTUBE_API_KEY = "AIzaSyAbMDEzmIVpsVTASYhTaXI6oC7BudQWzlU"
 ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.0"))
+ROW_SCRAPE_RETRY_ATTEMPTS = max(0, int(os.getenv("ROW_SCRAPE_RETRY_ATTEMPTS", "1")))
+ROW_SCRAPE_RETRY_DELAY_SECONDS = max(0.0, float(os.getenv("ROW_SCRAPE_RETRY_DELAY_SECONDS", "1.2")))
 POSTS_TAB_BUILD_STAGGER_SECONDS = max(0.0, float(os.getenv("POSTS_TAB_BUILD_STAGGER_SECONDS", "0.0")))
 POSTS_LAYOUT_SAMPLE_ROWS = max(10, int(os.getenv("POSTS_LAYOUT_SAMPLE_ROWS", "24")))
 POSTS_LAYOUT_USE_CACHE = str(os.getenv("POSTS_LAYOUT_USE_CACHE", "true")).strip().lower() in {"1", "true", "yes", "on"}
@@ -6883,6 +6885,90 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                 with state_lock:
                     logger(msg)
 
+            def ensure_tab_driver():
+                nonlocal tab_driver, tab_driver_failed
+                if tab_driver is None and not tab_driver_failed:
+                    try:
+                        tab_driver = create_selenium_driver(logger=locked_log)
+                    except Exception as driver_error:
+                        if LOCAL_DRIVER_FAIL_FAST:
+                            tab_driver_failed = True
+                            locked_log(
+                                f"[{tab_name}] ❌ Driver fail-fast (local): {str(driver_error)[:120]}. "
+                                f"Bỏ qua {len(row_plan)} bài của tab này để tránh chạy chập chờn."
+                            )
+                        else:
+                            locked_log(f"[{tab_name}] ⚠️ Driver tạo thất bại, thử lại sau 5s: {str(driver_error)[:80]}")
+                            time.sleep(5)
+                            try:
+                                tab_driver = create_selenium_driver(logger=locked_log)
+                            except Exception as retry_err:
+                                tab_driver_failed = True
+                                locked_log(
+                                    f"[{tab_name}] ❌ Không tạo được driver sau 2 lần thử. "
+                                    f"{len(row_plan)} bài sẽ bị bỏ qua. Lỗi: {str(retry_err)[:100]}"
+                                )
+                return None if tab_driver_failed else tab_driver
+
+            def restart_tab_driver(reason: str = ""):
+                nonlocal tab_driver, tab_driver_failed
+                if tab_driver is not None:
+                    close_selenium_driver(tab_driver)
+                tab_driver = None
+                tab_driver_failed = False
+                if reason:
+                    locked_log(f"[{tab_name}] {reason}")
+
+            def fetch_stats_with_row_retry(row_idx: int, url: str, platform: str):
+                nonlocal tab_driver, tab_driver_failed
+                if platform == "YouTube":
+                    return get_youtube_stats(url)
+
+                platform_key = str(platform or "").strip().lower()
+                retryable_platforms = {"tiktok", "facebook", "instagram"}
+                restartable_platforms = {"tiktok", "facebook", "instagram"}
+                extra_attempts = ROW_SCRAPE_RETRY_ATTEMPTS if platform_key in retryable_platforms else 0
+                total_attempts = 1 + extra_attempts
+
+                for attempt_index in range(total_attempts):
+                    current_driver = ensure_tab_driver()
+                    if tab_driver_failed or current_driver is None:
+                        return None
+                    try:
+                        stats = get_social_stats(url, platform, driver=current_driver, logger=locked_log)
+                        if tab_driver is not None and getattr(tab_driver, "_needs_restart", False):
+                            restart_tab_driver("Driver bị treo sau timeout, đang restart để chạy tiếp...")
+                        if stats:
+                            if attempt_index > 0:
+                                locked_log(f"[{tab_name}] Dòng {row_idx}: retry lần {attempt_index}/{extra_attempts} đã lấy được số liệu")
+                            return stats
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if "invalid session" in error_msg or "session id" in error_msg:
+                            restart_tab_driver("Driver session invalid, đang restart...")
+                            try:
+                                current_driver = ensure_tab_driver()
+                                if current_driver is not None and not tab_driver_failed:
+                                    stats = get_social_stats(url, platform, driver=current_driver, logger=locked_log)
+                                    if stats:
+                                        if attempt_index > 0:
+                                            locked_log(f"[{tab_name}] Dòng {row_idx}: retry lần {attempt_index}/{extra_attempts} đã lấy được số liệu")
+                                        return stats
+                            except Exception as retry_e:
+                                locked_log(f"[{tab_name}] Retry thất bại: {str(retry_e)[:80]}")
+                        else:
+                            locked_log(f"[{tab_name}] Selenium error: {str(e)[:80]}")
+                    if attempt_index >= total_attempts - 1 or not runtime_state["is_running"]:
+                        break
+                    locked_log(
+                        f"[{tab_name}] Dòng {row_idx}: chưa lấy được số liệu, thử lại lần {attempt_index + 1}/{extra_attempts}..."
+                    )
+                    if platform_key in restartable_platforms:
+                        restart_tab_driver("Khởi động lại driver trước khi retry dòng hiện tại...")
+                    if ROW_SCRAPE_RETRY_DELAY_SECONDS > 0:
+                        time.sleep(ROW_SCRAPE_RETRY_DELAY_SECONDS)
+                return None
+
             locked_log(f"[{tab_name}] ▶ Bắt đầu thread quét {len(row_plan)} bài...")
             try:
                 for i, target, url in row_plan:
@@ -6892,53 +6978,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     with state_lock:
                         runtime_state["current_task"] = f"[{tab_name}] Dòng {i}: {platform}"
                     locked_log(f"[{tab_name}] Dòng {i}: {platform}...")
-                    if platform == "YouTube":
-                        stats = get_youtube_stats(url)
-                    else:
-                        if tab_driver is None and not tab_driver_failed:
-                            try:
-                                tab_driver = create_selenium_driver(logger=locked_log)
-                            except Exception as driver_error:
-                                if LOCAL_DRIVER_FAIL_FAST:
-                                    tab_driver_failed = True
-                                    locked_log(
-                                        f"[{tab_name}] ❌ Driver fail-fast (local): {str(driver_error)[:120]}. "
-                                        f"Bỏ qua {len(row_plan)} bài của tab này để tránh chạy chập chờn."
-                                    )
-                                else:
-                                    # Retry once after a short delay (parallel threads may compete for resources)
-                                    locked_log(f"[{tab_name}] ⚠️ Driver tạo thất bại, thử lại sau 5s: {str(driver_error)[:80]}")
-                                    time.sleep(5)
-                                    try:
-                                        tab_driver = create_selenium_driver(logger=locked_log)
-                                    except Exception as retry_err:
-                                        tab_driver_failed = True
-                                        locked_log(f"[{tab_name}] ❌ Không tạo được driver sau 2 lần thử. {len(row_plan)} bài sẽ bị bỏ qua. Lỗi: {str(retry_err)[:100]}")
-                        if not tab_driver_failed:
-                            try:
-                                stats = get_social_stats(url, platform, driver=tab_driver, logger=locked_log)
-                                if tab_driver is not None and getattr(tab_driver, "_needs_restart", False):
-                                    locked_log(f"[{tab_name}] Driver bị treo sau timeout, đang restart để chạy tiếp...")
-                                    close_selenium_driver(tab_driver)
-                                    tab_driver = None
-                                    tab_driver = create_selenium_driver(logger=locked_log)
-                            except Exception as e:
-                                error_msg = str(e).lower()
-                                if "invalid session" in error_msg or "session id" in error_msg:
-                                    locked_log(f"[{tab_name}] Driver session invalid, đang restart...")
-                                    close_selenium_driver(tab_driver)
-                                    tab_driver = None
-                                    try:
-                                        tab_driver = create_selenium_driver(logger=locked_log)
-                                        stats = get_social_stats(url, platform, driver=tab_driver, logger=locked_log)
-                                    except Exception as retry_e:
-                                        locked_log(f"[{tab_name}] Retry thất bại: {str(retry_e)[:80]}")
-                                        stats = None
-                                else:
-                                    locked_log(f"[{tab_name}] Selenium error: {str(e)[:80]}")
-                                    stats = None
-                        else:
-                            stats = None
+                    stats = fetch_stats_with_row_retry(i, url, platform)
                     if stats and "v" not in stats and is_optional_view_metric(url, platform):
                         stats = dict(stats)
                         stats["v"] = 0
