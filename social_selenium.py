@@ -28,10 +28,10 @@ def _env_float(name: str, default: float, min_value: float) -> float:
         return default
 
 
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 20.0, 5.0)
-TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 16.0, 3.0)
-FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 18.0, 3.0)
-INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 10.0, 3.0)
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 14.0, 5.0)
+TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 12.0, 3.0)
+FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 12.0, 3.0)
+INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 9.0, 3.0)
 TIKTOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_TIKTOK_SOFT_RETRY_ATTEMPTS", 1.0, 0.0))
 TIKTOK_SOFT_RETRY_DELAY_SECONDS = _env_float("SELENIUM_TIKTOK_SOFT_RETRY_DELAY_SECONDS", 1.0, 0.0)
 FACEBOOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_FACEBOOK_SOFT_RETRY_ATTEMPTS", 1.0, 0.0))
@@ -42,14 +42,16 @@ TIMEOUT_RECOVERY_RETRY_ATTEMPTS = int(_env_float("SELENIUM_TIMEOUT_RECOVERY_RETR
 TIMEOUT_RECOVERY_RETRY_DELAY_SECONDS = _env_float("SELENIUM_TIMEOUT_RECOVERY_RETRY_DELAY_SECONDS", 0.8, 0.0)
 TIKTOK_TIMEOUT_STREAK_THRESHOLD = max(1, int(_env_float("SELENIUM_TIKTOK_TIMEOUT_STREAK_THRESHOLD", 2.0, 1.0)))
 TIKTOK_TIMEOUT_COOLDOWN_SECONDS = _env_float("SELENIUM_TIKTOK_TIMEOUT_COOLDOWN_SECONDS", 45.0, 5.0)
-DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.7, 0.1)
-READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
+DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.5, 0.1)
+READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.15, 0.05)
 READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
 TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS", 12.0, 5.0)
 TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS", 0.8, 0.2)
 TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS = _env_float("TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS", 26.0, 8.0)
 TIKTOK_AUTO_WAIT_POLL_SECONDS = _env_float("TIKTOK_AUTO_WAIT_POLL_SECONDS", 1.0, 0.2)
 TIKTOK_VISUAL_RETRY_WAIT_SECONDS = _env_float("TIKTOK_VISUAL_RETRY_WAIT_SECONDS", 18.0, 5.0)
+TIKTOK_NO_SESSION_AUTO_WAIT_TIMEOUT_SECONDS = _env_float("TIKTOK_NO_SESSION_AUTO_WAIT_TIMEOUT_SECONDS", 12.0, 5.0)
+TIKTOK_NO_SESSION_VISUAL_RETRY_WAIT_SECONDS = _env_float("TIKTOK_NO_SESSION_VISUAL_RETRY_WAIT_SECONDS", 8.0, 3.0)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -354,6 +356,13 @@ def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = Non
         _emit(logger, "Không nạp được cookie TikTok nào vào browser session.")
     if "login" in current_url.lower():
         _emit(logger, "Sau khi nạp cookie, TikTok vẫn trả về trạng thái login/challenge.")
+
+
+def _has_tiktok_session_config() -> bool:
+    if CHROME_USER_DATA_DIR:
+        return True
+    raw, _ = _load_cookie_payload("TT_COOKIES_JSON", "TT_COOKIES_FILE")
+    return bool(str(raw or "").strip())
 
 
 def _load_ig_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
@@ -2006,9 +2015,13 @@ def _wait_for_tiktok_manual_challenge(
     )
 
     best_bundle = bundle
-    deadline = time.time() + (
-        TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS if auto_wait_mode else TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS
+    has_session_config = _has_tiktok_session_config()
+    auto_wait_timeout = (
+        TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS
+        if has_session_config
+        else min(TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS, TIKTOK_NO_SESSION_AUTO_WAIT_TIMEOUT_SECONDS)
     )
+    deadline = time.time() + (auto_wait_timeout if auto_wait_mode else TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS)
     poll_seconds = TIKTOK_AUTO_WAIT_POLL_SECONDS if auto_wait_mode else TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS
     refresh_attempted = False
     while time.time() < deadline:
@@ -2069,7 +2082,13 @@ def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[
     if best_payload and any(best_payload.get(key) for key in ("v", "l", "s", "c", "save")):
         return best_bundle
 
-    deadline = time.time() + TIKTOK_VISUAL_RETRY_WAIT_SECONDS
+    has_session_config = _has_tiktok_session_config()
+    visual_retry_wait_seconds = (
+        TIKTOK_VISUAL_RETRY_WAIT_SECONDS
+        if has_session_config
+        else min(TIKTOK_VISUAL_RETRY_WAIT_SECONDS, TIKTOK_NO_SESSION_VISUAL_RETRY_WAIT_SECONDS)
+    )
+    deadline = time.time() + visual_retry_wait_seconds
     refreshed_once = False
     while time.time() < deadline:
         time.sleep(1)
