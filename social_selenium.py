@@ -1319,6 +1319,18 @@ def _payload_has_tiktok_signal(payload) -> bool:
     return signal_count >= 2
 
 
+def _payload_has_metric_signal(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    for key in ("v", "l", "s", "c", "save"):
+        try:
+            if int(payload.get(key) or 0) > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _extract_tiktok_caption(bundle) -> str:
     metas = bundle.get("metas", {}) or {}
     title = str(bundle.get("title") or "").strip()
@@ -2125,7 +2137,6 @@ def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[
 
 def _retry_tiktok_with_visible_browser(url: str, logger: Optional[Callable[[str], None]] = None):
     retry_driver = None
-    best_payload = None
     if not _can_use_visible_browser_retry():
         _emit(logger, "Bỏ qua TikTok visual retry: môi trường hiện tại không hỗ trợ Chrome thường ổn định.")
         return None
@@ -2136,13 +2147,13 @@ def _retry_tiktok_with_visible_browser(url: str, logger: Optional[Callable[[str]
         retry_payload = _extract_tiktok(retry_bundle)
         if retry_payload and any(retry_payload.get(key) for key in ("v", "l", "s", "c", "save")):
             return retry_payload
-        if retry_payload:
-            best_payload = retry_payload
+        if retry_payload and (retry_payload.get("cap") or retry_payload.get("air_date")):
+            _emit(logger, "TikTok visual retry mới chỉ đọc được metadata, sẽ coi như chưa lấy được metric.")
     except Exception as exc:
         _emit(logger, f"Retry TikTok visual thất bại: {str(exc)[:160]}")
     finally:
         close_selenium_driver(retry_driver)
-    return best_payload
+    return None
 
 
 def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Optional[Callable[[str], None]] = None):
@@ -2220,6 +2231,10 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if not extractor:
             return None
         payload = extractor(bundle)
+        if platform == "tiktok" and payload and not _payload_has_metric_signal(payload):
+            if payload.get("cap") or payload.get("air_date"):
+                _emit(logger, "TikTok mới chỉ đọc được metadata, tiếp tục retry để lấy metric thật...")
+            payload = None
         if platform == "tiktok" and not payload and TIKTOK_SOFT_RETRY_ATTEMPTS > 0:
             for attempt in range(1, TIKTOK_SOFT_RETRY_ATTEMPTS + 1):
                 if TIKTOK_SOFT_RETRY_DELAY_SECONDS > 0:
@@ -2227,6 +2242,8 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 _emit(logger, f"TikTok retry ngắn lần {attempt}/{TIKTOK_SOFT_RETRY_ATTEMPTS}...")
                 retry_bundle = _collect_page_bundle(driver, url, logger=logger)
                 retry_payload = extractor(retry_bundle)
+                if retry_payload and not _payload_has_metric_signal(retry_payload):
+                    retry_payload = None
                 if retry_payload:
                     bundle = retry_bundle
                     payload = retry_payload
@@ -2255,6 +2272,8 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                     break
         if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
+            if retry_payload and not _payload_has_metric_signal(retry_payload):
+                retry_payload = None
             if retry_payload:
                 payload = retry_payload
         if not payload:
@@ -2272,6 +2291,8 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
             if fallback_bundle:
                 try:
                     payload = extractor(fallback_bundle)
+                    if payload and not _payload_has_metric_signal(payload):
+                        payload = None
                     if payload:
                         bundle = fallback_bundle
                         _emit(logger, f"{platform.capitalize()} lấy được dữ liệu qua fallback requests.")
