@@ -1359,6 +1359,24 @@ def _should_reject_tiktok_low_confidence_payload(payload) -> bool:
     return not _has_tiktok_session_config()
 
 
+def _is_tiktok_photo_bundle(bundle, item=None, detail=None) -> bool:
+    raw_url = str((bundle or {}).get("url") or "").strip().lower()
+    if "/photo/" in raw_url:
+        return True
+    source_lower = str((bundle or {}).get("source") or "").lower()
+    if any(marker in source_lower for marker in ('"imagepost"', "tplv-photomode-image", "tos-alisg-i-photomode", '"slideshow"')):
+        return True
+    for node in (item, detail):
+        if not isinstance(node, dict):
+            continue
+        if node.get("imagePost") or node.get("imagePostInfo") or node.get("image_post"):
+            return True
+        text_blob = json.dumps(node, ensure_ascii=False).lower()
+        if any(marker in text_blob for marker in ("photomode", "imagepost", "slideshow")):
+            return True
+    return False
+
+
 def _extract_tiktok_caption(bundle) -> str:
     metas = bundle.get("metas", {}) or {}
     title = str(bundle.get("title") or "").strip()
@@ -1470,6 +1488,7 @@ def _extract_tiktok_photo_from_text(bundle):
     payload = {
         "v": 0,
         "cap": _extract_tiktok_caption(bundle),
+        "_photo_mode": True,
     }
     creator = _extract_tiktok_creator(bundle)
     if creator:
@@ -1518,6 +1537,7 @@ def _extract_tiktok_photo_from_text(bundle):
         return None
 
     payload = {"v": 0, "cap": _extract_tiktok_caption(bundle)}
+    payload["_photo_mode"] = True
     creator = _extract_tiktok_creator(bundle)
     if creator:
         payload["creator"] = creator
@@ -1575,12 +1595,13 @@ def _extract_tiktok(bundle):
     source = bundle["source"]
     metas = bundle["metas"]
     target_post_id = _extract_url_group(bundle.get("url", ""), r"/(?:video|photo)/(\d+)")
-    is_photo_post = "/photo/" in (bundle.get("url", "") or "").lower()
+    is_photo_post = _is_tiktok_photo_bundle(bundle)
 
     for data in _iter_json_script_payloads(source, required_substring="webapp.video-detail"):
         scope = data.get("__DEFAULT_SCOPE__", {}) if isinstance(data, dict) else {}
         detail = scope.get("webapp.video-detail", {}) if isinstance(scope, dict) else {}
         item = detail.get("itemInfo", {}).get("itemStruct", {}) if isinstance(detail, dict) else {}
+        is_photo_post = _is_tiktok_photo_bundle(bundle, item=item, detail=detail) or is_photo_post
         item_target_id = str(item.get("id") or item.get("awemeId") or "")
         if target_post_id and item_target_id and item_target_id != target_post_id:
             continue
@@ -1621,6 +1642,17 @@ def _extract_tiktok(bundle):
             payload["_warning"] = (
                 f"TikTok video {warning_text}. TikTok web public có thể chỉ trả số liệu giới hạn, nên các chỉ số có thể lệch."
             )
+        if is_photo_post:
+            payload["_photo_mode"] = True
+            if not any(payload.get(key) for key in ("l", "s", "c", "save")):
+                text_payload = _extract_tiktok_photo_from_text(bundle)
+                if text_payload and any(text_payload.get(key) for key in ("l", "s", "c", "save")):
+                    text_payload.setdefault("creator", payload.get("creator"))
+                    text_payload.setdefault("cap", payload.get("cap"))
+                    text_payload.setdefault("air_date", payload.get("air_date"))
+                    if payload.get("_warning"):
+                        text_payload["_warning"] = payload.get("_warning")
+                    return text_payload
         if any(payload.get(key) for key in ("v", "l", "s", "c", "save")) or payload.get("cap") or payload.get("air_date"):
             return payload
 

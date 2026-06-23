@@ -7053,7 +7053,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                 return None
 
             def record_row_success(row_idx: int, platform: str, url: str, stats, rescued: bool = False):
-                if stats and "v" not in stats and is_optional_view_metric(url, platform):
+                if stats and "v" not in stats and (is_optional_view_metric(url, platform) or stats.get("_photo_mode")):
                     stats = dict(stats)
                     stats["v"] = 0
                 if col_map.get("air_date") and not str((stats or {}).get("air_date", "") or "").strip():
