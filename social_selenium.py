@@ -1351,6 +1351,14 @@ def _payload_has_metric_signal(payload) -> bool:
     return False
 
 
+def _should_reject_tiktok_low_confidence_payload(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if not payload.get("_warning"):
+        return False
+    return not _has_tiktok_session_config()
+
+
 def _extract_tiktok_caption(bundle) -> str:
     metas = bundle.get("metas", {}) or {}
     title = str(bundle.get("title") or "").strip()
@@ -2251,6 +2259,12 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if not extractor:
             return None
         payload = extractor(bundle)
+        if platform == "tiktok" and payload and _should_reject_tiktok_low_confidence_payload(payload):
+            _emit(
+                logger,
+                "TikTok video gắn shop/quảng cáo đang chỉ trả số public dễ lệch. Bỏ qua kết quả này để tránh ghi sai; cần TT cookies/profile để lấy chính xác hơn.",
+            )
+            payload = None
         if platform == "tiktok" and payload and not _payload_has_metric_signal(payload):
             if payload.get("cap") or payload.get("air_date"):
                 _emit(logger, "TikTok mới chỉ đọc được metadata, tiếp tục retry để lấy metric thật...")
@@ -2262,6 +2276,8 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 _emit(logger, f"TikTok retry ngắn lần {attempt}/{TIKTOK_SOFT_RETRY_ATTEMPTS}...")
                 retry_bundle = _collect_page_bundle(driver, url, logger=logger)
                 retry_payload = extractor(retry_bundle)
+                if retry_payload and _should_reject_tiktok_low_confidence_payload(retry_payload):
+                    retry_payload = None
                 if retry_payload and not _payload_has_metric_signal(retry_payload):
                     retry_payload = None
                 if retry_payload:
@@ -2294,6 +2310,12 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
             embed_bundle = _collect_tiktok_embed_bundle(url, logger=logger)
             if embed_bundle:
                 embed_payload = extractor(embed_bundle)
+                if embed_payload and _should_reject_tiktok_low_confidence_payload(embed_payload):
+                    _emit(
+                        logger,
+                        "TikTok embed fallback chỉ trả số public giới hạn cho video shop/quảng cáo, bỏ qua để tránh ghi sai.",
+                    )
+                    embed_payload = None
                 if embed_payload and not _payload_has_metric_signal(embed_payload):
                     embed_payload = None
                 if embed_payload:
@@ -2302,6 +2324,8 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                     _emit(logger, "TikTok lấy được dữ liệu qua embed fallback.")
         if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
+            if retry_payload and _should_reject_tiktok_low_confidence_payload(retry_payload):
+                retry_payload = None
             if retry_payload and not _payload_has_metric_signal(retry_payload):
                 retry_payload = None
             if retry_payload:
@@ -2321,6 +2345,8 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
             if fallback_bundle:
                 try:
                     payload = extractor(fallback_bundle)
+                    if payload and _should_reject_tiktok_low_confidence_payload(payload):
+                        payload = None
                     if payload and not _payload_has_metric_signal(payload):
                         payload = None
                     if payload:
