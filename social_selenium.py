@@ -2294,8 +2294,13 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if platform == "tiktok":
             _TIKTOK_TIMEOUT_STREAK = 0
             _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
-        if has_signal or payload.get("cap") or payload.get("air_date"):
+        if has_signal:
             return payload
+        if payload.get("cap") or payload.get("air_date"):
+            _emit(
+                logger,
+                f"{platform.capitalize()} chỉ đọc được metadata (caption/ngày), chưa lấy được số liệu metric nên sẽ bỏ qua dòng này.",
+            )
         return None
     except WebDriverException as exc:
         error_text = str(exc)
