@@ -2373,7 +2373,11 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 _emit(logger, "Instagram đang trả về trang login/chặn truy cập nên khó đọc số liệu công khai.")
             if platform == "tiktok" and ("login" in low_url or "verify" in low_url or "captcha" in low_title):
                 _emit(logger, "TikTok đang trả về challenge/login nên khó đọc số liệu công khai.")
-            fallback_bundle = _collect_page_bundle_via_requests(url, platform, logger=logger)
+            if platform == "tiktok":
+                fallback_bundle = None
+                _emit(logger, "Bỏ qua fallback requests cho TikTok vì nguồn public này dễ trả sai metric.")
+            else:
+                fallback_bundle = _collect_page_bundle_via_requests(url, platform, logger=logger)
             if fallback_bundle:
                 try:
                     payload = extractor(fallback_bundle)
@@ -2388,7 +2392,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                     payload = None
         if not payload:
             return None
-        if platform != "facebook" and not str(payload.get("air_date") or "").strip():
+        if platform not in {"facebook", "tiktok"} and not str(payload.get("air_date") or "").strip():
             fallback_air_date = _extract_air_date_from_bundle(
                 bundle,
                 prefer_source_datetime=False,
