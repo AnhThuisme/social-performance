@@ -945,6 +945,26 @@ def _extract_url_group(url: str, pattern: str) -> str:
     return match.group(1) if match else ""
 
 
+def _extract_tiktok_video_id(url: str) -> str:
+    return _extract_url_group(url, r"/video/(\d+)")
+
+
+def _collect_tiktok_embed_bundle(url: str, logger: Optional[Callable[[str], None]] = None):
+    video_id = _extract_tiktok_video_id(url)
+    if not video_id:
+        return None
+    embed_urls = [
+        f"https://www.tiktok.com/embed/v2/{video_id}",
+        f"https://www.tiktok.com/embed/{video_id}",
+    ]
+    for embed_url in embed_urls:
+        bundle = _collect_page_bundle_via_requests(embed_url, "tiktok", logger=logger)
+        if bundle:
+            bundle["_tiktok_embed_url"] = embed_url
+            return bundle
+    return None
+
+
 def _iter_json_nodes(node):
     if isinstance(node, dict):
         yield node
@@ -2270,6 +2290,16 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                     bundle = retry_bundle
                     payload = retry_payload
                     break
+        if platform == "tiktok" and not payload:
+            embed_bundle = _collect_tiktok_embed_bundle(url, logger=logger)
+            if embed_bundle:
+                embed_payload = extractor(embed_bundle)
+                if embed_payload and not _payload_has_metric_signal(embed_payload):
+                    embed_payload = None
+                if embed_payload:
+                    bundle = embed_bundle
+                    payload = embed_payload
+                    _emit(logger, "TikTok lấy được dữ liệu qua embed fallback.")
         if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
             if retry_payload and not _payload_has_metric_signal(retry_payload):
