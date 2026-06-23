@@ -946,11 +946,14 @@ def _extract_url_group(url: str, pattern: str) -> str:
 
 
 def _extract_tiktok_video_id(url: str) -> str:
-    return _extract_url_group(url, r"/video/(\d+)")
+    return _extract_url_group(url, r"/(?:video|photo)/(\d+)")
 
 
 def _collect_tiktok_embed_bundle(url: str, logger: Optional[Callable[[str], None]] = None):
-    video_id = _extract_tiktok_video_id(url)
+    candidate_url = str(url or "").strip()
+    video_id = _extract_tiktok_video_id(candidate_url)
+    if not video_id:
+        video_id = _extract_string(candidate_url, [r"(?:^|[^\d])(\d{18,20})(?:[^\d]|$)"])
     if not video_id:
         return None
     embed_urls = [
@@ -2339,7 +2342,8 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                     payload = retry_payload
                     break
         if platform == "tiktok" and not payload:
-            embed_bundle = _collect_tiktok_embed_bundle(url, logger=logger)
+            embed_target_url = str(bundle.get("url") or "").strip() or str(url or "").strip()
+            embed_bundle = _collect_tiktok_embed_bundle(embed_target_url, logger=logger)
             if embed_bundle:
                 embed_payload = extractor(embed_bundle)
                 if embed_payload and _should_reject_tiktok_low_confidence_payload(embed_payload):
@@ -2353,7 +2357,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 if embed_payload:
                     bundle = embed_bundle
                     payload = embed_payload
-                    _emit(logger, "TikTok lấy được dữ liệu qua embed fallback.")
+                    _emit(logger, f"TikTok lấy được dữ liệu qua embed fallback ({embed_target_url[:100]}).")
         if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
             if retry_payload and _should_reject_tiktok_low_confidence_payload(retry_payload):
