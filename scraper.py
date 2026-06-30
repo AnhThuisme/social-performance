@@ -845,6 +845,143 @@ def cache_posts_sheet_dataset(user_email: str, sheet_id: str, sheet_name: str, d
     }
     persist_dashboard_cache_throttled()
 
+
+def collect_posts_dataset_from_cached_sheet_snapshot(
+    sheet_id: str,
+    sheet_name: str,
+    tab_index: int = 0,
+    sheet_slug: str = "",
+    campaign_override: str = "",
+    include_rows: bool = False,
+    state=None,
+):
+    runtime_state = resolve_runtime_state(state)
+    resolved_sheet_id = str(sheet_id or "").strip()
+    resolved_sheet_name = str(sheet_name or "").strip()
+    if not resolved_sheet_id or not resolved_sheet_name:
+        return None
+
+    cache_key = f"{resolved_sheet_id}:{resolved_sheet_name}"
+    layout_entry = SHEET_LAYOUT_CACHE.get(cache_key) or {}
+    data_entry = SHEET_DATA_CACHE.get(cache_key) or {}
+    layout = dict(layout_entry.get("layout") or {})
+    all_values = data_entry.get("data")
+    if not layout or not isinstance(all_values, list) or not all_values:
+        return None
+
+    header_row = max(1, int(layout.get("header_row") or 1))
+    headers = list(layout.get("headers") or [])
+    if not headers and len(all_values) >= header_row:
+        headers = list(all_values[header_row - 1] or [])
+    unique_headers = build_unique_headers(headers)
+    max_width = max(len(unique_headers), max((len(row) for row in all_values[header_row:]), default=0))
+    if len(unique_headers) < max_width:
+        unique_headers.extend([f"__extra_{idx}" for idx in range(len(unique_headers) + 1, max_width + 1)])
+
+    records = []
+    for row in all_values[header_row:]:
+        padded_row = list(row or []) + [""] * max(0, max_width - len(row or []))
+        record = {unique_headers[idx]: padded_row[idx] for idx in range(max_width)}
+        if include_rows:
+            record["__row_values__"] = padded_row
+        records.append(record)
+
+    sheet_title = resolved_sheet_name or f"Sheet {tab_index + 1}"
+    resolved_sheet_slug = sheet_slug or f"{build_dom_slug(sheet_title, 'sheet')}-{tab_index}"
+    resolved_campaign_override = str(campaign_override or "").strip()
+    platform_counts = {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0}
+    total_posts = 0
+    total_views = 0
+    total_reaction = 0
+    total_share = 0
+    total_comment = 0
+    total_buzz = 0
+    creators = set()
+    campaigns = set()
+    brand_counts = {}
+
+    col_map = apply_column_overrides_for_tab(layout.get("columns"), sheet_title, state=runtime_state)
+    link_header = resolve_header_from_column(headers, col_map.get("link"))
+    campaign_header = resolve_header_from_column(headers, col_map.get("campaign"))
+    start_row = resolve_effective_start_row(header_row, runtime_state)
+
+    for row_idx, record in enumerate(records, start=header_row + 1):
+        if row_idx < start_row:
+            continue
+        normalized_record = {normalize_header(str(key)): value for key, value in (record or {}).items()}
+        link = str(
+            read_record_value_from_column(record, col_map.get("link"))
+            or read_record_value_from_header(record, normalized_record, link_header)
+            or first_nonempty_value(normalized_record, "link", "url", "posturl", "linkpost")
+        ).strip()
+        if not link:
+            continue
+
+        resolved_link = resolve_creator_link(link) if include_rows else link
+        platform = detect_platform(resolved_link or link)
+        platform_key = normalize_header(platform)
+        if platform_key not in platform_counts:
+            platform_key = "khac"
+        platform_counts[platform_key] += 1
+
+        creator = resolve_post_creator_name(normalized_record, resolved_link or link, platform) if include_rows else ""
+        brand_label = extract_brand_label_from_record(normalized_record)
+        campaign = (
+            resolved_campaign_override
+            or str(
+                read_record_value_from_header(record, normalized_record, campaign_header)
+                or first_nonempty_value(normalized_record, "campaign", "chiendich", "camp")
+            ).strip()
+        )
+        view = parse_metric_number(read_record_value_from_column(record, col_map.get("view")) or first_nonempty_value(normalized_record, "view", "views", "luotxem"))
+        reaction = parse_metric_number(read_record_value_from_column(record, col_map.get("like")) or first_nonempty_value(normalized_record, "like", "likes", "reaction", "reactions"))
+        share = parse_metric_number(read_record_value_from_column(record, col_map.get("share")) or first_nonempty_value(normalized_record, "share", "shares"))
+        comment = parse_metric_number(read_record_value_from_column(record, col_map.get("comment")) or first_nonempty_value(normalized_record, "comment", "comments", "cmt"))
+        save = parse_metric_number(read_record_value_from_column(record, col_map.get("save")) or first_nonempty_value(normalized_record, "save", "saves", "saved", "bookmark", "bookmarks", "luu"))
+        buzz_raw = (
+            read_record_value_from_column(record, col_map.get("buzz"))
+            or first_nonempty_value(normalized_record, "buzz", "buzzcount", "totalbuzz", "tongbuzz")
+        )
+        buzz = parse_metric_number(buzz_raw) if str(buzz_raw or "").strip() else compute_buzz_value(platform, share, comment)
+
+        total_posts += 1
+        total_views += view
+        total_reaction += reaction
+        total_share += share
+        total_comment += comment
+        total_buzz += buzz
+        if creator:
+            creators.add(creator)
+        if campaign:
+            campaigns.add(campaign)
+        if brand_label:
+            brand_counts[brand_label] = brand_counts.get(brand_label, 0) + 1
+
+    dominant_brand = ""
+    if brand_counts:
+        dominant_brand = max(sorted(brand_counts), key=lambda key: brand_counts.get(key, 0))
+
+    return {
+        "sheet_title": sheet_title,
+        "sheet_name": resolved_sheet_name,
+        "sheet_slug": resolved_sheet_slug,
+        "sheet_id": resolved_sheet_id,
+        "sheet_gid": "0",
+        "total_posts": total_posts,
+        "total_views": total_views,
+        "total_reaction": total_reaction,
+        "total_share": total_share,
+        "total_comment": total_comment,
+        "total_buzz": total_buzz,
+        "creator_count": len(creators),
+        "campaign_count": len(campaigns),
+        "brand_label": dominant_brand,
+        "platform_counts": platform_counts,
+        "rows_html": "",
+        "error": "",
+        "from_sheet_cache": True,
+    }
+
 def background_refresh_dashboard_data(user_email, section_type):
     """
     section_type: 'overview', 'posts', 'config', or 'schedule'
@@ -6442,29 +6579,57 @@ def build_posts_panel_html(sheet=None, state=None):
                     runtime_state,
                 )
             else:
-                dataset = {
-                    "sheet_title": entry_display_name or entry_sheet_name or f"Sheet {entry_index + 1}",
-                    "sheet_name": entry_sheet_name or f"Sheet {entry_index + 1}",
-                    "sheet_slug": entry_slug,
-                    "sheet_id": entry_sheet_id,
-                    "sheet_gid": entry_sheet_gid,
-                    "campaign_label": entry_campaign_label,
-                    "brand_label": entry_brand_label,
-                    "industry_label": entry_industry_label,
-                    "campaign_description": entry_campaign_description,
-                    "total_posts": 0,
-                    "total_views": 0,
-                    "total_reaction": 0,
-                    "total_share": 0,
-                    "total_comment": 0,
-                    "total_buzz": 0,
-                    "creator_count": 0,
-                    "campaign_count": 0,
-                    "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
-                    "rows_html": "",
-                    "error": str(exc),
-                    "saved_at_text": entry_saved_at_text,
-                }
+                sheet_cache_dataset = collect_posts_dataset_from_cached_sheet_snapshot(
+                    entry_sheet_id,
+                    entry_sheet_name,
+                    entry_index,
+                    sheet_slug=entry_slug,
+                    campaign_override=entry_campaign_label,
+                    include_rows=False,
+                    state=runtime_state,
+                )
+                if sheet_cache_dataset:
+                    dataset = dict(sheet_cache_dataset)
+                    dataset["sheet_title"] = entry_display_name or str(dataset.get("sheet_title", "") or entry_sheet_name or f"Sheet {entry_index + 1}")
+                    dataset["sheet_name"] = entry_sheet_name or str(dataset.get("sheet_name", "") or f"Sheet {entry_index + 1}")
+                    dataset["sheet_slug"] = entry_slug
+                    dataset["sheet_id"] = entry_sheet_id
+                    dataset["sheet_gid"] = entry_sheet_gid or dataset.get("sheet_gid", "0")
+                    dataset["campaign_label"] = entry_campaign_label
+                    dataset["brand_label"] = entry_brand_label or str(dataset.get("brand_label", "") or "").strip()
+                    dataset["industry_label"] = entry_industry_label
+                    dataset["campaign_description"] = entry_campaign_description
+                    dataset["saved_at_text"] = entry_saved_at_text
+                    dataset["stale_warning"] = format_saved_sheet_error(str(exc))
+                    dataset["error"] = ""
+                    add_log(
+                        f"Bài đăng sheet '{entry_sheet_name}': đọc live lỗi nên đang dựng lại từ sheet cache nội bộ. Chi tiết: {str(exc)[:120]}",
+                        runtime_state,
+                    )
+                else:
+                    dataset = {
+                        "sheet_title": entry_display_name or entry_sheet_name or f"Sheet {entry_index + 1}",
+                        "sheet_name": entry_sheet_name or f"Sheet {entry_index + 1}",
+                        "sheet_slug": entry_slug,
+                        "sheet_id": entry_sheet_id,
+                        "sheet_gid": entry_sheet_gid,
+                        "campaign_label": entry_campaign_label,
+                        "brand_label": entry_brand_label,
+                        "industry_label": entry_industry_label,
+                        "campaign_description": entry_campaign_description,
+                        "total_posts": 0,
+                        "total_views": 0,
+                        "total_reaction": 0,
+                        "total_share": 0,
+                        "total_comment": 0,
+                        "total_buzz": 0,
+                        "creator_count": 0,
+                        "campaign_count": 0,
+                        "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
+                        "rows_html": "",
+                        "error": str(exc),
+                        "saved_at_text": entry_saved_at_text,
+                    }
         datasets.append(dataset)
 
     summary_rows_html = []
@@ -6473,8 +6638,9 @@ def build_posts_panel_html(sheet=None, state=None):
         brand_label = str(dataset.get("brand_label", "") or "").strip()
         campaign_label = str(dataset.get("campaign_label", "") or "").strip()
         industry_label = str(dataset.get("industry_label", "") or "").strip()
-        status_label = "Lỗi đọc" if dataset["error"] else ("Đã lưu" if dataset["total_posts"] > 0 else "Chưa có bài")
-        status_class = "posts-row-status-error" if dataset["error"] else ("posts-row-status-ready" if dataset["total_posts"] > 0 else "posts-row-status-empty")
+        is_cached_dataset = bool(str(dataset.get("stale_warning", "") or "").strip())
+        status_label = "Lỗi đọc" if dataset["error"] else ("Dùng cache" if is_cached_dataset else ("Đã lưu" if dataset["total_posts"] > 0 else "Chưa có bài"))
+        status_class = "posts-row-status-error" if dataset["error"] else ("posts-row-status-cached" if is_cached_dataset else ("posts-row-status-ready" if dataset["total_posts"] > 0 else "posts-row-status-empty"))
         activity_title = html.escape(dataset["sheet_title"])
         activity_sub = html.escape(dataset.get("saved_at_text", "") or "Chưa có thời gian lưu")
         stale_warning = str(dataset.get("stale_warning", "") or "").strip()
@@ -10710,6 +10876,11 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 background: rgba(37, 99, 235, 0.16);
                 border-color: rgba(96, 165, 250, 0.2);
                 color: #93c5fd;
+            }}
+            .posts-row-status-cached {{
+                background: rgba(245, 158, 11, 0.16);
+                border-color: rgba(251, 191, 36, 0.22);
+                color: #fde68a;
             }}
             .posts-row-status-empty {{
                 background: rgba(71, 85, 105, 0.28);
