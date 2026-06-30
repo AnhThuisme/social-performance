@@ -186,7 +186,7 @@ DASHBOARD_CACHE_LAST_SAVE_AT = 0.0
 LINK_RESOLVE_CACHE = {}  # {raw_url: {"final_url": "...", "updated_at": iso}}
 LINK_RESOLVE_CACHE_TTL_SECONDS = 1800
 # Bump khi thay đổi markup dashboard để invalidate cache HTML cũ (overview/posts/config/schedule).
-DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 10
+DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 11
 MAX_RUNTIME_LOG_LINES = max(100, int(os.getenv("MAX_RUNTIME_LOG_LINES", "400")))
 MAX_RUNTIME_LOG_RENDER_LINES = max(50, int(os.getenv("MAX_RUNTIME_LOG_RENDER_LINES", "160")))
 SHEET_TABS_REQUEST_LIMITER = {}  # {sheet_id: last_request_time}
@@ -9251,7 +9251,7 @@ def api_dashboard_posts(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     
     user_email = current_user.get("email", "")
-    cached_html, is_fresh = get_dashboard_cached_section(user_email, "posts", allow_legacy_version=True)
+    cached_html, is_fresh = get_dashboard_cached_section(user_email, "posts", allow_legacy_version=False)
     needs_refresh = not is_fresh
 
     if needs_refresh:
