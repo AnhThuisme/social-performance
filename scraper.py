@@ -461,6 +461,7 @@ def normalize_saved_sheet_entries(raw_items):
             "brand_label": str(item.get("brand_label", "") or "").strip(),
             "industry_label": str(item.get("industry_label", "") or "").strip(),
             "campaign_description": str(item.get("campaign_description", "") or "").strip(),
+            "summary_snapshot": dict(item.get("summary_snapshot", {}) or {}),
         })
     return entries
 
@@ -1283,6 +1284,77 @@ def get_saved_sheet_entry(sheet_id: str, sheet_name: str, settings=None, owner_e
     return None
 
 
+def build_saved_sheet_summary_snapshot(dataset: dict) -> dict:
+    if not isinstance(dataset, dict):
+        return {}
+    return {
+        "sheet_title": str(dataset.get("sheet_title", "") or "").strip(),
+        "sheet_name": str(dataset.get("sheet_name", "") or "").strip(),
+        "sheet_id": str(dataset.get("sheet_id", "") or "").strip(),
+        "sheet_gid": str(dataset.get("sheet_gid", "0") or "0").strip() or "0",
+        "campaign_label": str(dataset.get("campaign_label", "") or "").strip(),
+        "brand_label": str(dataset.get("brand_label", "") or "").strip(),
+        "industry_label": str(dataset.get("industry_label", "") or "").strip(),
+        "campaign_description": str(dataset.get("campaign_description", "") or "").strip(),
+        "total_posts": parse_metric_number(dataset.get("total_posts")),
+        "total_views": parse_metric_number(dataset.get("total_views")),
+        "total_reaction": parse_metric_number(dataset.get("total_reaction")),
+        "total_share": parse_metric_number(dataset.get("total_share")),
+        "total_comment": parse_metric_number(dataset.get("total_comment")),
+        "total_buzz": parse_metric_number(dataset.get("total_buzz")),
+        "creator_count": parse_metric_number(dataset.get("creator_count")),
+        "campaign_count": parse_metric_number(dataset.get("campaign_count")),
+        "platform_counts": dict(dataset.get("platform_counts", {}) or {}),
+    }
+
+
+def update_saved_sheet_summary(sheet_id: str, sheet_name: str, summary_snapshot: dict, owner_email: Optional[str] = None):
+    normalized_sheet_id = str(sheet_id or "").strip()
+    normalized_sheet_name = str(sheet_name or "").strip()
+    if not normalized_sheet_id or not normalized_sheet_name or not isinstance(summary_snapshot, dict):
+        return []
+    normalized_owner = normalize_email_address(owner_email or "")
+    settings = get_auth_settings().copy()
+    existing_entries = get_saved_sheet_entries(settings, owner_email=normalized_owner)
+    next_entries = []
+    updated = False
+    target_name_lower = normalized_sheet_name.lower()
+    snapshot_payload = build_saved_sheet_summary_snapshot(summary_snapshot)
+    for item in existing_entries:
+        current_sheet_id = str(item.get("sheet_id", "") or "").strip()
+        current_sheet_name = str(item.get("sheet_name", "") or "").strip()
+        if current_sheet_id == normalized_sheet_id and current_sheet_name.lower() == target_name_lower:
+            current_snapshot = build_saved_sheet_summary_snapshot(item.get("summary_snapshot", {}) or {})
+            if current_snapshot != snapshot_payload:
+                updated = True
+            next_entries.append(
+                {
+                    "sheet_id": current_sheet_id,
+                    "sheet_name": current_sheet_name,
+                    "display_name": str(item.get("display_name", "") or "").strip() or current_sheet_name,
+                    "sheet_gid": str(item.get("sheet_gid", "0") or "0").strip() or "0",
+                    "saved_at_text": str(item.get("saved_at_text", "") or "").strip(),
+                    "campaign_label": str(item.get("campaign_label", "") or "").strip(),
+                    "brand_label": str(item.get("brand_label", "") or "").strip(),
+                    "industry_label": str(item.get("industry_label", "") or "").strip(),
+                    "campaign_description": str(item.get("campaign_description", "") or "").strip(),
+                    "summary_snapshot": snapshot_payload,
+                }
+            )
+        else:
+            next_entries.append(dict(item))
+    if not updated:
+        return existing_entries
+    if normalized_owner:
+        saved_by_user = dict(settings.get("saved_sheets_by_user", {}) or {})
+        saved_by_user[normalized_owner] = normalize_saved_sheet_entries(next_entries)[:MAX_SAVED_SHEETS_PER_USER]
+        settings["saved_sheets_by_user"] = saved_by_user
+    else:
+        settings["saved_sheets"] = normalize_saved_sheet_entries(next_entries)[:MAX_SAVED_SHEETS_PER_USER]
+    persist_auth_settings(settings)
+    return get_saved_sheet_entries(settings, owner_email=normalized_owner)
+
+
 def build_campaign_options_html(selected_label: str = "", settings=None, owner_email: Optional[str] = None) -> str:
     selected_label = str(selected_label or "").strip()
     normalized_selected = selected_label.lower()
@@ -1405,6 +1477,7 @@ def save_sheet_entry(
                 campaign_description if campaign_description is not None else (existing_entry or {}).get("campaign_description", "")
                 or ""
             ).strip(),
+            "summary_snapshot": dict((existing_entry or {}).get("summary_snapshot", {}) or {}),
         }
     ]
     next_entries.extend(
@@ -1453,6 +1526,7 @@ def update_saved_sheet_campaign(sheet_id: str, sheet_name: str, campaign_label: 
                     "brand_label": str(item.get("brand_label", "") or "").strip(),
                     "industry_label": str(item.get("industry_label", "") or "").strip(),
                     "campaign_description": str(item.get("campaign_description", "") or "").strip(),
+                    "summary_snapshot": dict(item.get("summary_snapshot", {}) or {}),
                 }
             )
         else:
@@ -1500,6 +1574,7 @@ def update_saved_sheet_metadata(
             "brand_label": str(brand_label or "").strip(),
             "industry_label": str(industry_label or "").strip(),
             "campaign_description": str(item.get("campaign_description", "") or "").strip(),
+            "summary_snapshot": dict(item.get("summary_snapshot", {}) or {}),
         }
 
     target_index = -1
@@ -6558,6 +6633,7 @@ def build_posts_panel_html(sheet=None, state=None):
             dataset["industry_label"] = entry_industry_label
             dataset["campaign_description"] = entry_campaign_description
             cache_posts_sheet_dataset(owner_email, entry_sheet_id, entry_sheet_name, dataset)
+            update_saved_sheet_summary(entry_sheet_id, entry_sheet_name, dataset, owner_email=runtime_state["owner_email"])
         except Exception as exc:
             cached_dataset, _ = get_cached_posts_sheet_dataset(owner_email, entry_sheet_id, entry_sheet_name)
             if cached_dataset:
@@ -6579,57 +6655,80 @@ def build_posts_panel_html(sheet=None, state=None):
                     runtime_state,
                 )
             else:
-                sheet_cache_dataset = collect_posts_dataset_from_cached_sheet_snapshot(
-                    entry_sheet_id,
-                    entry_sheet_name,
-                    entry_index,
-                    sheet_slug=entry_slug,
-                    campaign_override=entry_campaign_label,
-                    include_rows=False,
-                    state=runtime_state,
-                )
-                if sheet_cache_dataset:
-                    dataset = dict(sheet_cache_dataset)
-                    dataset["sheet_title"] = entry_display_name or str(dataset.get("sheet_title", "") or entry_sheet_name or f"Sheet {entry_index + 1}")
-                    dataset["sheet_name"] = entry_sheet_name or str(dataset.get("sheet_name", "") or f"Sheet {entry_index + 1}")
-                    dataset["sheet_slug"] = entry_slug
-                    dataset["sheet_id"] = entry_sheet_id
-                    dataset["sheet_gid"] = entry_sheet_gid or dataset.get("sheet_gid", "0")
-                    dataset["campaign_label"] = entry_campaign_label
-                    dataset["brand_label"] = entry_brand_label or str(dataset.get("brand_label", "") or "").strip()
-                    dataset["industry_label"] = entry_industry_label
-                    dataset["campaign_description"] = entry_campaign_description
-                    dataset["saved_at_text"] = entry_saved_at_text
-                    dataset["stale_warning"] = format_saved_sheet_error(str(exc))
-                    dataset["error"] = ""
+                saved_summary = build_saved_sheet_summary_snapshot(dict(entry.get("summary_snapshot", {}) or {}))
+                if saved_summary:
+                    dataset = {
+                        **saved_summary,
+                        "sheet_title": entry_display_name or str(saved_summary.get("sheet_title", "") or entry_sheet_name or f"Sheet {entry_index + 1}"),
+                        "sheet_name": entry_sheet_name or str(saved_summary.get("sheet_name", "") or f"Sheet {entry_index + 1}"),
+                        "sheet_slug": entry_slug,
+                        "sheet_id": entry_sheet_id,
+                        "sheet_gid": entry_sheet_gid or str(saved_summary.get("sheet_gid", "0") or "0"),
+                        "campaign_label": entry_campaign_label or str(saved_summary.get("campaign_label", "") or "").strip(),
+                        "brand_label": entry_brand_label or str(saved_summary.get("brand_label", "") or "").strip(),
+                        "industry_label": entry_industry_label or str(saved_summary.get("industry_label", "") or "").strip(),
+                        "campaign_description": entry_campaign_description or str(saved_summary.get("campaign_description", "") or "").strip(),
+                        "saved_at_text": entry_saved_at_text,
+                        "rows_html": "",
+                        "error": "",
+                        "stale_warning": format_saved_sheet_error(str(exc)),
+                    }
                     add_log(
-                        f"Bài đăng sheet '{entry_sheet_name}': đọc live lỗi nên đang dựng lại từ sheet cache nội bộ. Chi tiết: {str(exc)[:120]}",
+                        f"Bài đăng sheet '{entry_sheet_name}': đọc live lỗi nên đang dùng summary snapshot đã lưu. Chi tiết: {str(exc)[:120]}",
                         runtime_state,
                     )
                 else:
-                    dataset = {
-                        "sheet_title": entry_display_name or entry_sheet_name or f"Sheet {entry_index + 1}",
-                        "sheet_name": entry_sheet_name or f"Sheet {entry_index + 1}",
-                        "sheet_slug": entry_slug,
-                        "sheet_id": entry_sheet_id,
-                        "sheet_gid": entry_sheet_gid,
-                        "campaign_label": entry_campaign_label,
-                        "brand_label": entry_brand_label,
-                        "industry_label": entry_industry_label,
-                        "campaign_description": entry_campaign_description,
-                        "total_posts": 0,
-                        "total_views": 0,
-                        "total_reaction": 0,
-                        "total_share": 0,
-                        "total_comment": 0,
-                        "total_buzz": 0,
-                        "creator_count": 0,
-                        "campaign_count": 0,
-                        "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
-                        "rows_html": "",
-                        "error": str(exc),
-                        "saved_at_text": entry_saved_at_text,
-                    }
+                    sheet_cache_dataset = collect_posts_dataset_from_cached_sheet_snapshot(
+                        entry_sheet_id,
+                        entry_sheet_name,
+                        entry_index,
+                        sheet_slug=entry_slug,
+                        campaign_override=entry_campaign_label,
+                        include_rows=False,
+                        state=runtime_state,
+                    )
+                    if sheet_cache_dataset:
+                        dataset = dict(sheet_cache_dataset)
+                        dataset["sheet_title"] = entry_display_name or str(dataset.get("sheet_title", "") or entry_sheet_name or f"Sheet {entry_index + 1}")
+                        dataset["sheet_name"] = entry_sheet_name or str(dataset.get("sheet_name", "") or f"Sheet {entry_index + 1}")
+                        dataset["sheet_slug"] = entry_slug
+                        dataset["sheet_id"] = entry_sheet_id
+                        dataset["sheet_gid"] = entry_sheet_gid or dataset.get("sheet_gid", "0")
+                        dataset["campaign_label"] = entry_campaign_label
+                        dataset["brand_label"] = entry_brand_label or str(dataset.get("brand_label", "") or "").strip()
+                        dataset["industry_label"] = entry_industry_label
+                        dataset["campaign_description"] = entry_campaign_description
+                        dataset["saved_at_text"] = entry_saved_at_text
+                        dataset["stale_warning"] = format_saved_sheet_error(str(exc))
+                        dataset["error"] = ""
+                        add_log(
+                            f"Bài đăng sheet '{entry_sheet_name}': đọc live lỗi nên đang dựng lại từ sheet cache nội bộ. Chi tiết: {str(exc)[:120]}",
+                            runtime_state,
+                        )
+                    else:
+                        dataset = {
+                            "sheet_title": entry_display_name or entry_sheet_name or f"Sheet {entry_index + 1}",
+                            "sheet_name": entry_sheet_name or f"Sheet {entry_index + 1}",
+                            "sheet_slug": entry_slug,
+                            "sheet_id": entry_sheet_id,
+                            "sheet_gid": entry_sheet_gid,
+                            "campaign_label": entry_campaign_label,
+                            "brand_label": entry_brand_label,
+                            "industry_label": entry_industry_label,
+                            "campaign_description": entry_campaign_description,
+                            "total_posts": 0,
+                            "total_views": 0,
+                            "total_reaction": 0,
+                            "total_share": 0,
+                            "total_comment": 0,
+                            "total_buzz": 0,
+                            "creator_count": 0,
+                            "campaign_count": 0,
+                            "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
+                            "rows_html": "",
+                            "error": str(exc),
+                            "saved_at_text": entry_saved_at_text,
+                        }
         datasets.append(dataset)
 
     summary_rows_html = []
