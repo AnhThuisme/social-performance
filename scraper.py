@@ -187,6 +187,7 @@ LINK_RESOLVE_CACHE = {}  # {raw_url: {"final_url": "...", "updated_at": iso}}
 LINK_RESOLVE_CACHE_TTL_SECONDS = 1800
 # Bump khi thay đổi markup dashboard để invalidate cache HTML cũ (overview/posts/config/schedule).
 DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 11
+DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION = 2
 MAX_RUNTIME_LOG_LINES = max(100, int(os.getenv("MAX_RUNTIME_LOG_LINES", "400")))
 MAX_RUNTIME_LOG_RENDER_LINES = max(50, int(os.getenv("MAX_RUNTIME_LOG_RENDER_LINES", "160")))
 SHEET_TABS_REQUEST_LIMITER = {}  # {sheet_id: last_request_time}
@@ -238,7 +239,8 @@ HEADER_ALIASES = {
     "date": {
         "date", "time", "timestamp", "ngay", "ngayquet", "thoigian", "thoigianquet",
         "scanat", "scandate", "updatedat", "lastupdated", "lastscan",
-        "publishdate", "createdat", "ngaydangtai", "ngaytao"
+        "publishdate", "createdat", "ngaydangtai", "ngaytao",
+        "reportdate", "scrapedate", "trackingdate", "lastscandate", "updatetime", "updatedtime"
     },
     "air_date": {
         "air", "aired", "airdate", "aireddate", "ngayair", "ngaydang", "ngayairbai", "ngaydangbai",
@@ -269,7 +271,8 @@ HEADER_ALIASES = {
     },
     "save": {
         "save", "saves", "saved", "bookmark", "bookmarks", "luu", "collect", "collectcount",
-        "favorite", "favourite", "luotluu"
+        "favorite", "favourite", "luotluu", "savecount", "savedcount", "totalsave",
+        "totalsaved", "bookmarkcount", "favoritescount", "favouritescount", "collects", "collectioncount"
     },
     "platform": {"platform", "nentang"},
     "caption": {"caption", "title", "mota", "noidung"},
@@ -3437,10 +3440,13 @@ def build_column_config_payload(sheet=None, state=None):
             header_row = max(1, int(layout.get("header_row") or 1))
             effective_start_row = resolve_effective_start_row(header_row, runtime_state)
             col_map = apply_column_overrides(layout.get("columns"), runtime_state["column_overrides"])
+            col_map = ensure_dashboard_date_column(ws, layout, col_map, runtime_state)
             for field in metric_cols:
                 col_idx = col_map.get(field)
                 metric_cols[field] = col_to_a1(col_idx) if col_idx else "Chưa thấy"
-            detected_text = format_detected_columns_text(layout, runtime_state)
+            detected_layout = dict(layout)
+            detected_layout["columns"] = dict(col_map)
+            detected_text = format_detected_columns_text(detected_layout, runtime_state)
         except Exception:
             pass
     manual_inputs = {field: (col_to_a1(col_idx) if col_idx else "") for field, col_idx in runtime_state["column_overrides"].items()}
@@ -4693,7 +4699,37 @@ def detect_columns_from_headers(headers, allow_partial: bool = True):
                     columns[field] = idx
                     matched_indices.add(idx)
                     break
+
+    # Pass 3: loose matching for stubborn metric headers that often appear as
+    # compounds like `totalsave`, `savecount`, `scrapedate`.
+    loose_patterns = {
+        "date": ("date", "datetime", "scandate", "reportdate", "trackingdate"),
+        "save": ("save", "saved", "bookmark", "collect", "favorite", "favourite", "luu"),
+    }
+    for idx, key in header_keys:
+        if not key or idx in matched_indices:
+            continue
+        for field, patterns in loose_patterns.items():
+            if field in columns:
+                continue
+            if any(pattern in key for pattern in patterns):
+                columns[field] = idx
+                matched_indices.add(idx)
+                break
     return columns
+
+
+def _infer_next_date_column(headers, col_map) -> int:
+    header_values = list(headers or [])
+    occupied = sorted({int(v) for v in (col_map or {}).values() if v})
+    if not occupied:
+        return max(1, len(header_values) + 1)
+    rightmost = max(occupied)
+    for col_idx in range(rightmost + 1, max(rightmost + 4, len(header_values) + 2)):
+        header_value = str(header_values[col_idx - 1] if col_idx - 1 < len(header_values) else "" or "").strip()
+        if not header_value:
+            return col_idx
+    return rightmost + 1
 
 def detect_sheet_layout(sheet, sample_rows: int = 30, use_cache: bool = True):
     global SHEET_LAYOUT_CACHE
@@ -6940,6 +6976,21 @@ def ensure_dashboard_date_column(sheet, layout=None, col_map=None, state=None):
         return dict(col_map or {})
     resolved_layout = layout or detect_sheet_layout(sheet)
     resolved_col_map = dict(col_map or apply_column_overrides(resolved_layout.get("columns"), state=state))
+    if resolved_col_map.get("date"):
+        return resolved_col_map
+    headers = list(resolved_layout.get("headers") or [])
+    if not headers:
+        try:
+            headers = sheet.row_values(max(1, int(resolved_layout.get("header_row") or 1)))
+        except Exception:
+            headers = []
+    strict_header_match = detect_columns_from_headers(headers, allow_partial=False).get("date")
+    relaxed_header_match = detect_columns_from_headers(headers, allow_partial=True).get("date")
+    inferred_date_col = strict_header_match or relaxed_header_match
+    if inferred_date_col:
+        resolved_col_map["date"] = inferred_date_col
+        return resolved_col_map
+    resolved_col_map["date"] = _infer_next_date_column(headers, resolved_col_map)
     return resolved_col_map
 
 def normalize_cell_value(field, value):
@@ -8532,7 +8583,7 @@ async def delete_schedule_entry(request: Request):
         state=runtime_state,
     )
 
-_DETECT_TAB_COLUMNS_CACHE = {}  # key: (owner_email, sheet_id, tab_name) -> (timestamp, result)
+_DETECT_TAB_COLUMNS_CACHE = {}  # key: (version, owner_email, sheet_id, tab_name, mode) -> (timestamp, result)
 _DETECT_TAB_COLUMNS_TTL = 900   # 15 minutes
 AUTO_DETECT_BATCH_WORKERS = max(2, int(os.getenv("AUTO_DETECT_BATCH_WORKERS", "4")))
 
@@ -8548,7 +8599,7 @@ def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effect
     owner_email = runtime_state.get("owner_email", "")
     sheet_id = runtime_state["active_sheet_id"]
     mode_key = "auto" if str(mode or "").strip().lower() == "auto" else "effective"
-    cache_key = (owner_email, sheet_id, resolved_tab, mode_key)
+    cache_key = (DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, resolved_tab, mode_key)
     now = time.time()
     cached_entry = _DETECT_TAB_COLUMNS_CACHE.get(cache_key)
     if cached_entry:
@@ -8559,6 +8610,7 @@ def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effect
         ws = get_worksheet(resolved_tab, sheet_id, runtime_state)
         layout = detect_sheet_layout(ws)
         raw_columns = layout.get("columns") or {}
+        raw_columns = ensure_dashboard_date_column(ws, layout, raw_columns, runtime_state)
         tab_overrides = runtime_state.get("column_overrides_by_tab", {}).get(resolved_tab)
         if mode_key == "auto":
             col_map = dict(raw_columns)
@@ -8630,7 +8682,7 @@ async def detect_tab_columns_batch(request: Request):
     tabs_to_scan = []
 
     for resolved_tab in tabs:
-        cache_key = (owner_email, sheet_id, resolved_tab, mode_key)
+        cache_key = (DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, resolved_tab, mode_key)
         cached_entry = _DETECT_TAB_COLUMNS_CACHE.get(cache_key)
         if cached_entry:
             cached_at, cached_result = cached_entry
@@ -8645,6 +8697,7 @@ async def detect_tab_columns_batch(request: Request):
         ws = get_worksheet(resolved_tab, sheet_id, runtime_state)
         layout = detect_sheet_layout(ws)
         raw_columns = layout.get("columns") or {}
+        raw_columns = ensure_dashboard_date_column(ws, layout, raw_columns, runtime_state)
         tab_overrides = runtime_state.get("column_overrides_by_tab", {}).get(resolved_tab)
         # AUTO mode must use raw detected columns only, without manual overrides.
         col_map = dict(raw_columns)
@@ -8679,7 +8732,7 @@ async def detect_tab_columns_batch(request: Request):
             for future, tab in future_map.items():
                 try:
                     result = future.result()
-                    _DETECT_TAB_COLUMNS_CACHE[(owner_email, sheet_id, tab, mode_key)] = (time.time(), result)
+                    _DETECT_TAB_COLUMNS_CACHE[(DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, tab, mode_key)] = (time.time(), result)
                     results_map[tab] = result
                 except Exception as exc:
                     results_map[tab] = {
@@ -8719,6 +8772,8 @@ def clear_tab_columns(request: Request, tab_name: str = ""):
     _DETECT_TAB_COLUMNS_CACHE.pop((owner_email, sheet_id, resolved_tab), None)  # backward compatibility
     _DETECT_TAB_COLUMNS_CACHE.pop((owner_email, sheet_id, resolved_tab, "auto"), None)
     _DETECT_TAB_COLUMNS_CACHE.pop((owner_email, sheet_id, resolved_tab, "effective"), None)
+    _DETECT_TAB_COLUMNS_CACHE.pop((DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, resolved_tab, "auto"), None)
+    _DETECT_TAB_COLUMNS_CACHE.pop((DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, resolved_tab, "effective"), None)
     return build_ui_json_response(
         f"Đã reset cấu hình tab '{resolved_tab}' về AUTO detect.",
         level="success",
