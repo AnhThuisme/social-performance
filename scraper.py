@@ -8727,18 +8727,18 @@ _DETECT_TAB_COLUMNS_TTL = 900   # 15 minutes
 AUTO_DETECT_BATCH_WORKERS = max(1, int(os.getenv("AUTO_DETECT_BATCH_WORKERS", "2")))
 
 @app.get("/detect-tab-columns")
-def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effective"):
+def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effective", sheet_id: str = ""):
     current_user, auth_response = require_authenticated_user(request)
     if auth_response:
         return JSONResponse({"ok": False, "error": "Unauthorized"}, status_code=401)
     runtime_state = get_runtime_state(current_user)
     resolved_tab = (tab_name or "").strip()
-    if not resolved_tab or not runtime_state["active_sheet_id"]:
+    requested_sheet_id = str(sheet_id or runtime_state.get("active_sheet_id") or "").strip()
+    if not resolved_tab or not requested_sheet_id:
         return JSONResponse({"ok": False, "detected_inputs": {}, "tab_name": resolved_tab})
     owner_email = runtime_state.get("owner_email", "")
-    sheet_id = runtime_state["active_sheet_id"]
     mode_key = "auto" if str(mode or "").strip().lower() == "auto" else "effective"
-    cache_key = (DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, resolved_tab, mode_key)
+    cache_key = (DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, requested_sheet_id, resolved_tab, mode_key)
     now = time.time()
     cached_entry = _DETECT_TAB_COLUMNS_CACHE.get(cache_key)
     if cached_entry:
@@ -8746,7 +8746,7 @@ def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effect
         if now - cached_at < _DETECT_TAB_COLUMNS_TTL:
             return JSONResponse(cached_result)
     try:
-        ws = get_worksheet(resolved_tab, sheet_id, runtime_state)
+        ws = get_worksheet(resolved_tab, requested_sheet_id, runtime_state)
         layout = detect_sheet_layout(ws)
         raw_columns = layout.get("columns") or {}
         raw_columns = ensure_dashboard_date_column(ws, layout, raw_columns, runtime_state)
@@ -8772,6 +8772,7 @@ def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effect
         result = {
             "ok": True,
             "tab_name": resolved_tab,
+            "sheet_id": requested_sheet_id,
             "detected_inputs": detected_inputs,
             "saved_overrides": saved_overrides,
             "has_saved_overrides": bool(tab_overrides),
@@ -8796,6 +8797,7 @@ async def detect_tab_columns_batch(request: Request):
     except Exception:
         payload = {}
     raw_tabs = (payload or {}).get("tabs", [])
+    requested_sheet_id = str((payload or {}).get("sheet_id", "") or runtime_state.get("active_sheet_id") or "").strip()
     if not isinstance(raw_tabs, list):
         raw_tabs = []
     tabs = []
@@ -8809,11 +8811,12 @@ async def detect_tab_columns_batch(request: Request):
             continue
         seen.add(key)
         tabs.append(tab)
+    if not requested_sheet_id:
+        return JSONResponse({"ok": False, "message": "Chưa có spreadsheet để AUTO.", "results": []})
     if not tabs:
         return JSONResponse({"ok": False, "message": "Chưa có tab nào để AUTO.", "results": []})
 
     owner_email = runtime_state.get("owner_email", "")
-    sheet_id = runtime_state["active_sheet_id"]
     now = time.time()
     mode_key = "auto"
     fields = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"]
@@ -8821,7 +8824,7 @@ async def detect_tab_columns_batch(request: Request):
     tabs_to_scan = []
 
     for resolved_tab in tabs:
-        cache_key = (DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, resolved_tab, mode_key)
+        cache_key = (DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, requested_sheet_id, resolved_tab, mode_key)
         cached_entry = _DETECT_TAB_COLUMNS_CACHE.get(cache_key)
         if cached_entry:
             cached_at, cached_result = cached_entry
@@ -8833,7 +8836,7 @@ async def detect_tab_columns_batch(request: Request):
         tabs_to_scan.append(resolved_tab)
 
     def _scan_one_tab(resolved_tab: str):
-        ws = get_worksheet(resolved_tab, sheet_id, runtime_state)
+        ws = get_worksheet(resolved_tab, requested_sheet_id, runtime_state)
         layout = detect_sheet_layout(ws)
         raw_columns = layout.get("columns") or {}
         raw_columns = ensure_dashboard_date_column(ws, layout, raw_columns, runtime_state)
@@ -8855,6 +8858,7 @@ async def detect_tab_columns_batch(request: Request):
         return {
             "ok": True,
             "tab_name": resolved_tab,
+            "sheet_id": requested_sheet_id,
             "detected_inputs": detected_inputs,
             "saved_overrides": saved_overrides,
             "has_saved_overrides": bool(tab_overrides),
@@ -8872,7 +8876,7 @@ async def detect_tab_columns_batch(request: Request):
             for future, tab in future_map.items():
                 try:
                     result = future.result()
-                    _DETECT_TAB_COLUMNS_CACHE[(DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, sheet_id, tab, mode_key)] = (time.time(), result)
+                    _DETECT_TAB_COLUMNS_CACHE[(DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION, owner_email, requested_sheet_id, tab, mode_key)] = (time.time(), result)
                     results_map[tab] = result
                 except Exception as exc:
                     results_map[tab] = {
@@ -14377,19 +14381,38 @@ def home(request: Request, background_tasks: BackgroundTasks):
 
                 const AUTO_COLUMN_FIELDS = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"];
                 const AUTO_DETECT_CONCURRENCY = 3;
+                const getCurrentSheetIdForAutoDetect = () => {{
+                    const fromInput = extractSheetIdFromInput(sheetUrlInput?.value || "");
+                    if (fromInput) return fromInput;
+                    const fromDom = String(activeSheetIdEls?.[0]?.textContent || "").trim();
+                    if (fromDom && fromDom !== "Chưa cài đặt") return fromDom;
+                    return "";
+                }};
                 const fetchAutoColumnConfigForTab = async (tabName) => {{
                     const resolvedTabName = String(tabName || "").trim();
                     if (!resolvedTabName) {{
                         return null;
                     }}
+                    const resolvedSheetId = getCurrentSheetIdForAutoDetect();
                     try {{
-                        const response = await fetch(`/detect-tab-columns?tab_name=${{encodeURIComponent(resolvedTabName)}}&mode=auto`, {{
+                        const params = new URLSearchParams();
+                        params.set("tab_name", resolvedTabName);
+                        params.set("mode", "auto");
+                        if (resolvedSheetId) {{
+                            params.set("sheet_id", resolvedSheetId);
+                        }}
+                        const response = await fetch(`/detect-tab-columns?${{params.toString()}}`, {{
                             headers: {{"X-Requested-With": "fetch"}},
                             cache: "no-store",
                         }});
                         const data = await response.json();
                         if (!data.ok || !data.detected_inputs) {{
-                            return null;
+                            return {{
+                                tabName: resolvedTabName,
+                                error: String(data?.error || data?.message || "Không đọc được cấu hình AUTO.").trim(),
+                                detectedInputs: null,
+                                startRow: "",
+                            }};
                         }}
                         const normalizedConfig = {{}};
                         AUTO_COLUMN_FIELDS.forEach((field) => {{
@@ -14402,23 +14425,30 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         serverColConfigByTab[resolvedTabName] = normalizedConfig;
                         return {{
                             tabName: resolvedTabName,
+                            error: "",
                             detectedInputs: normalizedConfig,
                             startRow: normalizedConfig.start_row || "",
                         }};
-                    }} catch (_) {{
-                        return null;
+                    }} catch (err) {{
+                        return {{
+                            tabName: resolvedTabName,
+                            error: String(err?.message || "Không gọi được API AUTO tab.").trim(),
+                            detectedInputs: null,
+                            startRow: "",
+                        }};
                     }}
                 }};
                 const fetchAutoColumnConfigBatch = async (tabNames) => {{
                     if (!Array.isArray(tabNames) || !tabNames.length) {{
                         return null;
                     }}
+                    const resolvedSheetId = getCurrentSheetIdForAutoDetect();
                     try {{
                         const response = await fetch("/detect-tab-columns-batch", {{
                             method: "POST",
                             headers: {{ "Content-Type": "application/json", "X-Requested-With": "fetch" }},
                             cache: "no-store",
-                            body: JSON.stringify({{ tabs: tabNames }}),
+                            body: JSON.stringify({{ tabs: tabNames, sheet_id: resolvedSheetId }}),
                         }});
                         const data = await response.json();
                         if (!data.ok || !Array.isArray(data.results)) {{
