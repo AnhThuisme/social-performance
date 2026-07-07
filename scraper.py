@@ -14424,10 +14424,20 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         if (!data.ok || !Array.isArray(data.results)) {{
                             return null;
                         }}
-                        const resultByTab = {{}};
+                        const payloadByTab = {{}};
                         data.results.forEach((item) => {{
                             const tabName = String(item?.tab_name || "").trim();
-                            if (!tabName || !item?.ok || !item?.detected_inputs) {{
+                            if (!tabName) {{
+                                return;
+                            }}
+                            const entry = {{
+                                ok: Boolean(item?.ok),
+                                error: String(item?.error || item?.message || "").trim(),
+                                detectedInputs: null,
+                                startRow: "",
+                            }};
+                            if (!item?.ok || !item?.detected_inputs) {{
+                                payloadByTab[tabName] = entry;
                                 return;
                             }}
                             const normalizedConfig = {{}};
@@ -14439,13 +14449,15 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             }}
                             tabColConfigCache[tabName] = normalizedConfig;
                             serverColConfigByTab[tabName] = normalizedConfig;
-                            resultByTab[tabName] = {{
+                            payloadByTab[tabName] = {{
+                                ok: true,
                                 tabName,
+                                error: "",
                                 detectedInputs: normalizedConfig,
                                 startRow: normalizedConfig.start_row || "",
                             }};
                         }});
-                        return resultByTab;
+                        return payloadByTab;
                     }} catch (_) {{
                         return null;
                     }}
@@ -14494,15 +14506,30 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         tabsForAuto.forEach((tabName, idx) => {{
                             detectResults[idx] = batchedResults[tabName] || null;
                         }});
-                    }} else {{
+                    }}
+                    const missingTabIndexes = detectResults
+                        .map((detected, idx) => (detected && detected.detectedInputs ? -1 : idx))
+                        .filter((idx) => idx >= 0);
+                    if (!batchedResults || missingTabIndexes.length) {{
                         let detectCursor = 0;
-                        const workerCount = Math.max(1, Math.min(AUTO_DETECT_CONCURRENCY, tabsForAuto.length));
+                        const retryTabIndexes = missingTabIndexes.length
+                            ? missingTabIndexes
+                            : tabsForAuto.map((_, idx) => idx);
+                        const workerCount = Math.max(1, Math.min(AUTO_DETECT_CONCURRENCY, retryTabIndexes.length));
                         const workers = Array.from({{ length: workerCount }}, async () => {{
                             while (true) {{
-                                const idx = detectCursor++;
-                                if (idx >= tabsForAuto.length) break;
+                                const cursor = detectCursor++;
+                                if (cursor >= retryTabIndexes.length) break;
+                                const idx = retryTabIndexes[cursor];
                                 const tabName = tabsForAuto[idx];
-                                detectResults[idx] = await fetchAutoColumnConfigForTab(tabName);
+                                const previousResult = detectResults[idx];
+                                if (previousResult && previousResult.error) {{
+                                    void pushRealtimeLog(`[${{tabName}}] Batch AUTO lỗi, thử quét lại riêng tab này...`);
+                                }}
+                                const retryResult = await fetchAutoColumnConfigForTab(tabName);
+                                if (retryResult) {{
+                                    detectResults[idx] = retryResult;
+                                }}
                             }}
                         }});
                         await Promise.all(workers);
@@ -14510,6 +14537,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     detectResults.forEach((detected, idx) => {{
                         const tabName = tabsForAuto[idx];
                         if (!detected || !detected.detectedInputs) {{
+                            const errorText = String(detected?.error || "").trim();
+                            if (errorText) {{
+                                void pushRealtimeLog(`[${{tabName}}] AUTO lỗi: ${{errorText}}`);
+                            }}
                             void pushRealtimeLog(`[${{tabName}}] AUTO không nhận được cột.`);
                             return;
                         }}
