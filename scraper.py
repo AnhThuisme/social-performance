@@ -183,6 +183,10 @@ DASHBOARD_REFRESH_LOCK = threading.Lock()
 DASHBOARD_CACHE_SAVE_LOCK = threading.Lock()
 DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS = max(1, int(os.getenv("DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS", "3")))
 DASHBOARD_CACHE_LAST_SAVE_AT = 0.0
+SHEETS_QUOTA_COOLDOWN_SECONDS = max(30, int(os.getenv("SHEETS_QUOTA_COOLDOWN_SECONDS", "90")))
+SHEETS_QUOTA_COOLDOWN_UNTIL = 0.0
+SHEETS_QUOTA_COOLDOWN_LAST_LOG_AT = 0.0
+SHEETS_QUOTA_LOCK = threading.Lock()
 LINK_RESOLVE_CACHE = {}  # {raw_url: {"final_url": "...", "updated_at": iso}}
 LINK_RESOLVE_CACHE_TTL_SECONDS = 1800
 # Bump khi thay đổi markup dashboard để invalidate cache HTML cũ (overview/posts/config/schedule).
@@ -737,6 +741,8 @@ def get_dashboard_cached_section(user_email: str, section: str, allow_legacy_ver
 
 
 def schedule_dashboard_refresh(background_tasks: BackgroundTasks, user_email: str, section: str) -> bool:
+    if section in {"overview", "posts", "config"} and is_sheets_quota_cooldown_active():
+        return False
     key = f"{user_email}:{section}"
     now_ts = time.time()
     with DASHBOARD_REFRESH_LOCK:
@@ -992,6 +998,8 @@ def background_refresh_dashboard_data(user_email, section_type):
     This runs in a background thread/task.
     """
     try:
+        if section_type in {"overview", "posts", "config"} and is_sheets_quota_cooldown_active():
+            return
         auth_data = load_auth_settings()
         user_list = auth_data.get("users", [])
         target_user = next((u for u in user_list if u.get("email") == user_email), None)
@@ -4471,6 +4479,8 @@ def list_spreadsheet_tabs(sheet_input: str):
                 return cache_entry["tabs"]
         except Exception:
             pass
+        if is_sheets_quota_cooldown_active() and cache_entry.get("tabs"):
+            return cache_entry["tabs"]
     
     def _fetch_tabs():
         gc = get_gspread_client()
@@ -4483,7 +4493,15 @@ def list_spreadsheet_tabs(sheet_input: str):
             for ws in spreadsheet.worksheets()
         ]
     
-    tabs = retry_with_backoff(_fetch_tabs, max_retries=4, base_delay=2, handle_quota=True)
+    try:
+        tabs = retry_with_backoff(_fetch_tabs, max_retries=4, base_delay=2, handle_quota=True)
+    except Exception as exc:
+        if is_quota_or_rate_limit_error(exc):
+            mark_sheets_quota_cooldown(exc, context="list tabs")
+            stale_tabs = (cache_entry or {}).get("tabs")
+            if stale_tabs:
+                return stale_tabs
+        raise
     SHEET_TABS_CACHE[sheet_id] = {"updated_at": now.isoformat(), "tabs": tabs}
     save_sheet_tabs_cache(SHEET_TABS_CACHE)
     return tabs
@@ -4514,6 +4532,132 @@ def is_quota_or_rate_limit_error(exc: Exception) -> bool:
         or "429" in msg
     )
 
+def mark_sheets_quota_cooldown(exc: Optional[Exception] = None, state=None, context: str = ""):
+    global SHEETS_QUOTA_COOLDOWN_UNTIL, SHEETS_QUOTA_COOLDOWN_LAST_LOG_AT
+    if exc is not None and not is_quota_or_rate_limit_error(exc):
+        return
+    now_ts = time.time()
+    should_log = False
+    with SHEETS_QUOTA_LOCK:
+        SHEETS_QUOTA_COOLDOWN_UNTIL = max(SHEETS_QUOTA_COOLDOWN_UNTIL, now_ts + SHEETS_QUOTA_COOLDOWN_SECONDS)
+        if (now_ts - float(SHEETS_QUOTA_COOLDOWN_LAST_LOG_AT or 0.0)) >= 20:
+            SHEETS_QUOTA_COOLDOWN_LAST_LOG_AT = now_ts
+            should_log = True
+    if should_log:
+        context_text = f" ({context})" if str(context or "").strip() else ""
+        add_log(
+            f"Google Sheet đang chạm quota đọc{context_text}. Tạm ưu tiên dữ liệu cache trong khoảng {SHEETS_QUOTA_COOLDOWN_SECONDS}s để tránh lỗi lặp.",
+            resolve_runtime_state(state) if state is not None else None,
+        )
+
+def get_sheets_quota_cooldown_remaining_seconds() -> int:
+    remaining = int(round(float(SHEETS_QUOTA_COOLDOWN_UNTIL or 0.0) - time.time()))
+    return max(0, remaining)
+
+def is_sheets_quota_cooldown_active() -> bool:
+    return get_sheets_quota_cooldown_remaining_seconds() > 0
+
+def get_sheet_cache_key(sheet=None, sheet_id: str = "", sheet_name: str = "") -> str:
+    resolved_sheet_id = str(sheet_id or getattr(getattr(sheet, "spreadsheet", None), "id", "") or "").strip()
+    resolved_sheet_name = str(sheet_name or getattr(sheet, "title", "") or "").strip()
+    if not resolved_sheet_id and not resolved_sheet_name:
+        return ""
+    return f"{resolved_sheet_id}:{resolved_sheet_name}"
+
+def get_cached_sheet_data_values(sheet=None, sheet_id: str = "", sheet_name: str = "", fresh_only: bool = False):
+    cache_key = get_sheet_cache_key(sheet=sheet, sheet_id=sheet_id, sheet_name=sheet_name)
+    if not cache_key:
+        return None
+    entry = SHEET_DATA_CACHE.get(cache_key)
+    if not isinstance(entry, dict):
+        return None
+    data = entry.get("data")
+    if not isinstance(data, list):
+        return None
+    if fresh_only:
+        try:
+            updated_at = datetime.fromisoformat(str(entry.get("updated_at", "") or ""))
+            if (datetime.now() - updated_at).total_seconds() >= SHEET_DATA_CACHE_TTL_SECONDS:
+                return None
+        except Exception:
+            return None
+    return data
+
+def extract_column_values_from_rows(
+    all_values,
+    col_idx: int,
+    start_row: int = 1,
+    max_rows: Optional[int] = None,
+    empty_streak_limit: Optional[int] = None,
+):
+    safe_col_idx = max(1, int(col_idx or 1))
+    safe_start_row = max(1, int(start_row or 1))
+    scan_max_rows = max(1000, int(max_rows or SHEET_COLUMN_SCAN_MAX_ROWS))
+    safe_empty_limit = max(50, int(empty_streak_limit or SHEET_COLUMN_SCAN_EMPTY_STREAK))
+    values = []
+    empty_streak = 0
+    scanned_rows = 0
+    for row in list(all_values or [])[safe_start_row - 1:]:
+        cell_val = ""
+        if isinstance(row, list) and safe_col_idx - 1 < len(row):
+            cell_val = str((row[safe_col_idx - 1] if row else "") or "").strip()
+        values.append(cell_val)
+        scanned_rows += 1
+        if cell_val:
+            empty_streak = 0
+        else:
+            empty_streak += 1
+        if scanned_rows >= scan_max_rows or empty_streak >= safe_empty_limit:
+            break
+    return values
+
+def _infer_sheet_layout_from_rows(batch_rows):
+    best_row = 1
+    best_headers = []
+    best_columns = {}
+    best_score = -1
+    normalized_rows = list(batch_rows or [])
+    for row_idx, headers in enumerate(normalized_rows, start=1):
+        if not any(str(cell or "").strip() for cell in headers):
+            continue
+        strict_columns = detect_columns_from_headers(headers, allow_partial=False)
+        relaxed_columns = detect_columns_from_headers(headers, allow_partial=True)
+        columns = dict(strict_columns)
+        for field, col_idx in relaxed_columns.items():
+            columns.setdefault(field, col_idx)
+
+        populated_cells = sum(1 for cell in headers if str(cell or "").strip())
+        if populated_cells < 3 and len(columns) < 2:
+            continue
+
+        score = (len(strict_columns) * 5) + (len(columns) * 2)
+        if "link" in strict_columns:
+            score += 8
+        elif "link" in columns:
+            score += 4
+        if any(metric in strict_columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
+            score += 4
+        elif any(metric in columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
+            score += 2
+        if "date" in strict_columns or "air_date" in strict_columns:
+            score += 2
+
+        if score > best_score:
+            best_row = row_idx
+            best_headers = headers
+            best_columns = columns
+            best_score = score
+
+    if best_score < 0 and normalized_rows:
+        best_headers = normalized_rows[0]
+        best_columns = detect_columns_from_headers(best_headers)
+
+    return {
+        "header_row": best_row,
+        "headers": best_headers,
+        "columns": best_columns,
+    }
+
 def retry_with_backoff(func, max_retries=3, base_delay=2, handle_quota=True):
     """Retry a function with exponential backoff on connection errors and quota errors"""
     import time
@@ -4524,6 +4668,8 @@ def retry_with_backoff(func, max_retries=3, base_delay=2, handle_quota=True):
             error_msg = str(e).lower()
             is_quota_error = "quota exceeded" in error_msg or "429" in error_msg
             is_conn_error = any(keyword in error_msg for keyword in ['connection', 'reset', 'aborted', 'timeout', '10054', 'forcibly closed'])
+            if is_quota_error:
+                mark_sheets_quota_cooldown(e)
             
             if (is_conn_error or (handle_quota and is_quota_error)) and attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt) + attempt
@@ -4745,66 +4891,42 @@ def detect_sheet_layout(sheet, sample_rows: int = 30, use_cache: bool = True):
                 return dict(cached_layout_entry.get("layout") or {})
         except Exception:
             pass
+    stale_layout = dict((cached_layout_entry or {}).get("layout") or {})
+    if use_cache and stale_layout and is_sheets_quota_cooldown_active():
+        return stale_layout
 
-    best_row = 1
-    best_headers = []
-    best_columns = {}
-    best_score = -1
     max_rows = max(1, int(sample_rows or 1))
+    cached_values = get_cached_sheet_data_values(sheet=sheet, fresh_only=False)
+    if is_sheets_quota_cooldown_active() and isinstance(cached_values, list) and cached_values:
+        layout_result = _infer_sheet_layout_from_rows(cached_values[:max_rows])
+        if any(layout_result.get(key) for key in ("headers", "columns")):
+            SHEET_LAYOUT_CACHE[cache_key] = {
+                "updated_at": now.isoformat(),
+                "layout": layout_result,
+            }
+            return layout_result
 
     # Fetch all sample rows in ONE API call to avoid quota exhaustion
     try:
         range_notation = f"1:{max_rows}"
         batch_rows = sheet.get(range_notation) or []
     except Exception as exc:
-        if cached_layout_entry and is_quota_or_rate_limit_error(exc):
-            return dict(cached_layout_entry.get("layout") or {})
-        # Fallback: single call for row 1
-        try:
-            batch_rows = [sheet.row_values(1)]
-        except Exception:
-            batch_rows = []
+        if is_quota_or_rate_limit_error(exc):
+            mark_sheets_quota_cooldown(exc, context=f"layout {sheet_name}")
+            if stale_layout:
+                return stale_layout
+            if isinstance(cached_values, list) and cached_values:
+                batch_rows = cached_values[:max_rows]
+            else:
+                batch_rows = []
+        else:
+            # Fallback: single call for row 1
+            try:
+                batch_rows = [sheet.row_values(1)]
+            except Exception:
+                batch_rows = []
 
-    for row_idx, headers in enumerate(batch_rows, start=1):
-        if not any(str(cell or "").strip() for cell in headers):
-            continue
-        strict_columns = detect_columns_from_headers(headers, allow_partial=False)
-        relaxed_columns = detect_columns_from_headers(headers, allow_partial=True)
-        columns = dict(strict_columns)
-        for field, col_idx in relaxed_columns.items():
-            columns.setdefault(field, col_idx)
-
-        populated_cells = sum(1 for cell in headers if str(cell or "").strip())
-        if populated_cells < 3 and len(columns) < 2:
-            continue
-
-        score = (len(strict_columns) * 5) + (len(columns) * 2)
-        if "link" in strict_columns:
-            score += 8
-        elif "link" in columns:
-            score += 4
-        if any(metric in strict_columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
-            score += 4
-        elif any(metric in columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
-            score += 2
-        if "date" in strict_columns or "air_date" in strict_columns:
-            score += 2
-
-        if score > best_score:
-            best_row = row_idx
-            best_headers = headers
-            best_columns = columns
-            best_score = score
-
-    if best_score < 0 and batch_rows:
-        best_headers = batch_rows[0]
-        best_columns = detect_columns_from_headers(best_headers)
-
-    layout_result = {
-        "header_row": best_row,
-        "headers": best_headers,
-        "columns": best_columns,
-    }
+    layout_result = _infer_sheet_layout_from_rows(batch_rows)
     SHEET_LAYOUT_CACHE[cache_key] = {
         "updated_at": now.isoformat(),
         "layout": layout_result,
@@ -4850,6 +4972,8 @@ def get_sheet_all_values_cached(sheet):
         stale_values = None
         if cache_entry:
             stale_values = cache_entry.get("data")
+        if stale_values is not None and is_sheets_quota_cooldown_active():
+            return stale_values
         try:
             all_values = sheet.get_all_values()
             SHEET_DATA_CACHE[cache_key] = {
@@ -4858,6 +4982,8 @@ def get_sheet_all_values_cached(sheet):
             }
             save_sheet_data_cache(SHEET_DATA_CACHE)
         except Exception as exc:
+            if is_quota_or_rate_limit_error(exc):
+                mark_sheets_quota_cooldown(exc, context=f"sheet values {sheet_name}")
             if stale_values and is_quota_or_rate_limit_error(exc):
                 all_values = stale_values
             else:
@@ -4911,36 +5037,40 @@ def get_sheet_column_values(
         except Exception:
             pass
     stale_values = list((cache_entry or {}).get("values") or [])
-    col_a1 = col_to_a1(safe_col_idx)
     scan_max_rows = max(1000, int(max_rows or SHEET_COLUMN_SCAN_MAX_ROWS))
-    chunk_size = max(200, int(SHEET_COLUMN_SCAN_CHUNK_SIZE))
     empty_streak_limit = max(50, int(SHEET_COLUMN_SCAN_EMPTY_STREAK))
-    values = []
-    scanned_rows = 0
-    empty_streak = 0
-    current_row = safe_start_row
+    cached_matrix = None
+    if use_cache:
+        cached_matrix = get_cached_sheet_data_values(sheet=sheet, fresh_only=True)
+    elif is_sheets_quota_cooldown_active():
+        cached_matrix = get_cached_sheet_data_values(sheet=sheet, fresh_only=False)
+    if isinstance(cached_matrix, list) and cached_matrix:
+        values = extract_column_values_from_rows(
+            cached_matrix,
+            safe_col_idx,
+            start_row=safe_start_row,
+            max_rows=scan_max_rows,
+            empty_streak_limit=empty_streak_limit,
+        )
+        SHEET_COLUMN_CACHE[cache_key] = {
+            "updated_at": now.isoformat(),
+            "values": values,
+        }
+        return list(values or [])
+    if stale_values and is_sheets_quota_cooldown_active():
+        return stale_values
     try:
-        while scanned_rows < scan_max_rows:
-            take_rows = min(chunk_size, scan_max_rows - scanned_rows)
-            end_row = current_row + take_rows - 1
-            range_a1 = f"{col_a1}{current_row}:{col_a1}{end_row}"
-            block = sheet.get(range_a1)
-            if not block:
-                break
-            for row in block:
-                cell_val = str((row[0] if row else "") or "").strip()
-                values.append(cell_val)
-                scanned_rows += 1
-                if cell_val:
-                    empty_streak = 0
-                else:
-                    empty_streak += 1
-                if empty_streak >= empty_streak_limit:
-                    break
-            if len(block) < take_rows or empty_streak >= empty_streak_limit:
-                break
-            current_row = end_row + 1
+        matrix_rows = get_sheet_all_values_cached(sheet)
+        values = extract_column_values_from_rows(
+            matrix_rows,
+            safe_col_idx,
+            start_row=safe_start_row,
+            max_rows=scan_max_rows,
+            empty_streak_limit=empty_streak_limit,
+        )
     except Exception as exc:
+        if is_quota_or_rate_limit_error(exc):
+            mark_sheets_quota_cooldown(exc, context=f"column {sheet_name}:{col_to_a1(safe_col_idx)}")
         if stale_values and is_quota_or_rate_limit_error(exc):
             return stale_values
         raise
@@ -6640,6 +6770,8 @@ def build_posts_panel_html(sheet=None, state=None):
         entry_slug = build_dom_slug(f"{entry_sheet_id}-{entry_sheet_name}", "sheet")
         
         try:
+            if is_sheets_quota_cooldown_active():
+                raise RuntimeError("Google Sheet quota cooldown active")
             # Optional stagger between sheets to reduce burst traffic to Google APIs.
             if entry_index > 0 and POSTS_TAB_BUILD_STAGGER_SECONDS > 0:
                 time.sleep(POSTS_TAB_BUILD_STAGGER_SECONDS)
@@ -6979,6 +7111,11 @@ def ensure_dashboard_date_column(sheet, layout=None, col_map=None, state=None):
     if resolved_col_map.get("date"):
         return resolved_col_map
     headers = list(resolved_layout.get("headers") or [])
+    if not headers:
+        cached_values = get_cached_sheet_data_values(sheet=sheet, fresh_only=False)
+        header_row = max(1, int(resolved_layout.get("header_row") or 1))
+        if isinstance(cached_values, list) and len(cached_values) >= header_row:
+            headers = list(cached_values[header_row - 1] or [])
     if not headers:
         try:
             headers = sheet.row_values(max(1, int(resolved_layout.get("header_row") or 1)))
@@ -7580,6 +7717,8 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         runtime_state["pending_updates"] = []
         set_run_progress(phase="error", state=runtime_state)
         error_text = str(e).strip() or "Unknown error"
+        if is_quota_or_rate_limit_error(e) or "quota cooldown" in error_text.lower():
+            error_text = "Google Sheet đang chạm giới hạn đọc dữ liệu. Hệ thống sẽ ưu tiên cache tạm thời, thử lại sau 1-2 phút."
         runtime_state["is_running"], runtime_state["current_task"] = False, f"Lỗi: {error_text[:160]}"
         logger(f"Lỗi hệ thống: {str(e)}")
     finally:
@@ -8585,7 +8724,7 @@ async def delete_schedule_entry(request: Request):
 
 _DETECT_TAB_COLUMNS_CACHE = {}  # key: (version, owner_email, sheet_id, tab_name, mode) -> (timestamp, result)
 _DETECT_TAB_COLUMNS_TTL = 900   # 15 minutes
-AUTO_DETECT_BATCH_WORKERS = max(2, int(os.getenv("AUTO_DETECT_BATCH_WORKERS", "4")))
+AUTO_DETECT_BATCH_WORKERS = max(1, int(os.getenv("AUTO_DETECT_BATCH_WORKERS", "2")))
 
 @app.get("/detect-tab-columns")
 def detect_tab_columns(request: Request, tab_name: str = "", mode: str = "effective"):
@@ -8726,7 +8865,8 @@ async def detect_tab_columns_batch(request: Request):
         }
 
     if tabs_to_scan:
-        worker_count = max(1, min(AUTO_DETECT_BATCH_WORKERS, len(tabs_to_scan)))
+        worker_limit = 1 if is_sheets_quota_cooldown_active() else AUTO_DETECT_BATCH_WORKERS
+        worker_count = max(1, min(worker_limit, len(tabs_to_scan)))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_map = {executor.submit(_scan_one_tab, tab): tab for tab in tabs_to_scan}
             for future, tab in future_map.items():
@@ -9353,7 +9493,7 @@ def api_dashboard_overview(background_tasks: BackgroundTasks, request: Request):
         return {"error": "Unauthorized", "html": ""}
     user_email = current_user.get("email", "")
     cached_html, is_fresh = get_dashboard_cached_section(user_email, "overview", allow_legacy_version=True)
-    needs_refresh = not is_fresh
+    needs_refresh = (not is_fresh) and (not is_sheets_quota_cooldown_active())
 
     if needs_refresh:
         schedule_dashboard_refresh(background_tasks, user_email, "overview")
@@ -9406,7 +9546,7 @@ def api_dashboard_posts(background_tasks: BackgroundTasks, request: Request):
     
     user_email = current_user.get("email", "")
     cached_html, is_fresh = get_dashboard_cached_section(user_email, "posts", allow_legacy_version=False)
-    needs_refresh = not is_fresh
+    needs_refresh = (not is_fresh) and (not is_sheets_quota_cooldown_active())
 
     if needs_refresh:
         schedule_dashboard_refresh(background_tasks, user_email, "posts")
@@ -9483,7 +9623,7 @@ def api_dashboard_config(background_tasks: BackgroundTasks, request: Request):
     
     user_email = current_user.get("email", "")
     cached_html, is_fresh = get_dashboard_cached_section(user_email, "config", allow_legacy_version=True)
-    needs_refresh = not is_fresh
+    needs_refresh = (not is_fresh) and (not is_sheets_quota_cooldown_active())
 
     if needs_refresh:
         schedule_dashboard_refresh(background_tasks, user_email, "config")
@@ -9502,7 +9642,7 @@ def api_dashboard_schedule(background_tasks: BackgroundTasks, request: Request):
     
     user_email = current_user.get("email", "")
     cached_html, is_fresh = get_dashboard_cached_section(user_email, "schedule", allow_legacy_version=True)
-    needs_refresh = not is_fresh
+    needs_refresh = (not is_fresh) and (not is_sheets_quota_cooldown_active())
 
     if needs_refresh:
         schedule_dashboard_refresh(background_tasks, user_email, "schedule")
