@@ -5690,7 +5690,7 @@ def collect_posts_dataset_for_worksheet(
             )
             rows_html.append(
                 f"""
-                <tr class="post-row posts-table-row" data-platform="{platform_key}" data-search="{search_blob}" data-post-link="{safe_link}" data-post-title="{safe_title_attr}" data-post-platform="{safe_platform_attr}" data-post-date="{safe_date_attr}" data-post-sheet="{safe_sheet_name_attr}" data-creator-key="{safe_creator_key}" data-creator-name="{safe_creator_attr}">
+                <tr class="post-row posts-table-row" data-platform="{platform_key}" data-search="{search_blob}" data-post-link="{safe_link}" data-post-title="{safe_title_attr}" data-post-platform="{safe_platform_attr}" data-post-date="{safe_date_attr}" data-post-sheet="{safe_sheet_name_attr}" data-creator-key="{safe_creator_key}" data-creator-name="{safe_creator_attr}" data-post-tier="{html.escape(kol_tier, quote=True)}" data-post-view="{view}">
                     <td class="posts-cell posts-cell-check">
                         <input
                             type="checkbox"
@@ -6532,6 +6532,9 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
                                 <div class="posts-columns-list" data-post-columns-list></div>
                             </div>
                         </div>
+                        <button type="button" class="posts-toolbar-btn posts-toplist-btn" data-posts-toplist-open>
+                            <i class="fa-solid fa-trophy"></i> Top List
+                        </button>
                         <button type="button" class="posts-toolbar-btn posts-rerun-btn"><i class="fa-solid fa-rotate-left"></i> Chạy lại</button>
                     </div>
                 </div>
@@ -6598,6 +6601,53 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
                         </button>
                     </div>
                     <div class="posts-creator-modal-list" data-posts-creator-modal-list></div>
+                </div>
+            </div>
+            <div class="posts-toplist-modal hidden" data-posts-toplist-modal aria-hidden="true">
+                <div class="posts-toplist-modal-backdrop" data-posts-toplist-close></div>
+                <div class="posts-toplist-modal-card" role="dialog" aria-modal="true" aria-label="Top List theo view">
+                    <div class="posts-toplist-modal-head">
+                        <div>
+                            <div class="posts-toplist-modal-kicker">Top List</div>
+                            <div class="posts-toplist-modal-title">Xếp hạng theo View</div>
+                            <div class="posts-toplist-modal-sub">Lọc theo tier và tháng dựa trên Aired Date của bài đăng.</div>
+                        </div>
+                        <button type="button" class="posts-toplist-modal-close" data-posts-toplist-close aria-label="Đóng">
+                            <i class="fa-solid fa-xmark"></i>
+                        </button>
+                    </div>
+                    <div class="posts-toplist-controls">
+                        <label class="posts-toplist-control">
+                            <span>Tier</span>
+                            <select class="posts-toplist-select" data-posts-toplist-tier>
+                                <option value="">Tất cả tier</option>
+                            </select>
+                        </label>
+                        <label class="posts-toplist-control">
+                            <span>Tháng Aired Date</span>
+                            <select class="posts-toplist-select" data-posts-toplist-month>
+                                <option value="">Tất cả tháng</option>
+                            </select>
+                        </label>
+                    </div>
+                    <div class="posts-toplist-summary" data-posts-toplist-summary>Chưa có dữ liệu để xếp hạng.</div>
+                    <div class="posts-toplist-table-wrap">
+                        <table class="posts-toplist-table">
+                            <thead>
+                                <tr>
+                                    <th>Top</th>
+                                    <th>Creator</th>
+                                    <th>Tier</th>
+                                    <th>Bài</th>
+                                    <th class="text-right">Tổng view</th>
+                                    <th class="text-right">View cao nhất</th>
+                                    <th>Bài nổi bật</th>
+                                </tr>
+                            </thead>
+                            <tbody data-posts-toplist-body></tbody>
+                        </table>
+                        <div class="posts-toplist-empty hidden" data-posts-toplist-empty>Không có creator nào khớp bộ lọc hiện tại.</div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -11398,6 +11448,9 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 .posts-detail-summary-grid {{
                     grid-template-columns: repeat(2, minmax(0, 1fr));
                 }}
+                .posts-toplist-controls {{
+                    grid-template-columns: minmax(0, 1fr);
+                }}
             }}
             @media (max-width: 1480px) {{
                 .posts-table {{
@@ -12517,6 +12570,216 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 padding: 14px;
                 border-radius: 12px;
                 border: 1px dashed rgba(148, 163, 184, 0.28);
+                color: #94a3b8;
+                font-size: 13px;
+                text-align: center;
+            }}
+            .posts-toplist-modal {{
+                position: fixed;
+                inset: 0;
+                z-index: 96;
+            }}
+            .posts-toplist-modal-backdrop {{
+                position: absolute;
+                inset: 0;
+                background: rgba(2, 6, 23, 0.78);
+                backdrop-filter: blur(2px);
+            }}
+            .posts-toplist-modal-card {{
+                position: relative;
+                width: min(1040px, calc(100% - 24px));
+                max-height: calc(100vh - 40px);
+                overflow: hidden;
+                margin: 20px auto;
+                border-radius: 20px;
+                border: 1px solid rgba(148, 163, 184, 0.2);
+                background: linear-gradient(180deg, rgba(15, 23, 42, 0.99), rgba(15, 23, 42, 0.96));
+                box-shadow: 0 22px 48px rgba(2, 6, 23, 0.5);
+                display: flex;
+                flex-direction: column;
+            }}
+            .posts-toplist-modal-head {{
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 16px;
+                padding: 18px 20px 14px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+            }}
+            .posts-toplist-modal-kicker {{
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: 0.16em;
+                text-transform: uppercase;
+                color: #67e8f9;
+            }}
+            .posts-toplist-modal-title {{
+                margin-top: 4px;
+                font-size: 22px;
+                line-height: 1.2;
+                font-weight: 900;
+                color: #f8fafc;
+            }}
+            .posts-toplist-modal-sub {{
+                margin-top: 4px;
+                font-size: 12px;
+                font-weight: 700;
+                color: #94a3b8;
+            }}
+            .posts-toplist-modal-close {{
+                width: 36px;
+                height: 36px;
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 0.24);
+                background: rgba(30, 41, 59, 0.75);
+                color: #e2e8f0;
+                cursor: pointer;
+            }}
+            .posts-toplist-modal-close:hover {{
+                background: rgba(51, 65, 85, 0.84);
+            }}
+            .posts-toplist-controls {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 14px;
+                padding: 18px 20px 0;
+            }}
+            .posts-toplist-control {{
+                display: grid;
+                gap: 8px;
+            }}
+            .posts-toplist-control span {{
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: 0.14em;
+                text-transform: uppercase;
+                color: #94a3b8;
+            }}
+            .posts-toplist-select {{
+                width: 100%;
+                min-height: 44px;
+                padding: 0 14px;
+                border-radius: 12px;
+                border: 1px solid rgba(148, 163, 184, 0.18);
+                background: rgba(15, 23, 42, 0.84);
+                color: #f8fafc;
+                font-size: 14px;
+                font-weight: 700;
+                outline: none;
+            }}
+            .posts-toplist-select:focus {{
+                border-color: rgba(56, 189, 248, 0.45);
+                box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.16);
+            }}
+            .posts-toplist-summary {{
+                margin: 16px 20px 0;
+                padding: 12px 14px;
+                border-radius: 14px;
+                border: 1px solid rgba(96, 165, 250, 0.18);
+                background: rgba(30, 41, 59, 0.42);
+                color: #dbeafe;
+                font-size: 13px;
+                font-weight: 700;
+            }}
+            .posts-toplist-table-wrap {{
+                padding: 16px 20px 20px;
+                overflow: auto;
+            }}
+            .posts-toplist-table {{
+                width: 100%;
+                min-width: 760px;
+                border-collapse: separate;
+                border-spacing: 0;
+            }}
+            .posts-toplist-table thead th {{
+                position: sticky;
+                top: 0;
+                z-index: 1;
+                padding: 12px 12px;
+                text-align: left;
+                font-size: 11px;
+                font-weight: 900;
+                letter-spacing: 0.16em;
+                text-transform: uppercase;
+                color: #94a3b8;
+                background: rgba(15, 23, 42, 0.96);
+                border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+            }}
+            .posts-toplist-table tbody td {{
+                padding: 14px 12px;
+                border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+                color: #e2e8f0;
+                font-size: 13px;
+                vertical-align: top;
+            }}
+            .posts-toplist-rank {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 34px;
+                height: 34px;
+                padding: 0 10px;
+                border-radius: 999px;
+                background: rgba(14, 165, 233, 0.14);
+                border: 1px solid rgba(56, 189, 248, 0.24);
+                color: #67e8f9;
+                font-size: 12px;
+                font-weight: 900;
+            }}
+            .posts-toplist-creator {{
+                display: grid;
+                gap: 4px;
+            }}
+            .posts-toplist-creator-name {{
+                font-size: 14px;
+                font-weight: 900;
+                color: #f8fafc;
+                word-break: break-word;
+            }}
+            .posts-toplist-creator-sub {{
+                font-size: 12px;
+                color: #94a3b8;
+            }}
+            .posts-toplist-tier-badges {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+            }}
+            .posts-toplist-tier-badge {{
+                display: inline-flex;
+                align-items: center;
+                padding: 4px 8px;
+                border-radius: 999px;
+                background: rgba(245, 158, 11, 0.12);
+                border: 1px solid rgba(245, 158, 11, 0.2);
+                color: #fbbf24;
+                font-size: 11px;
+                font-weight: 800;
+            }}
+            .posts-toplist-metric {{
+                text-align: right;
+                white-space: nowrap;
+                font-size: 14px;
+                font-weight: 900;
+                color: #f8fafc;
+            }}
+            .posts-toplist-link {{
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                color: #93c5fd;
+                font-size: 12px;
+                font-weight: 800;
+                text-decoration: none;
+                word-break: break-word;
+            }}
+            .posts-toplist-link:hover {{
+                color: #bfdbfe;
+            }}
+            .posts-toplist-empty {{
+                padding: 18px 16px;
+                border-radius: 14px;
+                border: 1px dashed rgba(148, 163, 184, 0.24);
                 color: #94a3b8;
                 font-size: 13px;
                 text-align: center;
@@ -13715,6 +13978,48 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             html[data-theme="light"] .posts-creator-modal-close:hover {{
                 background: rgba(226, 232, 240, 0.9);
+            }}
+            html[data-theme="light"] .posts-toplist-modal-card {{
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.98));
+                border-color: rgba(148, 163, 184, 0.26);
+                box-shadow: 0 20px 36px rgba(148, 163, 184, 0.2);
+            }}
+            html[data-theme="light"] .posts-toplist-modal-title,
+            html[data-theme="light"] .posts-toplist-creator-name,
+            html[data-theme="light"] .posts-toplist-metric {{
+                color: #0f172a;
+            }}
+            html[data-theme="light"] .posts-toplist-modal-sub,
+            html[data-theme="light"] .posts-toplist-control span,
+            html[data-theme="light"] .posts-toplist-creator-sub,
+            html[data-theme="light"] .posts-toplist-table thead th {{
+                color: #64748b;
+            }}
+            html[data-theme="light"] .posts-toplist-select {{
+                background: rgba(255, 255, 255, 0.96);
+                border-color: rgba(148, 163, 184, 0.26);
+                color: #0f172a;
+            }}
+            html[data-theme="light"] .posts-toplist-summary {{
+                background: rgba(239, 246, 255, 0.9);
+                border-color: rgba(96, 165, 250, 0.2);
+                color: #1e3a8a;
+            }}
+            html[data-theme="light"] .posts-toplist-table tbody td {{
+                color: #334155;
+                border-bottom-color: rgba(148, 163, 184, 0.18);
+            }}
+            html[data-theme="light"] .posts-toplist-modal-close {{
+                background: rgba(248, 250, 252, 0.95);
+                border-color: rgba(148, 163, 184, 0.28);
+                color: #0f172a;
+            }}
+            html[data-theme="light"] .posts-toplist-modal-close:hover {{
+                background: rgba(226, 232, 240, 0.9);
+            }}
+            html[data-theme="light"] .posts-toplist-empty {{
+                color: #64748b;
+                border-color: rgba(148, 163, 184, 0.28);
             }}
             html[data-theme="light"] .text-amber-200,
             html[data-theme="light"] .text-amber-300,
@@ -18061,6 +18366,45 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     updatePanelSelectAllState(panel);
                 }};
 
+                const parsePostsTopListDate = (value) => {{
+                    const raw = String(value || "").trim();
+                    if (!raw || raw === "-") return null;
+                    const normalized = raw.replace(/\s+/g, " ");
+                    const dmyMatch = normalized.match(/^(\d{{1,2}})\/(\d{{1,2}})\/(\d{{4}})/);
+                    if (dmyMatch) {{
+                        const day = Number.parseInt(dmyMatch[1], 10);
+                        const month = Number.parseInt(dmyMatch[2], 10);
+                        const year = Number.parseInt(dmyMatch[3], 10);
+                        const parsed = new Date(year, month - 1, day);
+                        if (
+                            Number.isFinite(parsed.getTime())
+                            && parsed.getFullYear() === year
+                            && parsed.getMonth() === month - 1
+                            && parsed.getDate() === day
+                        ) {{
+                            return parsed;
+                        }}
+                    }}
+                    const isoMatch = normalized.match(/^(\d{{4}})-(\d{{2}})-(\d{{2}})/);
+                    if (isoMatch) {{
+                        const parsed = new Date(`${{isoMatch[1]}}-${{isoMatch[2]}}-${{isoMatch[3]}}T00:00:00`);
+                        return Number.isNaN(parsed.getTime()) ? null : parsed;
+                    }}
+                    return null;
+                }};
+
+                const formatPostsTopListMonthKey = (sourceDate) => {{
+                    if (!(sourceDate instanceof Date) || Number.isNaN(sourceDate.getTime())) return "";
+                    const mm = `${{sourceDate.getMonth() + 1}}`.padStart(2, "0");
+                    return `${{sourceDate.getFullYear()}}-${{mm}}`;
+                }};
+
+                const formatPostsTopListMonthLabel = (sourceDate) => {{
+                    if (!(sourceDate instanceof Date) || Number.isNaN(sourceDate.getTime())) return "Không rõ tháng";
+                    const mm = `${{sourceDate.getMonth() + 1}}`.padStart(2, "0");
+                    return `Tháng ${{mm}}/${{sourceDate.getFullYear()}}`;
+                }};
+
                 const applyPostsMasterFilters = () => {{
                     const term = (postsMasterSearchField?.value || "").trim().toLowerCase();
                     const activeCampaign = postsMasterCampaignFilter || "all";
@@ -18450,6 +18794,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         modal.classList.add("hidden");
                         modal.setAttribute("aria-hidden", "true");
                     }});
+                    document.querySelectorAll("[data-posts-toplist-modal]").forEach((modal) => {{
+                        modal.classList.add("hidden");
+                        modal.setAttribute("aria-hidden", "true");
+                    }});
                     const safeSlug = postsTabCards.some((card) => card.dataset.postsTabTrigger === tabSlug)
                         ? tabSlug
                         : "";
@@ -18736,6 +19084,212 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             }});
                         }});
 
+                        const topListModal = panel.querySelector("[data-posts-toplist-modal]");
+                        const topListOpenButton = panel.querySelector("[data-posts-toplist-open]");
+                        const topListTierSelect = topListModal?.querySelector("[data-posts-toplist-tier]");
+                        const topListMonthSelect = topListModal?.querySelector("[data-posts-toplist-month]");
+                        const topListSummary = topListModal?.querySelector("[data-posts-toplist-summary]");
+                        const topListBody = topListModal?.querySelector("[data-posts-toplist-body]");
+                        const topListEmpty = topListModal?.querySelector("[data-posts-toplist-empty]");
+
+                        const closeTopListModal = () => {{
+                            if (!topListModal) return;
+                            topListModal.classList.add("hidden");
+                            topListModal.setAttribute("aria-hidden", "true");
+                        }};
+
+                        const collectTopListEntries = () => {{
+                            return Array.from(panel.querySelectorAll(".post-row")).map((row, index) => {{
+                                const creatorName = String(
+                                    row.dataset.creatorName
+                                    || row.querySelector(".post-creator-name")?.textContent
+                                    || row.querySelector('[data-post-col="creator"]')?.textContent
+                                    || "Khác"
+                                ).trim() || "Khác";
+                                const creatorKey = String(row.dataset.creatorKey || creatorName.toLowerCase()).trim();
+                                const tierText = String(
+                                    row.dataset.postTier
+                                    || row.querySelector('[data-post-col="tier"]')?.textContent
+                                    || "-"
+                                ).trim() || "-";
+                                const dateText = String(row.dataset.postDate || "").trim();
+                                const airedAt = parsePostsTopListDate(dateText);
+                                const monthKey = airedAt ? formatPostsTopListMonthKey(airedAt) : "";
+                                const title = String(row.dataset.postTitle || "").trim();
+                                const link = String(row.dataset.postLink || "").trim();
+                                let viewValue = 0n;
+                                const rawDatasetView = String(row.dataset.postView || "").trim();
+                                if (/^-?\d+$/.test(rawDatasetView)) {{
+                                    try {{
+                                        viewValue = BigInt(rawDatasetView);
+                                    }} catch (_) {{
+                                        viewValue = 0n;
+                                    }}
+                                }} else {{
+                                    const parsedCellValue = parseMetricCellNumber(
+                                        row.querySelector('[data-post-col="view"]')?.textContent || ""
+                                    );
+                                    viewValue = parsedCellValue ?? 0n;
+                                }}
+                                return {{
+                                    creatorName,
+                                    creatorKey,
+                                    tierText,
+                                    dateText: dateText || "-",
+                                    airedAt,
+                                    monthKey,
+                                    title,
+                                    link,
+                                    viewValue,
+                                    rowOrder: index,
+                                }};
+                            }});
+                        }};
+
+                        const refreshTopListFilterOptions = () => {{
+                            if (!topListTierSelect || !topListMonthSelect) return;
+                            const entries = collectTopListEntries();
+                            const currentTier = topListTierSelect.value || "";
+                            const currentMonth = topListMonthSelect.value || "";
+                            const tiers = Array.from(
+                                new Set(
+                                    entries
+                                        .map((item) => String(item.tierText || "").trim())
+                                        .filter((value) => value && value !== "-")
+                                )
+                            ).sort((left, right) => left.localeCompare(right, "vi"));
+                            const months = Array.from(
+                                new Map(
+                                    entries
+                                        .filter((item) => item.airedAt && item.monthKey)
+                                        .sort((left, right) => right.airedAt - left.airedAt)
+                                        .map((item) => [
+                                            item.monthKey,
+                                            formatPostsTopListMonthLabel(item.airedAt),
+                                        ])
+                                ).entries()
+                            );
+
+                            topListTierSelect.innerHTML = [
+                                '<option value="">Tất cả tier</option>',
+                                ...tiers.map((tier) => `<option value="${{escapeMarkup(tier)}}">${{escapeMarkup(tier)}}</option>`),
+                            ].join("");
+                            topListMonthSelect.innerHTML = [
+                                '<option value="">Tất cả tháng</option>',
+                                ...months.map(([key, label]) => `<option value="${{escapeMarkup(key)}}">${{escapeMarkup(label)}}</option>`),
+                            ].join("");
+
+                            topListTierSelect.value = tiers.includes(currentTier) ? currentTier : "";
+                            topListMonthSelect.value = months.some(([key]) => key === currentMonth) ? currentMonth : "";
+                        }};
+
+                        const renderTopList = () => {{
+                            if (!topListBody || !topListSummary || !topListEmpty) return;
+                            const entries = collectTopListEntries();
+                            const selectedTier = String(topListTierSelect?.value || "").trim();
+                            const selectedMonth = String(topListMonthSelect?.value || "").trim();
+                            const filtered = entries.filter((item) => {{
+                                const tierMatches = !selectedTier || item.tierText === selectedTier;
+                                const monthMatches = !selectedMonth || item.monthKey === selectedMonth;
+                                return tierMatches && monthMatches;
+                            }});
+
+                            const grouped = new Map();
+                            filtered.forEach((item) => {{
+                                const bucketKey = item.creatorKey || item.creatorName.toLowerCase();
+                                if (!grouped.has(bucketKey)) {{
+                                    grouped.set(bucketKey, {{
+                                        creatorName: item.creatorName,
+                                        creatorKey: bucketKey,
+                                        tiers: new Set(),
+                                        totalViews: 0n,
+                                        peakViews: 0n,
+                                        postCount: 0,
+                                        bestLink: item.link,
+                                        bestTitle: item.title,
+                                        bestDate: item.dateText,
+                                    }});
+                                }}
+                                const bucket = grouped.get(bucketKey);
+                                bucket.postCount += 1;
+                                bucket.totalViews += item.viewValue;
+                                if (item.tierText && item.tierText !== "-") {{
+                                    bucket.tiers.add(item.tierText);
+                                }}
+                                if (item.viewValue >= bucket.peakViews) {{
+                                    bucket.peakViews = item.viewValue;
+                                    bucket.bestLink = item.link;
+                                    bucket.bestTitle = item.title;
+                                    bucket.bestDate = item.dateText;
+                                }}
+                            }});
+
+                            const results = Array.from(grouped.values()).sort((left, right) => {{
+                                if (left.totalViews !== right.totalViews) {{
+                                    return left.totalViews > right.totalViews ? -1 : 1;
+                                }}
+                                if (left.peakViews !== right.peakViews) {{
+                                    return left.peakViews > right.peakViews ? -1 : 1;
+                                }}
+                                if (left.postCount !== right.postCount) {{
+                                    return right.postCount - left.postCount;
+                                }}
+                                return left.creatorName.localeCompare(right.creatorName, "vi");
+                            }});
+
+                            const totalViews = filtered.reduce((acc, item) => acc + item.viewValue, 0n);
+                            const activeMonthLabel = selectedMonth
+                                ? (topListMonthSelect?.selectedOptions?.[0]?.textContent || selectedMonth)
+                                : "Tất cả tháng";
+                            const activeTierLabel = selectedTier || "Tất cả tier";
+                            topListSummary.textContent = `${{results.length}} creator • ${{filtered.length}} bài • ${{formatCompactBigInt(totalViews)}} view • ${{activeTierLabel}} • ${{activeMonthLabel}}`;
+
+                            if (!results.length) {{
+                                topListBody.innerHTML = "";
+                                topListEmpty.classList.remove("hidden");
+                                return;
+                            }}
+
+                            topListEmpty.classList.add("hidden");
+                            topListBody.innerHTML = results.map((item, index) => {{
+                                const tierList = Array.from(item.tiers).sort((left, right) => left.localeCompare(right, "vi"));
+                                const tierBadges = tierList.length
+                                    ? tierList.map((tier) => `<span class="posts-toplist-tier-badge">${{escapeMarkup(tier)}}</span>`).join("")
+                                    : '<span class="posts-toplist-tier-badge">-</span>';
+                                const safeCreator = escapeMarkup(item.creatorName || "Khác");
+                                const safeDate = escapeMarkup(item.bestDate || "-");
+                                const bestTitleSource = String(item.bestTitle || item.bestLink || "Mở bài nổi bật").trim();
+                                const bestTitle = escapeMarkup(bestTitleSource.length > 46 ? `${{bestTitleSource.slice(0, 43)}}...` : bestTitleSource);
+                                const safeLink = escapeMarkup(item.bestLink || "");
+                                return `
+                                    <tr>
+                                        <td><span class="posts-toplist-rank">#${{index + 1}}</span></td>
+                                        <td>
+                                            <div class="posts-toplist-creator">
+                                                <div class="posts-toplist-creator-name">${{safeCreator}}</div>
+                                                <div class="posts-toplist-creator-sub">Bài nổi bật: ${{safeDate}}</div>
+                                            </div>
+                                        </td>
+                                        <td><div class="posts-toplist-tier-badges">${{tierBadges}}</div></td>
+                                        <td>${{item.postCount}}</td>
+                                        <td class="posts-toplist-metric">${{formatCompactBigInt(item.totalViews)}}</td>
+                                        <td class="posts-toplist-metric">${{formatCompactBigInt(item.peakViews)}}</td>
+                                        <td>
+                                            ${{safeLink ? `<a href="${{safeLink}}" target="_blank" rel="noreferrer" class="posts-toplist-link"><i class="fa-solid fa-up-right-from-square"></i><span>${{bestTitle}}</span></a>` : '<span class="posts-toplist-creator-sub">Không có link</span>'}}
+                                        </td>
+                                    </tr>
+                                `;
+                            }}).join("");
+                        }};
+
+                        const openTopListModal = () => {{
+                            if (!topListModal) return;
+                            refreshTopListFilterOptions();
+                            renderTopList();
+                            topListModal.classList.remove("hidden");
+                            topListModal.setAttribute("aria-hidden", "false");
+                        }};
+
                         const creatorModal = panel.querySelector("[data-posts-creator-modal]");
                         const creatorModalTitle = creatorModal?.querySelector("[data-posts-creator-modal-title]");
                         const creatorModalCount = creatorModal?.querySelector("[data-posts-creator-modal-count]");
@@ -18824,6 +19378,35 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                     closeCreatorModal();
                                 }});
                             }});
+                        }}
+
+                        if (topListModal && topListModal.dataset.bound !== "1") {{
+                            topListModal.dataset.bound = "1";
+                            topListModal.querySelectorAll("[data-posts-toplist-close]").forEach((node) => {{
+                                node.addEventListener("click", (event) => {{
+                                    event.preventDefault();
+                                    closeTopListModal();
+                                }});
+                            }});
+                        }}
+
+                        if (topListOpenButton && topListOpenButton.dataset.bound !== "1") {{
+                            topListOpenButton.dataset.bound = "1";
+                            topListOpenButton.addEventListener("click", (event) => {{
+                                event.preventDefault();
+                                event.stopPropagation();
+                                openTopListModal();
+                            }});
+                        }}
+
+                        if (topListTierSelect && topListTierSelect.dataset.bound !== "1") {{
+                            topListTierSelect.dataset.bound = "1";
+                            topListTierSelect.addEventListener("change", () => renderTopList());
+                        }}
+
+                        if (topListMonthSelect && topListMonthSelect.dataset.bound !== "1") {{
+                            topListMonthSelect.dataset.bound = "1";
+                            topListMonthSelect.addEventListener("change", () => renderTopList());
                         }}
 
                         panel.querySelectorAll("[data-post-creator-open]").forEach((button) => {{
