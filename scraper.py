@@ -220,7 +220,7 @@ LINK_RESOLVE_CACHE = {}  # {raw_url: {"final_url": "...", "updated_at": iso}}
 LINK_RESOLVE_CACHE_TTL_SECONDS = 1800
 # Bump khi thay đổi markup dashboard để invalidate cache HTML cũ (overview/posts/config/schedule).
 DASHBOARD_POSTS_CACHE_FORMAT_VERSION = 11
-DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION = 2
+DETECT_TAB_COLUMNS_CACHE_FORMAT_VERSION = 3
 MAX_RUNTIME_LOG_LINES = max(100, int(os.getenv("MAX_RUNTIME_LOG_LINES", "400")))
 MAX_RUNTIME_LOG_RENDER_LINES = max(50, int(os.getenv("MAX_RUNTIME_LOG_RENDER_LINES", "160")))
 SHEET_TABS_REQUEST_LIMITER = {}  # {sheet_id: last_request_time}
@@ -4509,15 +4509,8 @@ def list_spreadsheet_tabs(sheet_input: str):
     global SHEET_TABS_CACHE
     now = datetime.now()
     cache_entry = SHEET_TABS_CACHE.get(sheet_id)
-    if cache_entry:
-        try:
-            updated_at = datetime.fromisoformat(cache_entry["updated_at"])
-            if (now - updated_at).total_seconds() < SHEET_TABS_CACHE_TTL_SECONDS:
-                return cache_entry["tabs"]
-        except Exception:
-            pass
-        if is_sheets_quota_cooldown_active() and cache_entry.get("tabs"):
-            return cache_entry["tabs"]
+    if is_sheets_quota_cooldown_active() and cache_entry and cache_entry.get("tabs"):
+        return cache_entry["tabs"]
     
     def _fetch_tabs():
         gc = get_gspread_client()
@@ -4649,14 +4642,23 @@ def extract_column_values_from_rows(
     return values
 
 def _infer_sheet_layout_from_rows(batch_rows):
-    best_row = 1
-    best_headers = []
-    best_columns = {}
-    best_score = -1
-    normalized_rows = list(batch_rows or [])
-    for row_idx, headers in enumerate(normalized_rows, start=1):
-        if not any(str(cell or "").strip() for cell in headers):
-            continue
+    def _merge_header_rows(upper_row, lower_row):
+        upper_values = list(upper_row or [])
+        lower_values = list(lower_row or [])
+        max_width = max(len(upper_values), len(lower_values))
+        merged = []
+        for idx in range(max_width):
+            upper_text = str(upper_values[idx] if idx < len(upper_values) else "" or "").strip()
+            lower_text = str(lower_values[idx] if idx < len(lower_values) else "" or "").strip()
+            if upper_text and lower_text:
+                normalized_upper = normalize_header(upper_text)
+                normalized_lower = normalize_header(lower_text)
+                merged.append(lower_text if normalized_upper == normalized_lower else f"{upper_text} {lower_text}".strip())
+            else:
+                merged.append(lower_text or upper_text)
+        return merged
+
+    def _score_header_candidate(headers):
         strict_columns = detect_columns_from_headers(headers, allow_partial=False)
         relaxed_columns = detect_columns_from_headers(headers, allow_partial=True)
         columns = dict(strict_columns)
@@ -4665,25 +4667,53 @@ def _infer_sheet_layout_from_rows(batch_rows):
 
         populated_cells = sum(1 for cell in headers if str(cell or "").strip())
         if populated_cells < 3 and len(columns) < 2:
-            continue
+            return None
 
+        strict_metric_hits = sum(1 for metric in ("view", "like", "share", "comment", "save", "buzz") if metric in strict_columns)
+        loose_metric_hits = sum(1 for metric in ("view", "like", "share", "comment", "save", "buzz") if metric in columns)
         score = (len(strict_columns) * 5) + (len(columns) * 2)
         if "link" in strict_columns:
             score += 8
         elif "link" in columns:
             score += 4
-        if any(metric in strict_columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
-            score += 4
-        elif any(metric in columns for metric in ("view", "like", "share", "comment", "save", "buzz")):
-            score += 2
+        if strict_metric_hits:
+            score += 4 + (strict_metric_hits * 3)
+        elif loose_metric_hits:
+            score += 2 + (loose_metric_hits * 2)
         if "date" in strict_columns or "air_date" in strict_columns:
             score += 2
+        if strict_metric_hits >= 2:
+            score += 6
+        elif loose_metric_hits >= 2:
+            score += 3
+        return {
+            "strict_columns": strict_columns,
+            "columns": columns,
+            "score": score,
+        }
 
-        if score > best_score:
-            best_row = row_idx
-            best_headers = headers
-            best_columns = columns
-            best_score = score
+    best_row = 1
+    best_headers = []
+    best_columns = {}
+    best_score = -1
+    normalized_rows = list(batch_rows or [])
+    for row_idx, headers in enumerate(normalized_rows, start=1):
+        if not any(str(cell or "").strip() for cell in headers):
+            continue
+        candidate_rows = [(row_idx, list(headers or []))]
+        if row_idx > 1:
+            candidate_rows.append((row_idx, _merge_header_rows(normalized_rows[row_idx - 2], headers)))
+
+        for candidate_row_idx, candidate_headers in candidate_rows:
+            scored = _score_header_candidate(candidate_headers)
+            if not scored:
+                continue
+            score = int(scored["score"] or 0)
+            if score > best_score:
+                best_row = candidate_row_idx
+                best_headers = candidate_headers
+                best_columns = dict(scored["columns"] or {})
+                best_score = score
 
     if best_score < 0 and normalized_rows:
         best_headers = normalized_rows[0]
@@ -9541,23 +9571,9 @@ def sheet_tabs(request: Request, sheet_url: str = ""):
             "message": "Dán link Google Sheet hoặc Sheet ID hợp lệ để tải danh sách tab.",
         }
     
-    now = datetime.now()
-    last_request_time = SHEET_TABS_REQUEST_LIMITER.get(requested_sheet_id)
-    time_since_last = (now - last_request_time).total_seconds() if last_request_time else SHEET_TABS_MIN_INTERVAL_SECONDS
-    
-    if time_since_last < SHEET_TABS_MIN_INTERVAL_SECONDS:
-        cached_entry = SHEET_TABS_CACHE.get(requested_sheet_id)
-        if cached_entry:
-            return {
-                "ok": True,
-                "sheet_id": requested_sheet_id,
-                "tabs": cached_entry.get("tabs", []),
-                "message": "Danh sách tab (từ cache gần đây)",
-            }
-    
     try:
         tabs = list_spreadsheet_tabs(requested_sheet_id)
-        SHEET_TABS_REQUEST_LIMITER[requested_sheet_id] = now
+        SHEET_TABS_REQUEST_LIMITER[requested_sheet_id] = datetime.now()
         return {
             "ok": True,
             "sheet_id": requested_sheet_id,
