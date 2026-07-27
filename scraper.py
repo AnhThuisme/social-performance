@@ -96,6 +96,7 @@ DASHBOARD_SECTION_IDS = {
 # ==========================================
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "credential.json").strip() or "credential.json"
 AUTH_SETTINGS_FILE = "auth_settings.json"
+OTP_STORE_FILE = "otp_store.json"
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
 OTP_REQUEST_COOLDOWN_SECONDS = 30
@@ -151,6 +152,34 @@ def load_dashboard_cache():
         try:
             with open(DASHBOARD_CACHE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_otp_store(store_data):
+    try:
+        with open(OTP_STORE_FILE, "w", encoding="utf-8") as f:
+            json.dump(store_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_otp_store():
+    if os.path.exists(OTP_STORE_FILE):
+        try:
+            with open(OTP_STORE_FILE, "r", encoding="utf-8") as f:
+                raw_data = json.load(f)
+            if isinstance(raw_data, dict):
+                normalized = {}
+                for email, payload in raw_data.items():
+                    normalized_email = str(email or "").strip().lower()
+                    if not normalized_email or not isinstance(payload, dict):
+                        continue
+                    normalized[normalized_email] = {
+                        "code_hash": str(payload.get("code_hash", "") or "").strip(),
+                        "expires_at": float(payload.get("expires_at", 0) or 0),
+                        "sent_at": float(payload.get("sent_at", 0) or 0),
+                    }
+                return normalized
         except Exception:
             pass
     return {}
@@ -307,7 +336,8 @@ schedule_last_run_processed = 0
 schedule_last_run_success = 0
 schedule_last_run_failed = 0
 schedule_run_history = []
-OTP_STORE = {}
+OTP_STORE = load_otp_store()
+OTP_STORE_LOCK = threading.RLock()
 WEEKDAY_NAMES = [
     "Thứ hai",
     "Thứ ba",
@@ -2315,14 +2345,21 @@ def require_authenticated_user(request: Request, admin_only: bool = False):
     return current_user, None
 
 def cleanup_auth_runtime():
+    global OTP_STORE
     now_ts = time.time()
-    expired_emails = [
-        email
-        for email, payload in OTP_STORE.items()
-        if now_ts >= float(payload.get("expires_at", 0) or 0)
-    ]
-    for email in expired_emails:
-        OTP_STORE.pop(email, None)
+    with OTP_STORE_LOCK:
+        OTP_STORE = load_otp_store()
+        expired_emails = [
+            email
+            for email, payload in OTP_STORE.items()
+            if now_ts >= float(payload.get("expires_at", 0) or 0)
+        ]
+        if not expired_emails:
+            return OTP_STORE
+        for email in expired_emails:
+            OTP_STORE.pop(email, None)
+        save_otp_store(OTP_STORE)
+        return OTP_STORE
 
 def generate_otp_code() -> str:
     return f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
@@ -7867,7 +7904,7 @@ def logout(request: Request):
 
 @app.post("/auth/request-otp")
 async def auth_request_otp(request: Request):
-    cleanup_auth_runtime()
+    otp_store = cleanup_auth_runtime()
     try:
         payload = await request.json()
     except Exception:
@@ -7878,7 +7915,7 @@ async def auth_request_otp(request: Request):
     user = get_policy_user(email)
     if not user:
         return JSONResponse({"ok": False, "message": "Email này chưa có trong whitelist/access policy.", "level": "error"}, status_code=403)
-    last_payload = OTP_STORE.get(email, {})
+    last_payload = otp_store.get(email, {})
     now_ts = time.time()
     if last_payload and now_ts - float(last_payload.get("sent_at", 0) or 0) < OTP_REQUEST_COOLDOWN_SECONDS:
         wait_seconds = max(1, OTP_REQUEST_COOLDOWN_SECONDS - int(now_ts - float(last_payload.get("sent_at", 0) or 0)))
@@ -7893,17 +7930,22 @@ async def auth_request_otp(request: Request):
         return JSONResponse({"ok": False, "message": error_message, "level": "error"}, status_code=500)
 
     ttl_seconds = int(get_auth_settings().get("otp_ttl_seconds", 300))
-    OTP_STORE[email] = {
-        "code_hash": hash_otp_code(email, otp_code),
-        "expires_at": now_ts + ttl_seconds,
-        "sent_at": now_ts,
-    }
+    with OTP_STORE_LOCK:
+        latest_store = load_otp_store()
+        latest_store[email] = {
+            "code_hash": hash_otp_code(email, otp_code),
+            "expires_at": now_ts + ttl_seconds,
+            "sent_at": now_ts,
+        }
+        save_otp_store(latest_store)
+        OTP_STORE.clear()
+        OTP_STORE.update(latest_store)
     add_log(f"Đã gửi OTP cho {mask_email(email)}")
     return {"ok": True, "message": f"Đã gửi OTP 6 số tới {mask_email(email)}.", "level": "success"}
 
 @app.post("/auth/verify-otp")
 async def auth_verify_otp(request: Request):
-    cleanup_auth_runtime()
+    otp_store = cleanup_auth_runtime()
     try:
         payload = await request.json()
     except Exception:
@@ -7920,16 +7962,26 @@ async def auth_verify_otp(request: Request):
     if not user:
         return JSONResponse({"ok": False, "message": "Email này không còn trong access policy.", "level": "error"}, status_code=403)
 
-    saved_payload = OTP_STORE.get(email)
+    saved_payload = otp_store.get(email)
     if not saved_payload:
         return JSONResponse({"ok": False, "message": "OTP không tồn tại hoặc đã hết hạn. Hãy gửi lại OTP.", "level": "warning"}, status_code=400)
     if float(saved_payload.get("expires_at", 0) or 0) < time.time():
-        OTP_STORE.pop(email, None)
+        with OTP_STORE_LOCK:
+            latest_store = load_otp_store()
+            latest_store.pop(email, None)
+            save_otp_store(latest_store)
+            OTP_STORE.clear()
+            OTP_STORE.update(latest_store)
         return JSONResponse({"ok": False, "message": "OTP đã hết hạn. Hãy gửi lại OTP.", "level": "warning"}, status_code=400)
     if hash_otp_code(email, otp) != str(saved_payload.get("code_hash", "")):
         return JSONResponse({"ok": False, "message": "OTP không đúng. Kiểm tra lại mã 6 số.", "level": "error"}, status_code=400)
 
-    OTP_STORE.pop(email, None)
+    with OTP_STORE_LOCK:
+        latest_store = load_otp_store()
+        latest_store.pop(email, None)
+        save_otp_store(latest_store)
+        OTP_STORE.clear()
+        OTP_STORE.update(latest_store)
     record_user_login(email)
     response = JSONResponse(
         {

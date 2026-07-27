@@ -30,6 +30,7 @@ _fb_source_*.html
 dashboard_cache.json
 sheet_data_cache.json
 sheet_tabs_cache.json
+otp_store.json
 
 # Local helper/test scripts (not needed for runtime)
 test.js
