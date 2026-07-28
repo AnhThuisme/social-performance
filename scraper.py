@@ -545,6 +545,7 @@ def normalize_notification_preferences_map(raw_map, users):
 
 FORCED_ADMIN_EMAILS = {
     normalize_email_address("thu.phannguyenanh@fanscom.vn"),
+    normalize_email_address("ops@fanscom.vn"),
 }
 
 def parse_bool_env(value: str, default: bool) -> bool:
@@ -3129,17 +3130,25 @@ def build_employee_settings_content_html(current_user):
             </div>
 
             <div class="employee-layout">
-                <div class="posts-table-shell">
+                <div class="posts-table-shell employee-table-shell">
                     <div class="overflow-x-auto">
-                        <table class="w-full min-w-[860px] employee-table">
+                        <table class="w-full employee-table employee-table-fit">
+                            <colgroup>
+                                <col class="employee-col-user" />
+                                <col class="employee-col-role" />
+                                <col class="employee-col-status" />
+                                <col class="employee-col-login" />
+                                <col class="employee-col-count" />
+                                <col class="employee-col-actions" />
+                            </colgroup>
                             <thead>
                                 <tr>
-                                    <th>Nhân viên</th>
-                                    <th>Role</th>
-                                    <th>Trạng thái</th>
-                                    <th>Lần đăng nhập gần nhất</th>
-                                    <th class="text-right">Số lần</th>
-                                    <th class="text-right">Thao tác</th>
+                                    <th class="employee-th-user">Nhân viên</th>
+                                    <th class="employee-th-role">Role</th>
+                                    <th class="employee-th-status">Trạng thái</th>
+                                    <th class="employee-th-login">Lần đăng nhập gần nhất</th>
+                                    <th class="text-right employee-th-count">Số lần</th>
+                                    <th class="text-right employee-th-actions">Thao tác</th>
                                 </tr>
                             </thead>
                             <tbody id="employee-table-body"></tbody>
@@ -11912,7 +11921,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .employee-layout {{
                 display: grid;
-                grid-template-columns: minmax(0, 1.7fr) minmax(250px, 320px);
+                grid-template-columns: minmax(0, 1fr);
                 gap: 18px;
             }}
             .settings-layout {{
@@ -12167,67 +12176,102 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 border-color: rgba(56, 189, 248, 0.44);
             }}
             .employee-table {{
+                width: 100%;
+                table-layout: fixed;
                 border-collapse: separate;
                 border-spacing: 0;
+            }}
+            .employee-table-shell {{
+                width: 100%;
+            }}
+            .employee-table .overflow-x-auto {{
+                overflow-x: hidden;
+            }}
+            .employee-col-user {{
+                width: 32%;
+            }}
+            .employee-col-role {{
+                width: 12%;
+            }}
+            .employee-col-status {{
+                width: 16%;
+            }}
+            .employee-col-login {{
+                width: 22%;
+            }}
+            .employee-col-count {{
+                width: 8%;
+            }}
+            .employee-col-actions {{
+                width: 10%;
             }}
             .employee-table thead th {{
                 position: sticky;
                 top: 0;
                 z-index: 1;
                 background: rgba(51, 65, 85, 0.9);
-                padding: 16px 20px;
+                padding: 14px 14px;
                 color: #cbd5e1;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 800;
-                letter-spacing: 0.12em;
+                letter-spacing: 0.1em;
                 text-transform: uppercase;
                 text-align: left;
                 white-space: nowrap;
             }}
             .employee-table tbody td {{
                 border-top: 1px solid rgba(148, 163, 184, 0.12);
-                padding: 14px 16px;
+                padding: 13px 14px;
                 color: #e2e8f0;
-                vertical-align: top;
+                vertical-align: middle;
             }}
             .employee-row-user {{
                 display: flex;
                 align-items: center;
                 gap: 12px;
-                min-width: 220px;
+                min-width: 0;
             }}
             .employee-avatar {{
-                width: 40px;
-                height: 40px;
-                border-radius: 14px;
+                width: 38px;
+                height: 38px;
+                border-radius: 12px;
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
                 background: linear-gradient(135deg, rgba(14, 165, 233, 0.16), rgba(59, 130, 246, 0.16));
                 color: #bae6fd;
+                font-size: 14px;
                 font-weight: 900;
                 flex: 0 0 auto;
             }}
+            .employee-row-user > div {{
+                min-width: 0;
+            }}
             .employee-email {{
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 800;
                 color: #f8fafc;
-                word-break: break-all;
+                line-height: 1.45;
+                word-break: break-word;
+                overflow-wrap: anywhere;
             }}
             .employee-meta {{
                 margin-top: 3px;
                 font-size: 12px;
                 color: #94a3b8;
+                line-height: 1.35;
             }}
             .employee-status-badge {{
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                padding: 8px 12px;
+                padding: 7px 10px;
                 border-radius: 999px;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: 800;
-                white-space: nowrap;
+                white-space: normal;
+                text-align: center;
+                line-height: 1.3;
             }}
             .employee-status-badge.is-verified {{
                 background: rgba(16, 185, 129, 0.14);
@@ -12242,14 +12286,15 @@ def home(request: Request, background_tasks: BackgroundTasks):
             .employee-table-actions {{
                 display: flex;
                 justify-content: flex-end;
+                gap: 8px;
             }}
             .employee-icon-btn {{
                 display: inline-flex;
                 align-items: center;
                 justify-content: center;
-                width: 38px;
-                height: 38px;
-                border-radius: 12px;
+                width: 34px;
+                height: 34px;
+                border-radius: 10px;
                 border: 1px solid rgba(148, 163, 184, 0.14);
                 background: rgba(30, 41, 59, 0.68);
                 color: #e2e8f0;
@@ -12264,8 +12309,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .employee-form-card {{
                 width: 100%;
-                max-width: 320px;
-                justify-self: end;
+                max-width: none;
+                justify-self: stretch;
                 padding: 16px;
                 border-radius: 20px;
                 background: linear-gradient(180deg, rgba(20, 28, 45, 0.92), rgba(24, 33, 52, 0.92));
@@ -12284,6 +12329,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
             }}
             .employee-form-grid {{
                 display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 10px;
                 margin-top: 12px;
             }}
@@ -12297,7 +12343,8 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 color: #94a3b8;
             }}
             .employee-form-actions {{
-                display: grid;
+                display: flex;
+                flex-wrap: wrap;
                 gap: 8px;
                 margin-top: 12px;
             }}
@@ -12329,6 +12376,20 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 font-size: 11px;
                 line-height: 1.5;
                 color: #94a3b8;
+            }}
+            .employee-table td:nth-child(4) {{
+                font-size: 13px;
+                line-height: 1.4;
+                word-break: break-word;
+            }}
+            .employee-table td:nth-child(5) {{
+                white-space: nowrap;
+            }}
+            .employee-table td:nth-child(2),
+            .employee-table td:nth-child(3),
+            .employee-table td:nth-child(5),
+            .employee-table td:nth-child(6) {{
+                vertical-align: middle;
             }}
             .posts-table {{
                 width: 100%;
@@ -14258,6 +14319,18 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     width: 100%;
                     grid-template-columns: repeat(3, minmax(0, 1fr));
                 }}
+                .employee-table .overflow-x-auto {{
+                    overflow-x: auto;
+                }}
+                .employee-table-fit {{
+                    min-width: 760px;
+                }}
+                .employee-form-grid {{
+                    grid-template-columns: 1fr;
+                }}
+                .employee-form-actions {{
+                    display: grid;
+                }}
                 .settings-pane-actions {{
                     flex-direction: column;
                     align-items: stretch;
@@ -14728,6 +14801,10 @@ def home(request: Request, background_tasks: BackgroundTasks):
                 let tabColConfigCache = {{}};
                 // Authoritative server-saved per-tab overrides received via polling
                 let serverColConfigByTab = {{}};
+                const COLUMN_CONFIG_FIELDS = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"];
+                let suppressColConfigInputSync = false;
+                let dirtyColConfigFields = new Set();
+                let dirtyColConfigStartRow = false;
 
                 // Gather current values of all column config inputs into a plain object
                 const readColConfigInputs = () => {{
@@ -14741,18 +14818,52 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     return result;
                 }};
 
-                // Write a cached/server config object back into the form inputs
-                const writeColConfigInputs = (cfg) => {{
-                    if (!cfg || typeof cfg !== "object") return;
-                    document.querySelectorAll("[data-column-input]").forEach((el) => {{
-                        const key = el.dataset.columnInput;
-                        if (key in cfg) el.value = cfg[key];
-                    }});
-                    const srEl = document.querySelector("[form='set-columns-form'][name='start_row']");
-                    if (srEl && "start_row" in cfg) srEl.value = cfg["start_row"];
+                const syncActiveTabColConfigCache = () => {{
+                    const resolvedTab = String(colConfigActiveTab || "").trim();
+                    if (!resolvedTab) return;
+                    tabColConfigCache[resolvedTab] = readColConfigInputs();
                 }};
 
-                const AUTO_COLUMN_FIELDS = ["date", "air_date", "link", "view", "like", "share", "comment", "buzz", "save"];
+                const isColConfigFieldDirty = (fieldName) => {{
+                    const resolvedField = String(fieldName || "").trim();
+                    if (!resolvedField) return false;
+                    if (resolvedField === "start_row") return dirtyColConfigStartRow;
+                    return dirtyColConfigFields.has(resolvedField);
+                }};
+
+                const clearColConfigDirtyState = () => {{
+                    dirtyColConfigFields.clear();
+                    dirtyColConfigStartRow = false;
+                }};
+
+                // Write a cached/server config object back into the form inputs
+                const writeColConfigInputs = (cfg, options = {{}}) => {{
+                    if (!cfg || typeof cfg !== "object") return;
+                    const forceWrite = Boolean(options?.forceWrite);
+                    const preserveDirty = options?.preserveDirty !== false;
+                    suppressColConfigInputSync = true;
+                    try {{
+                        document.querySelectorAll("[data-column-input]").forEach((el) => {{
+                            const key = el.dataset.columnInput;
+                            if (!(key in cfg)) return;
+                            if (preserveDirty && isColConfigFieldDirty(key)) return;
+                            if (document.activeElement === el && !forceWrite) return;
+                            el.value = cfg[key] || "";
+                        }});
+                        const srEl = document.querySelector("[form='set-columns-form'][name='start_row']");
+                        if (srEl && "start_row" in cfg) {{
+                            if (!(preserveDirty && isColConfigFieldDirty("start_row"))) {{
+                                if (document.activeElement !== srEl || forceWrite) {{
+                                    srEl.value = cfg["start_row"] || "";
+                                }}
+                            }}
+                        }}
+                    }} finally {{
+                        suppressColConfigInputSync = false;
+                    }}
+                }};
+
+                const AUTO_COLUMN_FIELDS = COLUMN_CONFIG_FIELDS;
                 const AUTO_DETECT_CONCURRENCY = 3;
                 const getCurrentSheetIdForAutoDetect = () => {{
                     const fromInput = extractSheetIdFromInput(sheetUrlInput?.value || "");
@@ -14964,22 +15075,23 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         return;
                     }}
                     if (activeDetected) {{
+                        clearColConfigDirtyState();
+                        suppressColConfigInputSync = true;
                         document.querySelectorAll("[data-column-input]").forEach((input) => {{
                             const field = input.dataset.columnInput || "";
                             const autoValue = String(activeDetected?.[field] || "").trim();
                             input.dataset.detectedValue = autoValue;
-                            if (!autoValue) return;
-                            input.value = autoValue;
                             input.dataset.manualValue = "";
-                            input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                            input.value = autoValue;
                         }});
                         const srEl = document.querySelector("[form='set-columns-form'][name='start_row']");
                         if (srEl && activeStartRow && document.activeElement !== srEl) {{
                             srEl.value = activeStartRow;
                         }}
+                        suppressColConfigInputSync = false;
                     }}
                     if (activeTabForForm) {{
-                        tabColConfigCache[activeTabForForm] = readColConfigInputs();
+                        syncActiveTabColConfigCache();
                     }}
                     renderColConfigTabBar(activeTabForForm);
                     void pushRealtimeLog(`AUTO đã quét ${{scannedTabs}}/${{tabsForAuto.length}} tab, nhận tổng ${{totalFilledAcrossTabs}} cột.`);
@@ -15006,17 +15118,18 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         // Load this tab's saved config if we just switched to it
                         if (singleTab && singleTab !== colConfigActiveTab) {{
                             if (colConfigActiveTab) tabColConfigCache[colConfigActiveTab] = readColConfigInputs();
+                            clearColConfigDirtyState();
                             const cached = tabColConfigCache[singleTab];
                             const serverSaved = serverColConfigByTab[singleTab];
-                            if (cached) writeColConfigInputs(cached);
-                            else if (serverSaved) writeColConfigInputs(serverSaved);
+                            if (cached) writeColConfigInputs(cached, {{ forceWrite: true, preserveDirty: false }});
+                            else if (serverSaved) writeColConfigInputs(serverSaved, {{ forceWrite: true, preserveDirty: false }});
                             else {{
                                 fetch(`/detect-tab-columns?tab_name=${{encodeURIComponent(singleTab)}}`, {{
                                     headers: {{"X-Requested-With": "fetch"}},
                                     cache: "no-store",
                                 }}).then(r => r.json()).then(data => {{
                                     if (data.ok && data.detected_inputs && colConfigActiveTab === singleTab) {{
-                                        writeColConfigInputs(data.detected_inputs);
+                                        writeColConfigInputs(data.detected_inputs, {{ forceWrite: true, preserveDirty: false }});
                                         if (data.start_row) {{
                                             const srEl = document.querySelector("[form='set-columns-form'][name='start_row']");
                                             if (srEl && document.activeElement !== srEl) srEl.value = data.start_row;
@@ -15049,12 +15162,13 @@ def home(request: Request, background_tasks: BackgroundTasks):
 
                     // Load inputs for the new active tab from cache, then fall back to server data
                     if (prevTab !== nextTab) {{
+                        clearColConfigDirtyState();
                         const cached = tabColConfigCache[nextTab];
                         const serverSaved = serverColConfigByTab[nextTab];
                         if (cached) {{
-                            writeColConfigInputs(cached);
+                            writeColConfigInputs(cached, {{ forceWrite: true, preserveDirty: false }});
                         }} else if (serverSaved) {{
-                            writeColConfigInputs(serverSaved);
+                            writeColConfigInputs(serverSaved, {{ forceWrite: true, preserveDirty: false }});
                         }} else {{
                             // No saved config for this tab — fetch auto-detected columns from server
                             fetch(`/detect-tab-columns?tab_name=${{encodeURIComponent(nextTab)}}`, {{
@@ -15062,7 +15176,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 cache: "no-store",
                             }}).then(r => r.json()).then(data => {{
                                 if (data.ok && data.detected_inputs && colConfigActiveTab === nextTab) {{
-                                    writeColConfigInputs(data.detected_inputs);
+                                    writeColConfigInputs(data.detected_inputs, {{ forceWrite: true, preserveDirty: false }});
                                     if (data.start_row) {{
                                         const srEl = document.querySelector("[form='set-columns-form'][name='start_row']");
                                         if (srEl && document.activeElement !== srEl) srEl.value = data.start_row;
@@ -15108,6 +15222,24 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         }});
                     }});
                 }};
+
+                document.addEventListener("input", (event) => {{
+                    const field = event.target;
+                    if (!(field instanceof HTMLInputElement)) return;
+                    if (suppressColConfigInputSync) return;
+                    if (field.matches("[data-column-input]")) {{
+                        const fieldName = String(field.dataset.columnInput || "").trim();
+                        if (!fieldName) return;
+                        dirtyColConfigFields.add(fieldName);
+                        field.dataset.manualValue = (field.value || "").trim();
+                        syncActiveTabColConfigCache();
+                        return;
+                    }}
+                    if (field.matches("[form='set-columns-form'][name='start_row']")) {{
+                        dirtyColConfigStartRow = true;
+                        syncActiveTabColConfigCache();
+                    }}
+                }});
 
                 const renderSheetTabs = (tabs) => {{
                     refreshSheetTabDomRefs();
@@ -15619,6 +15751,13 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         applyScheduleConfigState(data);
                         applyScheduleTrackingState(data);
                         if (data.ok) {{
+                            const resolvedTabName = String(params.get("tab_name") || colConfigActiveTab || "").trim();
+                            const currentSnapshot = readColConfigInputs();
+                            if (resolvedTabName) {{
+                                tabColConfigCache[resolvedTabName] = currentSnapshot;
+                                serverColConfigByTab[resolvedTabName] = currentSnapshot;
+                            }}
+                            clearColConfigDirtyState();
                             applyColumnConfigState(data);
                             pendingSheetMetadataReveal = true;
                             applySheetMetadataState(data);
@@ -17024,7 +17163,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         if (latestByTab && typeof latestByTab === "object" && latestByTab[colConfigActiveTab]) {{
                             serverColConfigByTab[colConfigActiveTab] = latestByTab[colConfigActiveTab];
                         }}
-                        const tabCfg = serverColConfigByTab[colConfigActiveTab] || tabColConfigCache[colConfigActiveTab];
+                        const tabCfg = tabColConfigCache[colConfigActiveTab] || serverColConfigByTab[colConfigActiveTab];
                         if (tabCfg) writeColConfigInputs(tabCfg);
                     }}
                 }};
