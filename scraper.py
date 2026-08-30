@@ -27,7 +27,36 @@ import uvicorn
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+
+
+def load_local_env_file() -> None:
+    """Load local development settings without overriding real environment variables."""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].lstrip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                    value = value[1:-1]
+                if key:
+                    os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        pass
+
+
+load_local_env_file()
+
 from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
+
 try:
     from social_selenium import reset_stale_selenium_sessions
 except ImportError:
@@ -871,6 +900,7 @@ def cache_posts_sheet_dataset(user_email: str, sheet_id: str, sheet_name: str, d
         "total_reaction": parse_metric_number(dataset.get("total_reaction")),
         "total_share": parse_metric_number(dataset.get("total_share")),
         "total_comment": parse_metric_number(dataset.get("total_comment")),
+        "total_save": parse_metric_number(dataset.get("total_save")),
         "total_buzz": parse_metric_number(dataset.get("total_buzz")),
         "creator_count": parse_metric_number(dataset.get("creator_count")),
         "campaign_count": parse_metric_number(dataset.get("campaign_count")),
@@ -936,6 +966,7 @@ def collect_posts_dataset_from_cached_sheet_snapshot(
     total_reaction = 0
     total_share = 0
     total_comment = 0
+    total_save = 0
     total_buzz = 0
     creators = set()
     campaigns = set()
@@ -990,6 +1021,7 @@ def collect_posts_dataset_from_cached_sheet_snapshot(
         total_reaction += reaction
         total_share += share
         total_comment += comment
+        total_save += save
         total_buzz += buzz
         if creator:
             creators.add(creator)
@@ -1013,6 +1045,7 @@ def collect_posts_dataset_from_cached_sheet_snapshot(
         "total_reaction": total_reaction,
         "total_share": total_share,
         "total_comment": total_comment,
+        "total_save": total_save,
         "total_buzz": total_buzz,
         "creator_count": len(creators),
         "campaign_count": len(campaigns),
@@ -1343,6 +1376,7 @@ def build_saved_sheet_summary_snapshot(dataset: dict) -> dict:
         "total_reaction": parse_metric_number(dataset.get("total_reaction")),
         "total_share": parse_metric_number(dataset.get("total_share")),
         "total_comment": parse_metric_number(dataset.get("total_comment")),
+        "total_save": parse_metric_number(dataset.get("total_save")),
         "total_buzz": parse_metric_number(dataset.get("total_buzz")),
         "creator_count": parse_metric_number(dataset.get("creator_count")),
         "campaign_count": parse_metric_number(dataset.get("campaign_count")),
@@ -4169,6 +4203,7 @@ def build_schedule_tracking_payload(state=None):
             like_text = format_table_metric(row.get("like"))
             share_text = format_table_metric(row.get("share"))
             comment_text = format_table_metric(row.get("comment"))
+            save_text = format_table_metric(row.get("save"))
             buzz_text = format_table_metric(row.get("buzz"))
             reason_text = html.escape(str(row.get("reason") or ""))
             detail_rows_html += f"""
@@ -4190,6 +4225,7 @@ def build_schedule_tracking_payload(state=None):
                     <td class="posts-cell posts-cell-metric">{like_text}</td>
                     <td class="posts-cell posts-cell-metric">{share_text}</td>
                     <td class="posts-cell posts-cell-metric">{comment_text}</td>
+                    <td class="posts-cell posts-cell-metric">{save_text}</td>
                     <td class="posts-cell posts-cell-metric">{buzz_text}</td>
                 </tr>
             """
@@ -4208,6 +4244,7 @@ def build_schedule_tracking_payload(state=None):
                             <th class="posts-cell">Like</th>
                             <th class="posts-cell">Share</th>
                             <th class="posts-cell">Comment</th>
+                            <th class="posts-cell">Save</th>
                             <th class="posts-cell">Buzz</th>
                         </tr>
                     </thead>
@@ -5654,6 +5691,7 @@ def collect_posts_dataset_for_worksheet(
     total_reaction = 0
     total_share = 0
     total_comment = 0
+    total_save = 0
     total_buzz = 0
     creators = set()
     campaigns = set()
@@ -5679,6 +5717,7 @@ def collect_posts_dataset_for_worksheet(
             "total_reaction": 0,
             "total_share": 0,
             "total_comment": 0,
+            "total_save": 0,
             "total_buzz": 0,
             "creator_count": 0,
             "campaign_count": 0,
@@ -5807,6 +5846,7 @@ def collect_posts_dataset_for_worksheet(
                     <td class="posts-cell posts-cell-metric" data-post-col="reaction">{format_table_metric(reaction)}</td>
                     <td class="posts-cell posts-cell-metric" data-post-col="share">{format_table_metric(share)}</td>
                     <td class="posts-cell posts-cell-metric" data-post-col="comment">{format_table_metric(comment)}</td>
+                    <td class="posts-cell posts-cell-metric" data-post-col="save">{format_table_metric(save)}</td>
                     <td class="posts-cell posts-cell-metric" data-post-col="buzz">{format_table_metric(buzz)}</td>
                 </tr>
                 """
@@ -5817,6 +5857,7 @@ def collect_posts_dataset_for_worksheet(
         total_reaction += reaction
         total_share += share
         total_comment += comment
+        total_save += save
         total_buzz += buzz
         if creator:
             creators.add(creator)
@@ -5843,6 +5884,7 @@ def collect_posts_dataset_for_worksheet(
         "total_reaction": total_reaction,
         "total_share": total_share,
         "total_comment": total_comment,
+        "total_save": total_save,
         "total_buzz": total_buzz,
         "creator_count": len(creators),
         "campaign_count": len(campaigns),
@@ -6516,6 +6558,7 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
     reaction_text = format_compact_metric(dataset.get("total_reaction", 0))
     comment_text = format_compact_metric(dataset.get("total_comment", 0))
     share_text = format_compact_metric(dataset.get("total_share", 0))
+    save_text = format_compact_metric(dataset.get("total_save", 0))
     buzz_text = format_compact_metric(dataset.get("total_buzz", 0))
     detail_meta_chips = []
     if brand_label:
@@ -6544,7 +6587,7 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
         ]
     )
     rows_html = str(dataset.get("rows_html", "") or "").strip()
-    table_rows_html = rows_html if rows_html else '<tr><td colspan="13" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'
+    table_rows_html = rows_html if rows_html else '<tr><td colspan="14" class="posts-empty-state">Sheet này chưa có link nào hợp lệ để hiển thị.</td></tr>'
     return f"""
         <div class="posts-tab-panel" data-posts-tab-panel="{html.escape(str(dataset.get("sheet_slug", "") or ""), quote=True)}" data-posts-tab-title="{safe_sheet_title}" data-posts-sheet-id="{html.escape(str(dataset.get('sheet_id', '') or ''), quote=True)}" data-posts-sheet-name="{html.escape(str(dataset.get('sheet_name', '') or ''), quote=True)}" data-posts-platform="all">
             <div class="posts-tab-panel-head">
@@ -6581,6 +6624,10 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
                     <div class="posts-detail-summary-card">
                         <div class="posts-detail-summary-label">Share</div>
                         <div class="posts-detail-summary-value">{share_text}</div>
+                    </div>
+                    <div class="posts-detail-summary-card">
+                        <div class="posts-detail-summary-label">Save</div>
+                        <div class="posts-detail-summary-value">{save_text}</div>
                     </div>
                     <div class="posts-detail-summary-card">
                         <div class="posts-detail-summary-label">Buzz</div>
@@ -6636,6 +6683,7 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
                             <col class="posts-col-metric" />
                             <col class="posts-col-metric" />
                             <col class="posts-col-metric" />
+                            <col class="posts-col-metric" />
                         </colgroup>
                         <thead>
                             <tr>
@@ -6651,6 +6699,7 @@ def build_posts_detail_panel_html(dataset: dict, runtime_state) -> str:
                                 <th class="text-right" data-post-col="reaction">Reaction</th>
                                 <th class="text-right" data-post-col="share">Share</th>
                                 <th class="text-right" data-post-col="comment">Comment</th>
+                                <th class="text-right" data-post-col="save">Save</th>
                                 <th class="text-right" data-post-col="buzz">Buzz</th>
                             </tr>
                         </thead>
@@ -7015,6 +7064,7 @@ def build_posts_panel_html(sheet=None, state=None):
                             "total_reaction": 0,
                             "total_share": 0,
                             "total_comment": 0,
+                            "total_save": 0,
                             "total_buzz": 0,
                             "creator_count": 0,
                             "campaign_count": 0,
@@ -7639,6 +7689,10 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     locked_log(f"[{tab_name}] Dòng {row_idx}: có số liệu nhưng chưa tách được air date")
                 row_updates = build_row_updates(col_map, platform, now_str, stats)
                 update_values = {field: value for field, _, value in row_updates}
+                if col_map.get("save") and "save" not in update_values:
+                    locked_log(
+                        f"[{tab_name}] Dòng {row_idx}: đã cấu hình cột Save nhưng nền tảng không trả chỉ số Save; giữ nguyên ô hiện có."
+                    )
                 with state_lock:
                     set_pending_updates(row_idx, row_updates, runtime_state)
                 sheet_requests = []
@@ -7707,6 +7761,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                             "like": parse_metric_number(update_values.get("like")),
                             "share": parse_metric_number(update_values.get("share")),
                             "comment": parse_metric_number(update_values.get("comment")),
+                            "save": parse_metric_number(update_values.get("save")),
                             "buzz": parse_metric_number(update_values.get("buzz")),
                         }
                     )
@@ -12491,6 +12546,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
             .posts-table thead th[data-post-col="reaction"],
             .posts-table thead th[data-post-col="share"],
             .posts-table thead th[data-post-col="comment"],
+            .posts-table thead th[data-post-col="save"],
             .posts-table thead th[data-post-col="buzz"] {{
                 text-align: right;
                 padding-right: 12px;
