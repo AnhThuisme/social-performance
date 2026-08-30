@@ -7649,15 +7649,25 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     try:
                         stats = get_social_stats(url, platform, driver=current_driver, logger=locked_log)
                         if tab_driver is not None and getattr(tab_driver, "_needs_restart", False):
-                            restart_tab_driver("Driver bị treo sau timeout, đang restart để chạy tiếp...")
+                            restart_tab_driver("Driver session/window bị đóng hoặc lỗi, đang tự động khởi động lại driver...")
                         if stats:
                             if attempt_index > 0:
                                 locked_log(f"[{tab_name}] Dòng {row_idx}: retry lần {attempt_index}/{extra_attempts} đã lấy được số liệu")
                             return stats
                     except Exception as e:
                         error_msg = str(e).lower()
-                        if "invalid session" in error_msg or "session id" in error_msg:
-                            restart_tab_driver("Driver session invalid, đang restart...")
+                        if any(
+                            token in error_msg
+                            for token in (
+                                "invalid session",
+                                "session id",
+                                "no such window",
+                                "target window already closed",
+                                "web view not found",
+                                "chrome not reachable",
+                            )
+                        ):
+                            restart_tab_driver("Driver window/session bị lỗi hoặc bị đóng, đang tự động khởi động lại...")
                             try:
                                 current_driver = ensure_tab_driver()
                                 if current_driver is not None and not tab_driver_failed:

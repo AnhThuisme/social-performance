@@ -1357,6 +1357,8 @@ def _payload_has_metric_signal(payload) -> bool:
 def _should_reject_tiktok_low_confidence_payload(payload) -> bool:
     if not isinstance(payload, dict):
         return False
+    if any(payload.get(k) for k in ("v", "l", "s", "c", "save")):
+        return False
     if not payload.get("_warning"):
         return False
     return not _has_tiktok_session_config()
@@ -1603,7 +1605,10 @@ def _extract_tiktok(bundle):
     for data in _iter_json_script_payloads(source, required_substring="webapp.video-detail"):
         scope = data.get("__DEFAULT_SCOPE__", {}) if isinstance(data, dict) else {}
         detail = scope.get("webapp.video-detail", {}) if isinstance(scope, dict) else {}
-        item = detail.get("itemInfo", {}).get("itemStruct", {}) if isinstance(detail, dict) else {}
+        item_info = detail.get("itemInfo", {}) if isinstance(detail, dict) else {}
+        item = item_info.get("itemStruct") if (isinstance(item_info, dict) and "itemStruct" in item_info) else item_info
+        if not isinstance(item, dict):
+            item = {}
         is_photo_post = _is_tiktok_photo_bundle(bundle, item=item, detail=detail) or is_photo_post
         item_target_id = str(item.get("id") or item.get("awemeId") or "")
         if target_post_id and item_target_id and item_target_id != target_post_id:
@@ -1705,6 +1710,52 @@ def _extract_tiktok(bundle):
         text_metric_payload = _extract_tiktok_metrics_from_text(bundle)
         if text_metric_payload:
             return text_metric_payload
+    return payload
+
+
+def _enrich_tiktok_missing_save_count(payload: Optional[dict], url: str, logger: Optional[Callable[[str], None]] = None) -> Optional[dict]:
+    if not payload or payload.get("save") is not None:
+        return payload
+    target_url = str(url or payload.get("_original_url") or "").strip()
+    if not target_url or not _is_tiktok_url(target_url):
+        return payload
+    user_agents = [
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
+    ]
+    req_cookies = _build_requests_cookies_for_platform("tiktok")
+    for ua in user_agents:
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        try:
+            resp = requests.get(target_url, headers=headers, cookies=req_cookies, timeout=6.0, allow_redirects=True)
+            if resp.text:
+                req_bundle = {"source": resp.text, "text": "", "metas": {}, "title": "", "url": str(resp.url or target_url)}
+                req_payload = _extract_tiktok(req_bundle)
+                if req_payload and req_payload.get("save") is not None:
+                    payload["save"] = req_payload["save"]
+                    _emit(logger, f"TikTok bổ sung chỉ số Save ({req_payload['save']}) qua HTTP request fallback.")
+                    return payload
+                save_count = _extract_number(
+                    resp.text,
+                    [
+                        r'"collectCount"\s*:\s*("?[\d.,KMB]+"?)',
+                        r'"bookmarksCount"\s*:\s*("?[\d.,KMB]+"?)',
+                        r'"bookmarkCount"\s*:\s*("?[\d.,KMB]+"?)',
+                        r'"savedCount"\s*:\s*("?[\d.,KMB]+"?)',
+                        r'"savesCount"\s*:\s*("?[\d.,KMB]+"?)',
+                    ],
+                )
+                if save_count is not None:
+                    payload["save"] = save_count
+                    _emit(logger, f"TikTok bổ sung chỉ số Save ({save_count}) qua HTTP request fallback.")
+                    return payload
+        except Exception:
+            continue
     return payload
 
 
@@ -2244,11 +2295,25 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 return None
     elif platform == "tiktok":
         now_ts = time.time()
+        url = _resolve_tiktok_url(url, logger=logger)
         if now_ts < _TIKTOK_TIMEOUT_COOLDOWN_UNTIL:
             remaining = int(max(1, _TIKTOK_TIMEOUT_COOLDOWN_UNTIL - now_ts))
-            _emit(logger, f"TikTok đang cooldown {remaining}s sau nhiều timeout liên tiếp, bỏ qua nhanh link này.")
+            _emit(logger, f"TikTok đang cooldown Selenium ({remaining}s), thử đọc qua fast embed/requests fallback...")
+            embed_bundle = _collect_tiktok_embed_bundle(url, logger=logger)
+            if embed_bundle:
+                cb_payload = _extract_tiktok(embed_bundle)
+                if cb_payload:
+                    cb_payload = _enrich_tiktok_missing_save_count(cb_payload, url, logger=logger)
+                    if any(cb_payload.get(k) for k in ("v", "l", "s", "c", "save")):
+                        return cb_payload
+            req_bundle = _collect_page_bundle_via_requests(url, "tiktok", logger=logger)
+            if req_bundle:
+                cb_payload = _extract_tiktok(req_bundle)
+                if cb_payload:
+                    cb_payload = _enrich_tiktok_missing_save_count(cb_payload, url, logger=logger)
+                    if any(cb_payload.get(k) for k in ("v", "l", "s", "c", "save")):
+                        return cb_payload
             return None
-        url = _resolve_tiktok_url(url, logger=logger)
         if driver is not None:
             _ensure_tiktok_cookies(driver, logger=logger)
     elif platform == "instagram":
@@ -2377,11 +2442,7 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                 _emit(logger, "Instagram đang trả về trang login/chặn truy cập nên khó đọc số liệu công khai.")
             if platform == "tiktok" and ("login" in low_url or "verify" in low_url or "captcha" in low_title):
                 _emit(logger, "TikTok đang trả về challenge/login nên khó đọc số liệu công khai.")
-            if platform == "tiktok":
-                fallback_bundle = None
-                _emit(logger, "Bỏ qua fallback requests cho TikTok vì nguồn public này dễ trả sai metric.")
-            else:
-                fallback_bundle = _collect_page_bundle_via_requests(url, platform, logger=logger)
+            fallback_bundle = _collect_page_bundle_via_requests(url, platform, logger=logger)
             if fallback_bundle:
                 try:
                     payload = extractor(fallback_bundle)
@@ -2407,10 +2468,11 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         warning_message = str(payload.get("_warning", "") or "").strip()
         if warning_message:
             _emit(logger, warning_message)
-        has_signal = any(payload.get(key) for key in ("v", "l", "s", "c", "save"))
         if platform == "tiktok":
+            payload = _enrich_tiktok_missing_save_count(payload, url, logger=logger)
             _TIKTOK_TIMEOUT_STREAK = 0
             _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
+        has_signal = any(payload.get(key) for key in ("v", "l", "s", "c", "save"))
         if has_signal:
             return payload
         if payload.get("cap") or payload.get("air_date"):
@@ -2422,17 +2484,26 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
     except WebDriverException as exc:
         error_text = str(exc)
         error_lower = error_text.lower()
-        if (
-            platform == "tiktok"
-            and driver is not None
-            and "timed out receiving message from renderer" in error_lower
+        if driver is not None and any(
+            token in error_lower
+            for token in (
+                "no such window",
+                "target window already closed",
+                "web view not found",
+                "invalid session",
+                "session id",
+                "chrome not reachable",
+                "timed out receiving message from renderer",
+                "disconnected",
+            )
         ):
             try:
                 setattr(driver, "_needs_restart", True)
             except Exception:
                 pass
-            _emit(logger, "TikTok renderer timeout, đánh dấu restart driver để quét nhanh dòng tiếp theo.")
-        _emit(logger, f"Lỗi Selenium {platform}: {error_text[:160]}")
+            _emit(logger, f"Selenium session/window bị đóng hoặc lỗi ({error_text[:60]}), đánh dấu restart driver.")
+        else:
+            _emit(logger, f"Lỗi Selenium {platform}: {error_text[:160]}")
         return None
     except Exception as exc:
         _emit(logger, f"Lỗi đọc dữ liệu {platform}: {str(exc)[:160]}")
