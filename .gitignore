@@ -6,10 +6,10 @@ __pycache__/
 credential.json
 tiktok_cookies.json
 tiktok-profile/
-auth_settings.json
 .env
 .env.*
 !.env.example
+.vscode/
 
 # Build artifacts
 build/

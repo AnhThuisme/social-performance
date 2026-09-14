@@ -1,0 +1,87 @@
+{
+  "session_secret": "8ff466f72837eece8ecd72127f7866607938c41c139f086de0543322f5bdedb9",
+  "otp_ttl_seconds": 300,
+  "session_ttl_seconds": 86400,
+  "users": [
+    {
+      "email": "ops@fanscom.vn",
+      "role": "admin"
+    },
+    {
+      "email": "thu.phannguyenanh@fanscom.vn",
+      "role": "admin"
+    }
+  ],
+  "user_meta": {
+    "thu.phannguyenanh@fanscom.vn": {
+      "last_login_at": "30/08/2026 20:21:42",
+      "login_count": 1
+    }
+  },
+  "saved_sheets": [],
+  "saved_sheets_by_user": {
+    "thu.phannguyenanh@fanscom.vn": [
+      {
+        "sheet_id": "1BAGluRwbyrHbhWqGwwPmnLXhoSOr1BdZ3nMODUDNcdc",
+        "sheet_name": "SUMMARY REPORT",
+        "display_name": "SUMMARY REPORT",
+        "sheet_gid": "672655000",
+        "saved_at_text": "30/08/2026 22:33",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {
+          "sheet_title": "SUMMARY REPORT",
+          "sheet_name": "SUMMARY REPORT",
+          "sheet_id": "1BAGluRwbyrHbhWqGwwPmnLXhoSOr1BdZ3nMODUDNcdc",
+          "sheet_gid": "672655000",
+          "campaign_label": "",
+          "brand_label": "",
+          "industry_label": "",
+          "campaign_description": "",
+          "total_posts": 102,
+          "total_views": 8150551,
+          "total_reaction": 48751,
+          "total_share": 8462,
+          "total_comment": 5497,
+          "total_save": 5687,
+          "total_buzz": 6793,
+          "creator_count": 0,
+          "campaign_count": 1,
+          "platform_counts": {
+            "tiktok": 88,
+            "facebook": 7,
+            "instagram": 0,
+            "youtube": 0,
+            "khac": 7
+          }
+        }
+      }
+    ]
+  },
+  "schedule_entries": [],
+  "schedule_entries_by_user": {},
+  "campaigns": [],
+  "campaigns_by_user": {},
+  "notification_preferences_by_user": {
+    "ops@fanscom.vn": {
+      "email_notifications": true,
+      "system_alerts": true
+    },
+    "thu.phannguyenanh@fanscom.vn": {
+      "email_notifications": true,
+      "system_alerts": true
+    }
+  },
+  "mail": {
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "fanscom.ecom@gmail.com",
+    "smtp_password": "xouzlegqlkwazjic",
+    "smtp_from_email": "fanscom.ecom@gmail.com",
+    "smtp_from_name": "Social Monitor",
+    "use_tls": true,
+    "use_ssl": false
+  }
+}
