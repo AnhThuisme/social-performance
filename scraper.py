@@ -257,9 +257,9 @@ SHEET_TABS_MIN_INTERVAL_SECONDS = 5  # Minimum interval between requests for sam
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("AUTH_BOOTSTRAP_ADMIN_EMAIL", "").strip()
 # Gmail SMTP - điền trực tiếp vào đây nếu muốn cấu hình OTP ngay trong code.
 # Nếu để trống, app mới fallback sang biến môi trường cùng tên.
-GMAIL_SMTP_EMAIL = "fanscom.ecom@gmail.com"
-GMAIL_SMTP_APP_PASSWORD = "btqtzotpeyhnzzac"
-GMAIL_SMTP_FROM_EMAIL = "fanscom.ecom@gmail.com"
+GMAIL_SMTP_EMAIL = os.getenv("GMAIL_SMTP_EMAIL", "fanscom.ecom@gmail.com")
+GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "xouzlegqlkwazjic")
+GMAIL_SMTP_FROM_EMAIL = os.getenv("GMAIL_SMTP_FROM_EMAIL", "fanscom.ecom@gmail.com")
 YOUTUBE_API_KEY = "AIzaSyAbMDEzmIVpsVTASYhTaXI6oC7BudQWzlU"
 ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.0"))
 ROW_SCRAPE_RETRY_ATTEMPTS = max(0, int(os.getenv("ROW_SCRAPE_RETRY_ATTEMPTS", "1")))
