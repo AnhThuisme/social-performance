@@ -257,9 +257,9 @@ SHEET_TABS_MIN_INTERVAL_SECONDS = 5  # Minimum interval between requests for sam
 BOOTSTRAP_ADMIN_EMAIL = os.getenv("AUTH_BOOTSTRAP_ADMIN_EMAIL", "").strip()
 # Gmail SMTP - điền trực tiếp vào đây nếu muốn cấu hình OTP ngay trong code.
 # Nếu để trống, app mới fallback sang biến môi trường cùng tên.
-GMAIL_SMTP_EMAIL = os.getenv("GMAIL_SMTP_EMAIL", "fanscom.ecom@gmail.com")
-GMAIL_SMTP_APP_PASSWORD = os.getenv("GMAIL_SMTP_APP_PASSWORD", "xouzlegqlkwazjic")
-GMAIL_SMTP_FROM_EMAIL = os.getenv("GMAIL_SMTP_FROM_EMAIL", "fanscom.ecom@gmail.com")
+GMAIL_SMTP_EMAIL = str(os.getenv("GMAIL_SMTP_EMAIL", "") or "").strip() or "fanscom.ecom@gmail.com"
+GMAIL_SMTP_APP_PASSWORD = re.sub(r"\s+", "", str(os.getenv("GMAIL_SMTP_APP_PASSWORD", "") or "").strip() or "xouzlegqlkwazjic")
+GMAIL_SMTP_FROM_EMAIL = str(os.getenv("GMAIL_SMTP_FROM_EMAIL", "") or "").strip() or "fanscom.ecom@gmail.com"
 YOUTUBE_API_KEY = "AIzaSyAbMDEzmIVpsVTASYhTaXI6oC7BudQWzlU"
 ROW_SCAN_DELAY_SECONDS = float(os.getenv("ROW_SCAN_DELAY_SECONDS", "0.0"))
 ROW_SCRAPE_RETRY_ATTEMPTS = max(0, int(os.getenv("ROW_SCRAPE_RETRY_ATTEMPTS", "1")))
@@ -711,9 +711,9 @@ def normalize_auth_settings(data):
     mail["smtp_from_name"] = str(mail.get("smtp_from_name", "") or "Social Monitor").strip() or "Social Monitor"
     mail["use_tls"] = bool(mail.get("use_tls", True))
     mail["use_ssl"] = bool(mail.get("use_ssl", False))
-    gmail_smtp_email = normalize_email_address(GMAIL_SMTP_EMAIL or os.getenv("GMAIL_SMTP_EMAIL", ""))
-    gmail_smtp_app_password = re.sub(r"\s+", "", str(GMAIL_SMTP_APP_PASSWORD or os.getenv("GMAIL_SMTP_APP_PASSWORD", "") or ""))
-    gmail_smtp_from_email = normalize_email_address(GMAIL_SMTP_FROM_EMAIL or os.getenv("GMAIL_SMTP_FROM_EMAIL", ""))
+    gmail_smtp_email = normalize_email_address(str(os.getenv("GMAIL_SMTP_EMAIL", "") or "").strip() or GMAIL_SMTP_EMAIL or "fanscom.ecom@gmail.com")
+    gmail_smtp_app_password = re.sub(r"\s+", "", str(os.getenv("GMAIL_SMTP_APP_PASSWORD", "") or "").strip() or GMAIL_SMTP_APP_PASSWORD or "xouzlegqlkwazjic")
+    gmail_smtp_from_email = normalize_email_address(str(os.getenv("GMAIL_SMTP_FROM_EMAIL", "") or "").strip() or GMAIL_SMTP_FROM_EMAIL or gmail_smtp_email)
     if gmail_smtp_from_email and "@" not in gmail_smtp_from_email:
         gmail_smtp_from_email = ""
     gmail_mode_enabled = bool(gmail_smtp_email or gmail_smtp_app_password or gmail_smtp_from_email)
@@ -724,14 +724,17 @@ def normalize_auth_settings(data):
         "smtp_from_email": normalize_email_address(os.getenv("AUTH_SMTP_FROM_EMAIL", "")) or gmail_smtp_from_email or normalize_email_address(gmail_smtp_email),
         "smtp_from_name": str(os.getenv("AUTH_SMTP_FROM_NAME", "") or "").strip(),
     }
-    if gmail_mode_enabled:
-        for key, value in env_mail.items():
-            if value:
-                mail[key] = value
-    else:
-        for key, value in env_mail.items():
-            if value and not mail.get(key):
-                mail[key] = value
+    for key, value in env_mail.items():
+        if value:
+            mail[key] = value
+    if not mail.get("smtp_host"):
+        mail["smtp_host"] = "smtp.gmail.com"
+    if not mail.get("smtp_user"):
+        mail["smtp_user"] = gmail_smtp_email
+    if not mail.get("smtp_password"):
+        mail["smtp_password"] = gmail_smtp_app_password
+    if not mail.get("smtp_from_email"):
+        mail["smtp_from_email"] = gmail_smtp_from_email or gmail_smtp_email
     try:
         env_smtp_port = int(str(os.getenv("AUTH_SMTP_PORT", "") or "").strip() or ("587" if gmail_mode_enabled else "0"))
     except Exception:
@@ -2259,7 +2262,7 @@ def get_policy_user(email: str, settings=None):
 def is_mail_configured(settings=None):
     auth_settings = settings or get_auth_settings()
     mail = auth_settings.get("mail", {})
-    smtp_ready = bool(str(mail.get("smtp_host", "") or "").strip() and str(mail.get("smtp_from_email", "") or "").strip())
+    smtp_ready = bool((str(mail.get("smtp_host", "") or "").strip() or GMAIL_SMTP_EMAIL) and (str(mail.get("smtp_from_email", "") or "").strip() or GMAIL_SMTP_FROM_EMAIL or GMAIL_SMTP_EMAIL))
     resend_api_key = str(
         os.getenv("AUTH_RESEND_API_KEY", "")
         or os.getenv("RESEND_API_KEY", "")
@@ -2583,6 +2586,13 @@ def send_otp_email(target_email: str, otp_code: str, settings=None):
 
     host = str(mail.get("smtp_host", "") or "").strip()
     from_email = normalize_email_address(mail.get("smtp_from_email", ""))
+    if not host or not from_email:
+        mail["smtp_host"] = host or "smtp.gmail.com"
+        mail["smtp_from_email"] = from_email or GMAIL_SMTP_FROM_EMAIL or GMAIL_SMTP_EMAIL or "fanscom.ecom@gmail.com"
+        mail["smtp_user"] = str(mail.get("smtp_user", "") or "").strip() or GMAIL_SMTP_EMAIL or "fanscom.ecom@gmail.com"
+        mail["smtp_password"] = str(mail.get("smtp_password", "") or "").strip() or GMAIL_SMTP_APP_PASSWORD or "xouzlegqlkwazjic"
+        host = mail["smtp_host"]
+        from_email = mail["smtp_from_email"]
     if not host or not from_email:
         if _is_resend_ready():
             _send_with_resend_api()

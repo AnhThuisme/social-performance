@@ -8,7 +8,6 @@ __pycache__/
 build/
 dist/
 credential.json
-auth_settings.json
 Social_Export.xlsx
 _dashboard_rendered.html
 __pycache__/
