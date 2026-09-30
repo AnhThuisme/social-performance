@@ -16,6 +16,10 @@
     "thu.phannguyenanh@fanscom.vn": {
       "last_login_at": "30/08/2026 20:21:42",
       "login_count": 1
+    },
+    "ops@fanscom.vn": {
+      "last_login_at": "29/09/2026 15:55:11",
+      "login_count": 1
     }
   },
   "saved_sheets": [],
@@ -55,6 +59,82 @@
             "instagram": 0,
             "youtube": 0,
             "khac": 7
+          }
+        }
+      }
+    ],
+    "ops@fanscom.vn": [
+      {
+        "sheet_id": "1dkUgwWw69j4BItNGLOxnfWArh4n2T3YnrDZbU26x6Qs",
+        "sheet_name": "RS_Post | M&B group + Mass/Local page [10.8]",
+        "display_name": "RS_Post | M&B group + Mass/Local page [10.8]",
+        "sheet_gid": "1066215362",
+        "saved_at_text": "30/09/2026 09:04",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {
+          "sheet_title": "RS_Post | M&B group + Mass/Local page [10.8]",
+          "sheet_name": "RS_Post | M&B group + Mass/Local page [10.8]",
+          "sheet_id": "1dkUgwWw69j4BItNGLOxnfWArh4n2T3YnrDZbU26x6Qs",
+          "sheet_gid": "1066215362",
+          "campaign_label": "",
+          "brand_label": "",
+          "industry_label": "",
+          "campaign_description": "",
+          "total_posts": 37,
+          "total_views": 0,
+          "total_reaction": 27474,
+          "total_share": 3389,
+          "total_comment": 10112,
+          "total_save": 0,
+          "total_buzz": 13501,
+          "creator_count": 0,
+          "campaign_count": 1,
+          "platform_counts": {
+            "tiktok": 0,
+            "facebook": 37,
+            "instagram": 0,
+            "youtube": 0,
+            "khac": 0
+          }
+        }
+      },
+      {
+        "sheet_id": "1dkUgwWw69j4BItNGLOxnfWArh4n2T3YnrDZbU26x6Qs",
+        "sheet_name": "Copy of  W3 lọc",
+        "display_name": "Copy of  W3 lọc",
+        "sheet_gid": "1748127589",
+        "saved_at_text": "29/09/2026 16:55",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {
+          "sheet_title": "Copy of  W3 lọc",
+          "sheet_name": "Copy of  W3 lọc",
+          "sheet_id": "1dkUgwWw69j4BItNGLOxnfWArh4n2T3YnrDZbU26x6Qs",
+          "sheet_gid": "1748127589",
+          "campaign_label": "",
+          "brand_label": "",
+          "industry_label": "",
+          "campaign_description": "",
+          "total_posts": 278,
+          "total_views": 3304892,
+          "total_reaction": 8086,
+          "total_share": 10319,
+          "total_comment": 3106,
+          "total_save": 0,
+          "total_buzz": 3109,
+          "creator_count": 0,
+          "campaign_count": 1,
+          "platform_counts": {
+            "tiktok": 0,
+            "facebook": 0,
+            "instagram": 0,
+            "youtube": 0,
+            "khac": 278
           }
         }
       }

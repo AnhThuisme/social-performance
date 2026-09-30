@@ -7802,15 +7802,21 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         })
                 if sheet_requests:
                     _reqs = sheet_requests
-                    retry_with_backoff(
-                        lambda: ws.spreadsheet.batch_update({"requests": _reqs}),
-                        max_retries=3,
-                        handle_quota=True
-                    )
+                    try:
+                        retry_with_backoff(
+                            lambda: ws.spreadsheet.batch_update({"requests": _reqs}),
+                            max_retries=3,
+                            handle_quota=True
+                        )
+                    except Exception as sheet_err:
+                        locked_log(f"[{tab_name}] Dòng {row_idx}: Ghi Google Sheet tạm thời gặp lỗi ({str(sheet_err)[:90]}). Dữ liệu đã lưu tạm.")
                 red_fields = []
                 if ENABLE_SUCCESS_METRIC_ZERO_CHECK:
-                    red_fields = get_red_metric_fields_from_sheet(ws, row_idx, col_map, url, platform)
-                    update_metric_highlights(ws, row_idx, col_map, red_fields)
+                    try:
+                        red_fields = get_red_metric_fields_from_sheet(ws, row_idx, col_map, url, platform)
+                        update_metric_highlights(ws, row_idx, col_map, red_fields)
+                    except Exception:
+                        pass
                 with state_lock:
                     run_rows_snapshot.append(
                         {
@@ -7840,8 +7846,11 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
             def record_row_failure(row_idx: int, platform: str, url: str, reason: str = "Không lấy được số liệu"):
                 add_failed_item(tab_name, row_idx, platform, url, reason, runtime_state, sheet_id=tab_sheet_id)
                 if ENABLE_HIGHLIGHT_ON_FAILED_SCRAPE:
-                    red_fields = get_red_metric_fields_from_sheet(ws, row_idx, col_map, url, platform)
-                    update_metric_highlights(ws, row_idx, col_map, red_fields)
+                    try:
+                        red_fields = get_red_metric_fields_from_sheet(ws, row_idx, col_map, url, platform)
+                        update_metric_highlights(ws, row_idx, col_map, red_fields)
+                    except Exception:
+                        pass
                 locked_log(f"[{tab_name}] Dòng {row_idx}: {reason}")
                 with state_lock:
                     run_rows_snapshot.append(
@@ -7867,15 +7876,19 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                 for i, target, url in row_plan:
                     if not runtime_state["is_running"]:
                         return
-                    platform = detect_platform(url)
-                    with state_lock:
-                        runtime_state["current_task"] = f"[{tab_name}] Dòng {i}: {platform}"
-                    locked_log(f"[{tab_name}] Dòng {i}: {platform}...")
-                    stats = fetch_stats_with_row_retry(i, url, platform)
-                    if stats and runtime_state["is_running"]:
-                        record_row_success(i, platform, url, stats)
-                    elif runtime_state["is_running"]:
-                        deferred_failed_rows.append((i, target, url, platform))
+                    try:
+                        platform = detect_platform(url)
+                        with state_lock:
+                            runtime_state["current_task"] = f"[{tab_name}] Dòng {i}: {platform}"
+                        locked_log(f"[{tab_name}] Dòng {i}: {platform}...")
+                        stats = fetch_stats_with_row_retry(i, url, platform)
+                        if stats and runtime_state["is_running"]:
+                            record_row_success(i, platform, url, stats)
+                        elif runtime_state["is_running"]:
+                            deferred_failed_rows.append((i, target, url, platform))
+                    except Exception as row_exc:
+                        locked_log(f"[{tab_name}] Dòng {i}: Lỗi bất ngờ khi quét dòng này ({str(row_exc)[:80]}), ghi nhận lỗi và tiếp tục dòng tiếp theo.")
+                        deferred_failed_rows.append((i, target, url, detect_platform(url)))
                     with state_lock:
                         shared["processed"] += 1
                         runtime_state["schedule_last_run_processed"] = shared["processed"]
@@ -7885,27 +7898,32 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         tp = runtime_state["tab_progress"].get(tab_name)
                         if tp:
                             tp["current"] = tp.get("current", 0) + 1
-                    time.sleep(max(0.0, ROW_SCAN_DELAY_SECONDS))
-                if runtime_state["is_running"] and deferred_failed_rows and FAILED_ROW_RETRY_PASSES > 0:
-                    locked_log(f"[{tab_name}] Quét lại {len(deferred_failed_rows)} dòng còn thiếu số liệu...")
+                retry_passes = max(0, int(os.getenv("FAILED_ROW_RETRY_PASSES", str(FAILED_ROW_RETRY_PASSES))))
+                retry_delay = max(0.0, float(os.getenv("FAILED_ROW_RETRY_DELAY_SECONDS", str(FAILED_ROW_RETRY_DELAY_SECONDS))))
+                if runtime_state["is_running"] and deferred_failed_rows and retry_passes > 0:
+                    locked_log(f"[{tab_name}] 🔄 Tự động quét lại {len(deferred_failed_rows)} dòng còn thiếu số liệu...")
                     remaining_rows = list(deferred_failed_rows)
-                    for retry_pass in range(FAILED_ROW_RETRY_PASSES):
+                    for retry_pass in range(retry_passes):
                         if not remaining_rows or not runtime_state["is_running"]:
                             break
                         restart_tab_driver("Làm mới driver trước lượt quét lại các dòng lỗi...")
-                        if FAILED_ROW_RETRY_DELAY_SECONDS > 0:
-                            time.sleep(FAILED_ROW_RETRY_DELAY_SECONDS)
+                        if retry_delay > 0:
+                            time.sleep(retry_delay)
                         next_remaining_rows = []
                         for row_idx, target, url, platform in remaining_rows:
                             if not runtime_state["is_running"]:
                                 break
-                            with state_lock:
-                                runtime_state["current_task"] = f"[{tab_name}] Dòng {row_idx}: quét lại"
-                            locked_log(f"[{tab_name}] Dòng {row_idx}: quét lại lượt cuối {retry_pass + 1}/{FAILED_ROW_RETRY_PASSES}...")
-                            stats = fetch_stats_with_row_retry(row_idx, url, platform)
-                            if stats and runtime_state["is_running"]:
-                                record_row_success(row_idx, platform, url, stats, rescued=True)
-                            else:
+                            try:
+                                with state_lock:
+                                    runtime_state["current_task"] = f"[{tab_name}] Dòng {row_idx}: quét lại"
+                                locked_log(f"[{tab_name}] Dòng {row_idx}: quét lại lượt cuối {retry_pass + 1}/{FAILED_ROW_RETRY_PASSES}...")
+                                stats = fetch_stats_with_row_retry(row_idx, url, platform)
+                                if stats and runtime_state["is_running"]:
+                                    record_row_success(row_idx, platform, url, stats, rescued=True)
+                                else:
+                                    next_remaining_rows.append((row_idx, target, url, platform))
+                            except Exception as retry_row_exc:
+                                locked_log(f"[{tab_name}] Dòng {row_idx}: Quét lại gặp sự cố ({str(retry_row_exc)[:80]}).")
                                 next_remaining_rows.append((row_idx, target, url, platform))
                         remaining_rows = next_remaining_rows
                     deferred_failed_rows = remaining_rows
