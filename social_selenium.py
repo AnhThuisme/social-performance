@@ -28,10 +28,10 @@ def _env_float(name: str, default: float, min_value: float) -> float:
         return default
 
 
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 8.0, 2.0)
-TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 6.0, 2.0)
-FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 6.0, 2.0)
-INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 5.0, 2.0)
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 6.0, 2.0)
+TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 4.5, 2.0)
+FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 5.0, 2.0)
+INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 4.0, 2.0)
 TIKTOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_TIKTOK_SOFT_RETRY_ATTEMPTS", 0.0, 0.0))
 TIKTOK_SOFT_RETRY_DELAY_SECONDS = _env_float("SELENIUM_TIKTOK_SOFT_RETRY_DELAY_SECONDS", 0.3, 0.0)
 FACEBOOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_FACEBOOK_SOFT_RETRY_ATTEMPTS", 0.0, 0.0))
@@ -45,7 +45,8 @@ TIKTOK_TIMEOUT_COOLDOWN_SECONDS = _env_float("SELENIUM_TIKTOK_TIMEOUT_COOLDOWN_S
 DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 0.15, 0.05)
 SCROLL_SETTLE_SECONDS = _env_float("SELENIUM_SCROLL_SETTLE_SECONDS", 0.1, 0.02)
 READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.05, 0.02)
-READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 2.5, 0.5)
+READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 1.5, 0.5)
+
 TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS", 3.0, 1.0)
 TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS", 0.3, 0.1)
 TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS = _env_float("TIKTOK_AUTO_WAIT_TIMEOUT_SECONDS", 3.5, 1.0)
@@ -735,15 +736,16 @@ def _focus_visible_browser_window(driver):
 
 
 def _can_use_visible_browser_retry() -> bool:
-    # Headful Chrome retry is only reliable on environments that actually expose a desktop
-    # session. Docker/VPS without DISPLAY tends to crash immediately with "Chrome instance exited".
+    if not ALLOW_VISIBLE_BROWSER_RETRY:
+        return False
     if _is_local_desktop_runtime():
         return True
     if _ensure_virtual_display():
         return True
-    if _get_remote_selenium_url() and ALLOW_VISIBLE_BROWSER_RETRY:
+    if _get_remote_selenium_url():
         return True
     return False
+
 
 
 def _read_current_page_bundle(driver):
@@ -913,22 +915,117 @@ def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None
 
 
 def _parse_compact_number(value) -> Optional[int]:
+    """Parse a number string or numeric value into an integer, handling:
+    - Numbers with embedded labels (e.g. "Likes: 5.6K", "5.6K likes", "1,234 comments", "1.2M views")
+    - Compact suffixes: K, M, B, T (e.g. 1.2K, 1,2K, 1.234K, 1.5M, 2B, 1.2 K)
+    - Thousand separators: comma, dot, or space (e.g. 1.234.567, 1,234,567, 1 234 567)
+    - Mixed separators (e.g. 1.234,56 or 1,234.56)
+    - Decimal notation: floored to integer (e.g. 12.5 -> 12)
+    - Fallback: cleanly extracts valid integer tokens
+    """
     if value is None:
         return None
-    raw = str(value).strip().strip("\"'").replace("\xa0", "").replace(" ", "")
-    if not raw:
+    if isinstance(value, (int, float)):
+        return int(float(value))
+
+    raw = str(value).strip()
+    if not raw or raw.lower() == "nan":
         return None
-    suffix_match = re.match(r"^([\d.,]+)([KMB])$", raw.upper())
-    if suffix_match:
-        number_part = suffix_match.group(1).replace(",", ".")
+    raw_lower = raw.lower()
+    if any(marker in raw_lower for marker in ("http://", "https://", "www.", ".com/", ".vn/", ".net/")):
+        return None
+
+    cleaned = raw.replace("\xa0", " ").strip().strip("\"'")
+
+    # 1. Compact number with suffix (K, M, B, T, etc.)
+    # Handles "1.2K", "5.6K likes", "Likes: 5.6K", "1.2 K", "1,234K"
+    compact_pattern = r"(?:^|[^\w])([+-]?[\d.,\s]+?)\s*([kmbtpe])(?:\b|[^\w]|$)"
+    match = re.search(compact_pattern, cleaned, flags=re.IGNORECASE)
+    if match:
+        number_part = match.group(1).replace(" ", "")
+        unit = match.group(2).upper()
+        unit_multiplier = {
+            "K": 1_000,
+            "M": 1_000_000,
+            "B": 1_000_000_000,
+            "T": 1_000_000_000_000,
+            "P": 1_000_000_000_000_000,
+            "E": 1_000_000_000_000_000_000,
+        }.get(unit, 1)
+
+        last_sep = max(number_part.rfind("."), number_part.rfind(","))
+        if last_sep != -1:
+            after_last_sep = number_part[last_sep + 1:]
+            if len(after_last_sep) == 3:
+                # Thousand separator e.g. "1.234K"
+                clean = re.sub(r"[.,]", "", number_part)
+                try:
+                    base = int(clean)
+                except Exception:
+                    return None
+            else:
+                # Decimal separator e.g. "1.2K" or "1,2K"
+                clean = number_part.replace(",", ".")
+                try:
+                    base = float(clean)
+                except Exception:
+                    return None
+        else:
+            try:
+                base = float(number_part)
+            except Exception:
+                return None
+        return int(base * unit_multiplier)
+
+    # 2. Plain numbers without suffix
+    # First collapse spaces between digits (e.g. "1 234" -> "1234", "1 234 567" -> "1234567")
+    cleaned_digits = re.sub(r"(\d)\s+(\d)", r"\1\2", cleaned)
+
+    number_token_match = re.search(r"[+-]?\d[\d.,]*", cleaned_digits)
+    if not number_token_match:
+        return None
+    token = number_token_match.group(0)
+    has_dot = "." in token
+    has_comma = "," in token
+
+    # Both dot and comma: e.g. 1.234,56 (EU) or 1,234.56 (US)
+    if has_dot and has_comma:
+        decimal_sep = "." if token.rfind(".") > token.rfind(",") else ","
+        if decimal_sep == ".":
+            normalized = token.replace(",", "")
+        else:
+            normalized = token.replace(".", "").replace(",", ".")
         try:
-            base = float(number_part)
+            return int(float(normalized))
         except Exception:
             return None
-        multiplier = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}[suffix_match.group(2)]
-        return int(base * multiplier)
-    digits = re.sub(r"[^\d]", "", raw)
-    return int(digits) if digits else None
+
+    # Single separator type: e.g. 1.234.567 or 1,234 or 12.5
+    if has_dot or has_comma:
+        sep = "." if has_dot else ","
+        parts = token.split(sep)
+        if len(parts) > 2:
+            collapsed = "".join(parts)
+            return int(collapsed) if collapsed.isdigit() else None
+        if len(parts) == 2:
+            left, right = parts
+            if right.isdigit() and len(right) == 3 and left.replace("+", "").replace("-", "").isdigit():
+                collapsed = left + right
+                collapsed = collapsed.replace("+", "")
+                return int(collapsed) if re.fullmatch(r"-?\d+", collapsed) else None
+            try:
+                return int(left) if left.lstrip("+-").isdigit() else int(float(token.replace(",", ".")))
+            except Exception:
+                return None
+
+    digits = re.sub(r"[^\d-]", "", token)
+    if re.fullmatch(r"-?\d+", digits or ""):
+        try:
+            return int(digits)
+        except Exception:
+            return None
+    return None
+
 
 
 def _extract_number(text: str, patterns) -> Optional[int]:
@@ -1028,10 +1125,11 @@ def _extract_text_metric(text: str, labels) -> Optional[int]:
         return None
     label_pattern = "|".join(re.escape(label) for label in labels)
     patterns = [
-        rf"([\d.,]+(?:[KMB])?)\s*(?:{label_pattern})\b",
-        rf"\b(?:{label_pattern})\s*([\d.,]+(?:[KMB])?)",
+        rf"([\d.,\s]+?(?:[kmbtpeKMBTPE])?)\s*(?:{label_pattern})\b",
+        rf"\b(?:{label_pattern})\s*([\d.,\s]+?(?:[kmbtpeKMBTPE])?)",
     ]
     return _extract_number(text, patterns)
+
 
 
 def _format_air_date(day, month) -> str:
@@ -1310,11 +1408,9 @@ def _has_tiktok_challenge(bundle) -> bool:
     if any(marker in text for marker in visible_markers):
         return True
     source_markers = (
-        "secsdk-captcha",
         "captcha-verify-container",
         "captcha_container",
         "drag the slider to fit the puzzle",
-        "slardarwaf",
         "_wafchallengeid",
     )
     return any(marker in source for marker in source_markers)
@@ -1326,7 +1422,8 @@ def _is_tiktok_auto_wait(bundle) -> bool:
     source = (bundle.get("source") or "").lower()
     if text == "please wait..." or title == "please wait...":
         return True
-    return "slardarwaf" in source or "_wafchallengeid" in source
+    return "_wafchallengeid" in source
+
 
 
 def _payload_has_tiktok_signal(payload) -> bool:

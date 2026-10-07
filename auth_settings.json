@@ -18,8 +18,8 @@
       "login_count": 1
     },
     "ops@fanscom.vn": {
-      "last_login_at": "29/09/2026 15:55:11",
-      "login_count": 1
+      "last_login_at": "07/10/2026 15:02:28",
+      "login_count": 3
     }
   },
   "saved_sheets": [],
@@ -65,6 +65,55 @@
     ],
     "ops@fanscom.vn": [
       {
+        "sheet_id": "1t3Caqc5KXsF5nC8h7jHWumINN3AIJizFa87l45gzxLo",
+        "sheet_name": "PERFORMANCE_T9",
+        "display_name": "PERFORMANCE_T9",
+        "sheet_gid": "1061223300",
+        "saved_at_text": "07/10/2026 15:03",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {}
+      },
+      {
+        "sheet_id": "1uPufk5_jNBlQP70EzsBl5QMPJ_0jQuNl3d1vg8_BIYA",
+        "sheet_name": "CHẠY VIEW",
+        "display_name": "CHẠY VIEW",
+        "sheet_gid": "1855359232",
+        "saved_at_text": "30/09/2026 10:15",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {
+          "sheet_title": "CHẠY VIEW",
+          "sheet_name": "CHẠY VIEW",
+          "sheet_id": "1uPufk5_jNBlQP70EzsBl5QMPJ_0jQuNl3d1vg8_BIYA",
+          "sheet_gid": "1855359232",
+          "campaign_label": "",
+          "brand_label": "",
+          "industry_label": "",
+          "campaign_description": "",
+          "total_posts": 0,
+          "total_views": 0,
+          "total_reaction": 0,
+          "total_share": 0,
+          "total_comment": 0,
+          "total_save": 0,
+          "total_buzz": 0,
+          "creator_count": 0,
+          "campaign_count": 0,
+          "platform_counts": {
+            "tiktok": 0,
+            "facebook": 0,
+            "instagram": 0,
+            "youtube": 0,
+            "khac": 0
+          }
+        }
+      },
+      {
         "sheet_id": "1dkUgwWw69j4BItNGLOxnfWArh4n2T3YnrDZbU26x6Qs",
         "sheet_name": "RS_Post | M&B group + Mass/Local page [10.8]",
         "display_name": "RS_Post | M&B group + Mass/Local page [10.8]",
@@ -85,11 +134,11 @@
           "campaign_description": "",
           "total_posts": 37,
           "total_views": 0,
-          "total_reaction": 27474,
-          "total_share": 3389,
-          "total_comment": 10112,
+          "total_reaction": 26847,
+          "total_share": 3385,
+          "total_comment": 10026,
           "total_save": 0,
-          "total_buzz": 13501,
+          "total_buzz": 13411,
           "creator_count": 0,
           "campaign_count": 1,
           "platform_counts": {
@@ -120,21 +169,21 @@
           "brand_label": "",
           "industry_label": "",
           "campaign_description": "",
-          "total_posts": 278,
-          "total_views": 3304892,
-          "total_reaction": 8086,
-          "total_share": 10319,
-          "total_comment": 3106,
+          "total_posts": 0,
+          "total_views": 0,
+          "total_reaction": 0,
+          "total_share": 0,
+          "total_comment": 0,
           "total_save": 0,
-          "total_buzz": 3109,
+          "total_buzz": 0,
           "creator_count": 0,
-          "campaign_count": 1,
+          "campaign_count": 0,
           "platform_counts": {
             "tiktok": 0,
             "facebook": 0,
             "instagram": 0,
             "youtube": 0,
-            "khac": 278
+            "khac": 0
           }
         }
       }

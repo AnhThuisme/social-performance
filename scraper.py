@@ -5376,10 +5376,15 @@ def parse_metric_number(value) -> int:
     if any(marker in raw_lower for marker in ("http://", "https://", "www.", ".com/", ".vn/", ".net/")):
         return 0
 
-    compact_match = re.fullmatch(r"\s*([+-]?\d+(?:[.,]\d+)?)\s*([kmbtpe])\s*", raw, flags=re.IGNORECASE)
-    if compact_match:
-        number_text = compact_match.group(1).replace(",", ".")
-        unit = compact_match.group(2).upper()
+    cleaned = raw.replace("\xa0", " ").strip().strip("\"'")
+
+    # 1. Compact number with suffix (K, M, B, T, etc.)
+    # Handles "1.2K", "5.6K likes", "Likes: 5.6K", "1.2 K", "1,234K"
+    compact_pattern = r"(?:^|[^\w])([+-]?[\d.,\s]+?)\s*([kmbtpe])(?:\b|[^\w]|$)"
+    match = re.search(compact_pattern, cleaned, flags=re.IGNORECASE)
+    if match:
+        number_part = match.group(1).replace(" ", "")
+        unit = match.group(2).upper()
         unit_multiplier = {
             "K": 1_000,
             "M": 1_000_000,
@@ -5388,12 +5393,39 @@ def parse_metric_number(value) -> int:
             "P": 1_000_000_000_000_000,
             "E": 1_000_000_000_000_000_000,
         }.get(unit, 1)
+
+        last_sep = max(number_part.rfind("."), number_part.rfind(","))
+        if last_sep != -1:
+            after_last_sep = number_part[last_sep + 1:]
+            if len(after_last_sep) == 3:
+                # Thousand separator e.g. "1.234K"
+                clean = re.sub(r"[.,]", "", number_part)
+                try:
+                    base = int(clean)
+                except Exception:
+                    return 0
+            else:
+                # Decimal separator e.g. "1.2K" or "1,2K"
+                clean = number_part.replace(",", ".")
+                try:
+                    base = float(clean)
+                except Exception:
+                    return 0
+        else:
+            try:
+                base = float(number_part)
+            except Exception:
+                return 0
         try:
-            return int(float(number_text) * unit_multiplier)
+            return int(base * unit_multiplier)
         except Exception:
             return 0
 
-    number_token_match = re.search(r"[+-]?\d[\d.,]*", raw)
+    # 2. Plain numbers without suffix
+    # First collapse spaces between digits (e.g. "1 234" -> "1234", "1 234 567" -> "1234567")
+    cleaned_digits = re.sub(r"(\d)\s+(\d)", r"\1\2", cleaned)
+
+    number_token_match = re.search(r"[+-]?\d[\d.,]*", cleaned_digits)
     if not number_token_match:
         return 0
     token = number_token_match.group(0)
@@ -5422,12 +5454,13 @@ def parse_metric_number(value) -> int:
         if len(parts) == 2:
             left, right = parts
             if right.isdigit() and len(right) == 3 and left.replace("+", "").replace("-", "").isdigit():
+                # Thousand separator: 1.234 or 1,234
                 collapsed = left + right
                 collapsed = collapsed.replace("+", "")
                 return int(collapsed) if re.fullmatch(r"-?\d+", collapsed) else 0
-            normalized = token.replace(",", ".")
+            # Decimal separator: floor to integer
             try:
-                return int(float(normalized))
+                return int(left) if left.lstrip("+-").isdigit() else int(float(token.replace(",", ".")))
             except Exception:
                 return 0
 
@@ -5438,6 +5471,8 @@ def parse_metric_number(value) -> int:
         except Exception:
             return 0
     return 0
+
+
 
 def format_metric_number(value) -> str:
     return f"{parse_metric_number(value):,}".replace(",", ".")
@@ -7322,13 +7357,17 @@ def build_row_updates(col_map, platform, now, stats):
             continue
         if stat_key not in stats or stats.get(stat_key) is None:
             continue
-        row_updates.append((field, col_map[field], int(stats.get(stat_key, 0))))
+        row_updates.append((field, col_map[field], parse_metric_number(stats.get(stat_key, 0))))
     has_share_metric = "s" in stats and stats.get("s") is not None
     has_comment_metric = "c" in stats and stats.get("c") is not None
     platform_key = str(platform or "").strip().lower()
     should_write_buzz = has_comment_metric if platform_key == "tiktok" else (has_share_metric or has_comment_metric)
     if col_map.get("buzz") and should_write_buzz:
-        buzz_value = compute_buzz_value(platform, int(stats.get("s") or 0), int(stats.get("c") or 0))
+        buzz_value = compute_buzz_value(
+            platform,
+            parse_metric_number(stats.get("s", 0)),
+            parse_metric_number(stats.get("c", 0)),
+        )
         row_updates.append(("buzz", col_map["buzz"], buzz_value))
     return row_updates
 
@@ -7362,11 +7401,9 @@ def ensure_dashboard_date_column(sheet, layout=None, col_map=None, state=None):
 
 def normalize_cell_value(field, value):
     if field in {"view", "like", "share", "comment", "buzz", "save"}:
-        try:
-            return int(str(value).strip())
-        except Exception:
-            return value
+        return parse_metric_number(value)
     return value
+
 
 
 def get_missing_metric_fields(col_map, stats):
@@ -7447,21 +7484,25 @@ def update_metric_highlights(sheet, row_idx: int, col_map, missing_fields):
         )
 
 
-# --- Xá»­ lÃ½ YouTube ---
+# --- Xử lý YouTube ---
 def get_youtube_stats(url):
     try:
         video_id_match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
         if not video_id_match: return None
         youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
         item = youtube.videos().list(part="statistics,snippet", id=video_id_match.group(1)).execute()['items'][0]
+        stats_data = item.get('statistics', {})
         return {
-            "v": item['statistics'].get("viewCount", 0),
-            "l": item['statistics'].get("likeCount", 0),
-            "s": 0, "c": item['statistics'].get("commentCount", 0),
-            "cap": item['snippet'].get('title', ''),
-            "air_date": format_air_date_text(item['snippet'].get('publishedAt', '')),
+            "v": parse_metric_number(stats_data.get("viewCount", 0)),
+            "l": parse_metric_number(stats_data.get("likeCount", 0)),
+            "s": 0,
+            "c": parse_metric_number(stats_data.get("commentCount", 0)),
+            "cap": item.get('snippet', {}).get('title', ''),
+            "air_date": format_air_date_text(item.get('snippet', {}).get('publishedAt', '')),
         }
-    except: return None
+    except Exception:
+        return None
+
 
 # --- Xá»­ lÃ½ Äa ná»n táº£ng (Facebook, TikTok, IG) ---
 def get_social_stats(url, platform_name, driver=None, logger=None):
@@ -7739,10 +7780,11 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     locked_log(
                         f"[{tab_name}] Dòng {row_idx}: chưa lấy được số liệu, thử lại lần {attempt_index + 1}/{extra_attempts}..."
                     )
-                    if platform_key in restartable_platforms:
-                        restart_tab_driver("Khởi động lại driver trước khi retry dòng hiện tại...")
+                    if platform_key in restartable_platforms and (tab_driver is None or getattr(tab_driver, "_needs_restart", False)):
+                        restart_tab_driver("Driver session bị lỗi, đang tự động khởi động lại driver...")
                     if ROW_SCRAPE_RETRY_DELAY_SECONDS > 0:
                         time.sleep(ROW_SCRAPE_RETRY_DELAY_SECONDS)
+
                 return None
 
             def record_row_success(row_idx: int, platform: str, url: str, stats, rescued: bool = False):
