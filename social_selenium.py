@@ -474,6 +474,10 @@ def _add_common_browser_args(options, headless: bool = True):
         args.insert(0, "--headless=new")
     for arg in args:
         options.add_argument(arg)
+    try:
+        options.page_load_strategy = "eager"
+    except Exception:
+        pass
 
 
 def _apply_stealth(driver):
@@ -589,36 +593,67 @@ def _is_tiktok_url(url: str) -> bool:
     return _detect_platform_from_url(url) == "tiktok"
 
 
+def _normalize_tiktok_target_url(url: str) -> str:
+    """Normalize TikTok URL for robust web scraping:
+    1. Ensures https:// scheme (handles 'tiktok.com/@user/photo/123').
+    2. Strips tracker query params (_r, _t, image_index, etc.).
+    3. If URL is a /photo/ link or has a video/photo ID:
+       Converts to canonical 'https://www.tiktok.com/@{username}/video/{post_id}'.
+       Why?
+       - TikTok desktop web SPA router frequently freezes or renders a blank
+         explore page (pc_web_explorePage_all) on /photo/ URLs when tracking
+         parameters or slight username typos exist.
+       - But TikTok's server ALWAYS routes /video/{post_id} (even for photos!)
+         to the correct canonical post, auto-correcting username discrepancies
+         and pre-rendering the full page data with metrics!
+    """
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return raw_url
+    if not raw_url.lower().startswith(("http://", "https://")):
+        raw_url = "https://" + raw_url.lstrip("/")
+    clean_url = raw_url.split("#")[0]
+    match = re.search(r"/(?:video|photo)/(\d+)", clean_url, re.IGNORECASE)
+    if match:
+        post_id = match.group(1)
+        user_match = re.search(r"@([^/?&#]+)", clean_url)
+        username = user_match.group(1).strip() if user_match else "a"
+        return f"https://www.tiktok.com/@{username}/video/{post_id}"
+    return clean_url
+
+
 def _resolve_tiktok_url(url: str, logger: Optional[Callable[[str], None]] = None) -> str:
     raw_url = str(url or "").strip()
     if not raw_url:
         return raw_url
+    if not raw_url.lower().startswith(("http://", "https://")):
+        raw_url = "https://" + raw_url.lstrip("/")
     try:
         parsed = urllib.parse.urlparse(raw_url)
         host = (parsed.netloc or "").lower()
     except Exception:
-        return raw_url
-    if not (host.startswith("vt.tiktok.com") or host.startswith("vm.tiktok.com")):
-        return raw_url
-    headers = {
-        "User-Agent": DEFAULT_USER_AGENT,
-        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
-    }
-    for method in ("head", "get"):
-        try:
-            request_fn = requests.head if method == "head" else requests.get
-            resp = request_fn(raw_url, allow_redirects=True, timeout=10, headers=headers, stream=(method == "get"))
-            final_url = str(resp.url or raw_url).split("#")[0]
+        host = ""
+    if host.startswith("vt.tiktok.com") or host.startswith("vm.tiktok.com"):
+        headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+        }
+        for method in ("head", "get"):
             try:
-                resp.close()
-            except Exception:
-                pass
-            if final_url and final_url != raw_url:
-                _emit(logger, f"Đã resolve TikTok short-link -> {final_url[:120]}")
-                return final_url
-        except Exception as exc:
-            _emit(logger, f"Resolve TikTok short-link ({method}) lỗi: {str(exc)[:120]}")
-    return raw_url
+                request_fn = requests.head if method == "head" else requests.get
+                resp = request_fn(raw_url, allow_redirects=True, timeout=10, headers=headers, stream=(method == "get"))
+                final_url = str(resp.url or raw_url).split("#")[0]
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                if final_url and final_url != raw_url:
+                    _emit(logger, f"Đã resolve TikTok short-link -> {final_url[:120]}")
+                    raw_url = final_url
+                    break
+            except Exception as exc:
+                _emit(logger, f"Resolve TikTok short-link ({method}) lỗi: {str(exc)[:120]}")
+    return _normalize_tiktok_target_url(raw_url)
 
 
 def _is_facebook_login_gate(url: str) -> bool:
@@ -847,7 +882,11 @@ def _collect_page_bundle_via_requests(url: str, platform: str, logger: Optional[
             allow_redirects=True,
             timeout=timeout_sec,
         )
+        if resp.status_code != 200:
+            return None
         source = resp.text or ""
+        if "overload-protect" in source or len(source) < 100:
+            return None
         metas = _extract_meta_tags_from_html(source)
         title_match = re.search(r"<title[^>]*>(.*?)</title>", source, flags=re.IGNORECASE | re.DOTALL)
         title = re.sub(r"\s+", " ", str(title_match.group(1) if title_match else "")).strip()
@@ -887,8 +926,13 @@ def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None
             pass
 
     if timed_out:
-        # Driver may be in unstable renderer state after timeout.
-        # Return a lightweight bundle immediately to avoid extra blocking.
+        try:
+            fallback_bundle = _read_current_page_bundle(driver)
+            if fallback_bundle and len(fallback_bundle.get("source", "")) > 500:
+                fallback_bundle["_timed_out"] = True
+                return fallback_bundle
+        except Exception:
+            pass
         try:
             current_url = driver.current_url or url
         except Exception:
@@ -2429,15 +2473,18 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         bundle = _collect_page_bundle(driver, url, logger=logger)
         if bundle.get("_timed_out"):
             if platform == "tiktok":
-                _emit(logger, "TikTok timeout: bỏ qua retry sâu trên cùng driver để tránh treo dây chuyền.")
-                _TIKTOK_TIMEOUT_STREAK += 1
-                if TIKTOK_TIMEOUT_COOLDOWN_SECONDS > 0 and _TIKTOK_TIMEOUT_STREAK >= TIKTOK_TIMEOUT_STREAK_THRESHOLD:
-                    _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = time.time() + TIKTOK_TIMEOUT_COOLDOWN_SECONDS
-                    _emit(
-                        logger,
-                        f"TikTok timeout liên tiếp ({_TIKTOK_TIMEOUT_STREAK}), tạm cooldown {int(TIKTOK_TIMEOUT_COOLDOWN_SECONDS)}s.",
-                    )
-                return None
+                candidate = _extract_tiktok(bundle) if bundle.get("source") else None
+                if candidate and any(candidate.get(k) for k in ("v", "l", "s", "c", "save")):
+                    payload = candidate
+                else:
+                    _emit(logger, "TikTok timeout khi tải trang.")
+                    _TIKTOK_TIMEOUT_STREAK += 1
+                    if TIKTOK_TIMEOUT_COOLDOWN_SECONDS > 0 and _TIKTOK_TIMEOUT_STREAK >= TIKTOK_TIMEOUT_STREAK_THRESHOLD:
+                        _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = time.time() + TIKTOK_TIMEOUT_COOLDOWN_SECONDS
+                        _emit(
+                            logger,
+                            f"TikTok timeout liên tiếp ({_TIKTOK_TIMEOUT_STREAK}), tạm cooldown {int(TIKTOK_TIMEOUT_COOLDOWN_SECONDS)}s.",
+                        )
             if TIMEOUT_RECOVERY_RETRY_ATTEMPTS > 0:
                 for attempt in range(1, TIMEOUT_RECOVERY_RETRY_ATTEMPTS + 1):
                     if TIMEOUT_RECOVERY_RETRY_DELAY_SECONDS > 0:
@@ -2556,6 +2603,21 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
                         _emit(logger, f"{platform.capitalize()} lấy được dữ liệu qua fallback requests.")
                 except Exception:
                     payload = None
+        # === TikTok deep fallback: try in-browser embed URL ===
+        if platform == "tiktok" and not payload and driver is not None and _is_tiktok_url(url):
+            video_id = _extract_tiktok_video_id(url)
+            if video_id:
+                in_browser_embed_url = f"https://www.tiktok.com/embed/v2/{video_id}"
+                _emit(logger, f"TikTok thử lại qua embed trong browser: {in_browser_embed_url}")
+                try:
+                    embed_b = _collect_page_bundle(driver, in_browser_embed_url, logger=logger)
+                    embed_p = extractor(embed_b)
+                    if embed_p and any(embed_p.get(k) for k in ("v", "l", "s", "c", "save")):
+                        bundle = embed_b
+                        payload = embed_p
+                        _emit(logger, "TikTok lấy được dữ liệu qua embed trong browser.")
+                except Exception:
+                    pass
         if not payload:
             return None
         if platform not in {"facebook", "tiktok"} and not str(payload.get("air_date") or "").strip():

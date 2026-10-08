@@ -66,6 +66,18 @@
     "ops@fanscom.vn": [
       {
         "sheet_id": "1t3Caqc5KXsF5nC8h7jHWumINN3AIJizFa87l45gzxLo",
+        "sheet_name": "Sheet6",
+        "display_name": "Sheet6",
+        "sheet_gid": "66501803",
+        "saved_at_text": "08/10/2026 10:37",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {}
+      },
+      {
+        "sheet_id": "1t3Caqc5KXsF5nC8h7jHWumINN3AIJizFa87l45gzxLo",
         "sheet_name": "PERFORMANCE_T9",
         "display_name": "PERFORMANCE_T9",
         "sheet_gid": "1061223300",
@@ -74,7 +86,32 @@
         "brand_label": "",
         "industry_label": "",
         "campaign_description": "",
-        "summary_snapshot": {}
+        "summary_snapshot": {
+          "sheet_title": "PERFORMANCE_T9",
+          "sheet_name": "PERFORMANCE_T9",
+          "sheet_id": "1t3Caqc5KXsF5nC8h7jHWumINN3AIJizFa87l45gzxLo",
+          "sheet_gid": "1061223300",
+          "campaign_label": "",
+          "brand_label": "",
+          "industry_label": "",
+          "campaign_description": "",
+          "total_posts": 0,
+          "total_views": 0,
+          "total_reaction": 0,
+          "total_share": 0,
+          "total_comment": 0,
+          "total_save": 0,
+          "total_buzz": 0,
+          "creator_count": 0,
+          "campaign_count": 0,
+          "platform_counts": {
+            "tiktok": 0,
+            "facebook": 0,
+            "instagram": 0,
+            "youtube": 0,
+            "khac": 0
+          }
+        }
       },
       {
         "sheet_id": "1uPufk5_jNBlQP70EzsBl5QMPJ_0jQuNl3d1vg8_BIYA",
