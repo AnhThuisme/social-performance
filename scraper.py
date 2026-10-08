@@ -3434,16 +3434,44 @@ def add_failed_item(tab_name: str, row_idx: int, platform: str, url: str, reason
     runtime_state = resolve_runtime_state(state)
     failed_items = runtime_state.get("failed_items") or []
     timestamp = datetime.now().strftime("%H:%M:%S")
+    target_sheet_id = str(sheet_id or runtime_state.get("active_sheet_id", "") or "").strip()
+    target_tab = str(tab_name or "").strip()
+    target_row = int(row_idx or 0)
+    failed_items = [
+        item for item in failed_items
+        if not (
+            str(item.get("sheet_id") or "").strip() == target_sheet_id
+            and str(item.get("tab") or "").strip() == target_tab
+            and int(item.get("row") or 0) == target_row
+        )
+    ]
     failed_items.insert(0, {
         "time": timestamp,
-        "sheet_id": str(sheet_id or runtime_state.get("active_sheet_id", "") or "").strip(),
-        "tab": str(tab_name or "").strip(),
-        "row": int(row_idx or 0),
+        "sheet_id": target_sheet_id,
+        "tab": target_tab,
+        "row": target_row,
         "platform": str(platform or "").strip(),
         "url": str(url or "").strip(),
         "reason": str(reason or "Không lấy được số liệu").strip(),
     })
-    runtime_state["failed_items"] = failed_items[:50]
+    runtime_state["failed_items"] = failed_items
+
+
+def remove_failed_item(tab_name: str, row_idx: int, state=None, sheet_id: str = ""):
+    runtime_state = resolve_runtime_state(state)
+    failed_items = runtime_state.get("failed_items") or []
+    target_sheet_id = str(sheet_id or runtime_state.get("active_sheet_id", "") or "").strip()
+    target_tab = str(tab_name or "").strip()
+    target_row = int(row_idx or 0)
+    failed_items = [
+        item for item in failed_items
+        if not (
+            (not target_sheet_id or str(item.get("sheet_id") or "").strip() == target_sheet_id)
+            and str(item.get("tab") or "").strip() == target_tab
+            and int(item.get("row") or 0) == target_row
+        )
+    ]
+    runtime_state["failed_items"] = failed_items
 
 
 def build_failed_html(state=None):
@@ -3453,7 +3481,7 @@ def build_failed_html(state=None):
     if not failed_items:
         return header_html + '<p class="system-log-empty">Chưa có dòng lỗi lấy số liệu.</p>'
     rows = []
-    for item in failed_items[:30]:
+    for item in failed_items:
         time_text = html.escape(str(item.get("time") or ""))
         tab_text = html.escape(str(item.get("tab") or ""))
         row_text = html.escape(str(item.get("row") or ""))
@@ -7883,6 +7911,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                         f"[{tab_name}] Dòng {row_idx}: "
                         + ("Cập nhật thành công sau lượt quét lại" if rescued else "Cập nhật thành công")
                     )
+                    remove_failed_item(tab_name, row_idx, runtime_state, sheet_id=tab_sheet_id)
                     shared["success"] += 1
 
             def record_row_failure(row_idx: int, platform: str, url: str, reason: str = "Không lấy được số liệu"):
