@@ -1168,9 +1168,11 @@ def _extract_text_metric(text: str, labels) -> Optional[int]:
     if not text:
         return None
     label_pattern = "|".join(re.escape(label) for label in labels)
+    # Use [\d.,]+ (no \s) to avoid matching a number on one line with a label on the next line.
+    # e.g. "919\nBình luận" must NOT be parsed as 919 comments.
     patterns = [
-        rf"([\d.,\s]+?(?:[kmbtpeKMBTPE])?)\s*(?:{label_pattern})\b",
-        rf"\b(?:{label_pattern})\s*([\d.,\s]+?(?:[kmbtpeKMBTPE])?)",
+        rf"([\d.,]+(?:[kmbtpeKMBTPE])?)[ \t]*(?:{label_pattern})\b",
+        rf"\b(?:{label_pattern})[ \t]*([\d.,]+(?:[kmbtpeKMBTPE])?)",
     ]
     return _extract_number(text, patterns)
 
@@ -1302,7 +1304,11 @@ def _extract_relative_air_date_from_text_line(line: str) -> str:
     if not cleaned or len(cleaned) > 80:
         return ""
     lowered = cleaned.lower()
-    now = datetime.now()
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Ho_Chi_Minh"))).replace(tzinfo=None)
+    except Exception:
+        now = datetime.now()
     if re.search(r"\b(today|hôm nay|hom nay|just now|vừa xong|vua xong)\b", lowered):
         return _format_air_date(now.day, now.month)
     if re.search(r"\b(yesterday|hôm qua|hom qua)\b", lowered):
@@ -1997,7 +2003,8 @@ def _extract_instagram(bundle):
 
 def _extract_facebook_target_ids(url: str):
     patterns = [
-        r"/reel/(\d+)",
+        r"/reel/([a-zA-Z0-9_-]+)",
+        r"/share/[rv]/([a-zA-Z0-9_-]+)",
         r"/videos/(?:[^/]+/)?(\d+)",
         r"[?&]v=(\d+)",
         r"[?&]multi_permalinks=(\d+)",
@@ -2085,15 +2092,31 @@ def _extract_facebook_reel_text_counts(text: str):
         parsed = _parse_compact_number(line)
         if parsed is not None:
             numeric_lines.append(parsed)
-    if len(numeric_lines) < 2:
+    if not numeric_lines:
         return {}
-    return {
-        "c": numeric_lines[-2],
-        "s": numeric_lines[-1],
-    }
+    if len(numeric_lines) >= 3:
+        # Action bar with [Likes, Comments, Shares]
+        return {
+            "l": numeric_lines[-3],
+            "c": numeric_lines[-2],
+            "s": numeric_lines[-1],
+        }
+    elif len(numeric_lines) == 2:
+        # Action bar with only [Likes, Shares] (comments count hidden or 0)
+        return {
+            "l": numeric_lines[0],
+            "s": numeric_lines[1],
+        }
+    elif len(numeric_lines) == 1:
+        return {
+            "l": numeric_lines[0],
+        }
+    return {}
 
 
 def _extract_facebook(bundle):
+    import os as _os
+    _DEBUG = _os.environ.get("DEBUG_FB", "").strip() == "1"
     source = bundle["source"]
     text = bundle["text"]
     metas = bundle["metas"]
@@ -2134,54 +2157,52 @@ def _extract_facebook(bundle):
                 r'"view_count"\s*:\s*("?[\d.,KMB]+"?)',
                 r'"play_count"\s*:\s*("?[\d.,KMB]+"?)',
                 r'"video_view_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"video_view_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)',
+                r'"play_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)',
+                r'"i18n_view_count"\s*:\s*"([\d.,KMB]+)"',
+                r'"videoPlayCount"\s*:\s*("?[\d.,KMB]+"?)',
+            ],
+        )
+        or _extract_number(
+            source,
+            [
+                r'"view_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"play_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"video_view_count"\s*:\s*("?[\d.,KMB]+"?)',
+                r'"video_view_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)',
+                r'"play_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)',
+                r'"i18n_view_count"\s*:\s*"([\d.,KMB]+)"',
+                r'"videoPlayCount"\s*:\s*("?[\d.,KMB]+"?)',
             ],
         )
         or _extract_facebook_metric_from_meta(
             metas,
             [
-                r'([\d.,]+(?:[KMB])?)\s*views?\b',
+                r'([\d.,]+(?:[KMB])?)\s*(?:views?|lượt xem|lượt phát|plays?)\b',
             ],
+        )
+        or _extract_text_metric(
+            text,
+            ["views", "view", "plays", "play", "lượt xem", "lượt phát"],
         )
     )
     if view_value is not None:
         payload["v"] = view_value
 
-    reaction_value = (
-        _extract_scoped_number(
-            source,
-            target_ids,
-            [
-                r'"subscription_target_id":"{id}".{{0,8000}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
-                r'"share_fbid":"{id}".{{0,8000}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
-                r'"subscription_target_id":"{id}".{{0,8000}}?"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
-                r'"share_fbid":"{id}".{{0,8000}}?"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
-            ],
-        )
-        or _extract_scoped_number(
-            source,
-            target_ids,
-            [
-                r'"top_level_post_id":"{id}".{{0,2200}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
-            ],
-        )
-        or
-        _extract_number(
-            scoped_source,
-            [
-                r'"reaction_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)',
-                r'"reaction_count"\s*:\s*("?[\d.,KMB]+"?)',
-                r'"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
-            ],
-        )
-        or _extract_facebook_metric_from_meta(
-            metas,
-            [
-                r'([\d.,]+(?:[KMB])?)\s*reactions?\b',
-                r'([\d.,]+(?:[KMB])?)\s*likes?\b',
-            ],
-        )
-        or _extract_text_metric(text, ["reactions", "reaction", "likes", "like"])
-    )
+    _l_scoped1 = _extract_scoped_number(source, target_ids, [
+        r'"subscription_target_id":"{id}".{{0,8000}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
+        r'"share_fbid":"{id}".{{0,8000}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)',
+        r'"subscription_target_id":"{id}".{{0,8000}}?"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
+        r'"share_fbid":"{id}".{{0,8000}}?"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"',
+    ])
+    _l_scoped2 = _extract_scoped_number(source, target_ids, [r'"top_level_post_id":"{id}".{{0,2200}}?"reaction_count"\s*:\s*\{{[^}}]{{0,220}}"count"\s*:\s*(\d+)'])
+    _l_json = _extract_number(scoped_source, [r'"reaction_count"\s*:\s*\{[^}]{0,220}"count"\s*:\s*(\d+)', r'"reaction_count"\s*:\s*("?[\d.,KMB]+"?)', r'"i18n_reaction_count"\s*:\s*"([\d.,KMB]+)"'])
+    _l_meta = _extract_facebook_metric_from_meta(metas, [r'([\d.,]+(?:[KMB])?)\s*(?:reactions?|likes?|lượt thích|cảm xúc)\b'])
+    _l_text = _extract_text_metric(text, ["reactions", "reaction", "likes", "like", "lượt thích", "thích", "cảm xúc", "bày tỏ cảm xúc"])
+    reaction_value = _l_scoped1 or _l_scoped2 or _l_json or _l_meta or _l_text
+    if _DEBUG:
+        print(f"[FB DEBUG] URL={bundle.get('url','')}")
+        print(f"[FB DEBUG] LIKES: scoped1={_l_scoped1} scoped2={_l_scoped2} json={_l_json} meta={_l_meta} text={_l_text} => {reaction_value}")
     if reaction_value is not None:
         payload["l"] = reaction_value
 
@@ -2207,46 +2228,51 @@ def _extract_facebook(bundle):
                 r'"i18n_share_count"\s*:\s*"([\d.,KMB]+)"',
             ],
         )
-        or _extract_text_metric(text, ["shares", "share"])
+        or _extract_text_metric(text, ["shares", "share", "lượt chia sẻ", "chia sẻ"])
     )
     if share_value is not None:
         payload["s"] = share_value
 
-    comment_value = (
-        _extract_scoped_number(
-            source,
-            target_ids,
-            [
-                r'"top_level_post_id":"{id}".{{0,2200}}?"total_comment_count"\s*:\s*(\d+)',
-                r'"subscription_target_id":"{id}".{{0,9000}}?"comments"\s*:\s*\{{[^}}]{{0,220}}"total_count"\s*:\s*(\d+)',
-                r'"share_fbid":"{id}".{{0,9000}}?"comments"\s*:\s*\{{[^}}]{{0,220}}"total_count"\s*:\s*(\d+)',
-                r'"subscription_target_id":"{id}".{{0,9000}}?"comments_count_summary_renderer".{{0,1600}}?"total_count"\s*:\s*(\d+)',
-                r'"share_fbid":"{id}".{{0,9000}}?"comments_count_summary_renderer".{{0,1600}}?"total_count"\s*:\s*(\d+)',
-            ],
-        )
-        or
-        _extract_number(
-            scoped_source,
-            [
-                r'"total_comment_count"\s*:\s*"?(?:\\)?([\d.,KMB]+)"?',
-                r'"comment_count"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
-                r'"comment_count"\s*:\s*("?[\d.,KMB]+"?)',
-                r'"comments"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
-                r'"comment_rendering_instance"\s*:\s*\{.{0,1600}?"comments"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
-                r'"i18n_comment_count"\s*:\s*"([\d.,KMB]+)"',
-            ],
-        )
-        or _extract_text_metric(text, ["comments", "comment"])
-    )
+    _c_scoped = _extract_scoped_number(source, target_ids, [
+        r'"top_level_post_id":"{id}".{{0,2200}}?"total_comment_count"\s*:\s*(\d+)',
+        r'"subscription_target_id":"{id}".{{0,9000}}?"comments"\s*:\s*\{{[^}}]{{0,220}}"total_count"\s*:\s*(\d+)',
+        r'"share_fbid":"{id}".{{0,9000}}?"comments"\s*:\s*\{{[^}}]{{0,220}}"total_count"\s*:\s*(\d+)',
+        r'"subscription_target_id":"{id}".{{0,9000}}?"comments_count_summary_renderer".{{0,1600}}?"total_count"\s*:\s*(\d+)',
+        r'"share_fbid":"{id}".{{0,9000}}?"comments_count_summary_renderer".{{0,1600}}?"total_count"\s*:\s*(\d+)',
+    ])
+    _c_json = _extract_number(scoped_source, [
+        r'"total_comment_count"\s*:\s*"?(?:\\)?([\d.,KMB]+)"?',
+        r'"comment_count"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
+        r'"comment_count"\s*:\s*("?[\d.,KMB]+"?)',
+        r'"comments"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
+        r'"comment_rendering_instance"\s*:\s*\{.{0,1600}?"comments"\s*:\s*\{[^}]{0,220}"total_count"\s*:\s*(\d+)',
+        r'"i18n_comment_count"\s*:\s*"([\d.,KMB]+)"',
+    ])
+    _c_text = _extract_text_metric(text, ["comments", "comment", "bình luận", "lượt bình luận", "câu trả lời"])
+    comment_value = _c_scoped or _c_json or _c_text
+    if _DEBUG:
+        print(f"[FB DEBUG] COMMENTS: scoped={_c_scoped} json={_c_json} text={_c_text} => {comment_value}")
     if comment_value is not None:
         payload["c"] = comment_value
 
-    if "/reel/" in str(bundle.get("url") or "").lower():
+    url_lower = str(bundle.get("url") or "").lower()
+    if "/reel/" in url_lower or "/share/r/" in url_lower or "/share/v/" in url_lower:
         reel_text_counts = _extract_facebook_reel_text_counts(text)
+        if "l" not in payload and reel_text_counts.get("l") is not None:
+            payload["l"] = reel_text_counts["l"]
         if "c" not in payload and reel_text_counts.get("c") is not None:
-            payload["c"] = reel_text_counts["c"]
+            if payload.get("l") is None or reel_text_counts["c"] != payload.get("l"):
+                payload["c"] = reel_text_counts["c"]
         if "s" not in payload and reel_text_counts.get("s") is not None:
             payload["s"] = reel_text_counts["s"]
+
+    # Extra safety guard against duplicate like & comment count on Facebook
+    if payload.get("l") is not None and payload.get("c") is not None and payload["l"] == payload["c"]:
+        true_cmt = _extract_text_metric(text, ["comments", "comment", "bình luận", "lượt bình luận", "câu trả lời"])
+        if true_cmt is not None and true_cmt != payload["l"]:
+            payload["c"] = true_cmt
+        else:
+            payload.pop("c", None)
 
     return payload
 

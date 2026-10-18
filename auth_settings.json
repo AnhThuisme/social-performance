@@ -18,8 +18,8 @@
       "login_count": 1
     },
     "ops@fanscom.vn": {
-      "last_login_at": "07/10/2026 15:02:28",
-      "login_count": 3
+      "last_login_at": "18/10/2026 21:22:56",
+      "login_count": 5
     }
   },
   "saved_sheets": [],
@@ -64,6 +64,80 @@
       }
     ],
     "ops@fanscom.vn": [
+      {
+        "sheet_id": "1i5Buo_PYxlnrNUeeZu8XhBkUMcWAbP-kYsBYDqb1Xxo",
+        "sheet_name": "CHẠY SỐ 08/10",
+        "display_name": "CHẠY SỐ 08/10",
+        "sheet_gid": "666120707",
+        "saved_at_text": "18/10/2026 21:23",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {
+          "sheet_title": "CHẠY SỐ 08/10",
+          "sheet_name": "CHẠY SỐ 08/10",
+          "sheet_id": "1i5Buo_PYxlnrNUeeZu8XhBkUMcWAbP-kYsBYDqb1Xxo",
+          "sheet_gid": "666120707",
+          "campaign_label": "",
+          "brand_label": "",
+          "industry_label": "",
+          "campaign_description": "",
+          "total_posts": 0,
+          "total_views": 0,
+          "total_reaction": 0,
+          "total_share": 0,
+          "total_comment": 0,
+          "total_save": 0,
+          "total_buzz": 0,
+          "creator_count": 0,
+          "campaign_count": 0,
+          "platform_counts": {
+            "tiktok": 0,
+            "facebook": 0,
+            "instagram": 0,
+            "youtube": 0,
+            "khac": 0
+          }
+        }
+      },
+      {
+        "sheet_id": "1oXJjqOBlN0HxBowhFSvsZJ5IWL0Ws8A7SkKiuxUIQk0",
+        "sheet_name": "W1-OCT",
+        "display_name": "W1-OCT",
+        "sheet_gid": "826671226",
+        "saved_at_text": "13/10/2026 07:29",
+        "campaign_label": "",
+        "brand_label": "",
+        "industry_label": "",
+        "campaign_description": "",
+        "summary_snapshot": {
+          "sheet_title": "W1-OCT",
+          "sheet_name": "W1-OCT",
+          "sheet_id": "1oXJjqOBlN0HxBowhFSvsZJ5IWL0Ws8A7SkKiuxUIQk0",
+          "sheet_gid": "826671226",
+          "campaign_label": "",
+          "brand_label": "",
+          "industry_label": "",
+          "campaign_description": "",
+          "total_posts": 40,
+          "total_views": 0,
+          "total_reaction": 44549,
+          "total_share": 9028,
+          "total_comment": 20935,
+          "total_save": 0,
+          "total_buzz": 29963,
+          "creator_count": 0,
+          "campaign_count": 1,
+          "platform_counts": {
+            "tiktok": 0,
+            "facebook": 40,
+            "instagram": 0,
+            "youtube": 0,
+            "khac": 0
+          }
+        }
+      },
       {
         "sheet_id": "1t3Caqc5KXsF5nC8h7jHWumINN3AIJizFa87l45gzxLo",
         "sheet_name": "Sheet6",
@@ -170,20 +244,20 @@
           "industry_label": "",
           "campaign_description": "",
           "total_posts": 37,
-          "total_views": 0,
-          "total_reaction": 26847,
+          "total_views": 1057,
+          "total_reaction": 3345,
           "total_share": 3385,
-          "total_comment": 10026,
-          "total_save": 0,
-          "total_buzz": 13411,
+          "total_comment": 619,
+          "total_save": 10026,
+          "total_buzz": 4004,
           "creator_count": 0,
           "campaign_count": 1,
           "platform_counts": {
             "tiktok": 0,
-            "facebook": 37,
+            "facebook": 27,
             "instagram": 0,
             "youtube": 0,
-            "khac": 0
+            "khac": 10
           }
         }
       },
@@ -206,21 +280,21 @@
           "brand_label": "",
           "industry_label": "",
           "campaign_description": "",
-          "total_posts": 0,
-          "total_views": 0,
-          "total_reaction": 0,
-          "total_share": 0,
+          "total_posts": 280,
+          "total_views": 3109,
+          "total_reaction": 44856,
+          "total_share": 10332,
           "total_comment": 0,
           "total_save": 0,
-          "total_buzz": 0,
+          "total_buzz": 3115,
           "creator_count": 0,
-          "campaign_count": 0,
+          "campaign_count": 1,
           "platform_counts": {
             "tiktok": 0,
             "facebook": 0,
             "instagram": 0,
             "youtube": 0,
-            "khac": 0
+            "khac": 280
           }
         }
       }

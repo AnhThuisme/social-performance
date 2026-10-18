@@ -74,16 +74,38 @@ except ImportError:
 def _configure_process_timezone() -> str:
     # Force server process timezone so datetime.now() follows app timezone everywhere.
     tz_name = (os.getenv("APP_TIMEZONE") or "Asia/Ho_Chi_Minh").strip() or "Asia/Ho_Chi_Minh"
-    os.environ["TZ"] = tz_name
-    try:
-        time.tzset()
-    except Exception:
-        # tzset is not available on some platforms (e.g. Windows local dev)
-        pass
+    if os.name != "nt":
+        os.environ["TZ"] = tz_name
+        try:
+            time.tzset()
+        except Exception:
+            pass
+    else:
+        # On Windows, MSVCRT does NOT support IANA timezones (like 'Asia/Ho_Chi_Minh').
+        # Setting TZ to an IANA string causes MSVCRT to treat it as UTC with 0 offset,
+        # shifting datetime.now() back by 7 hours!
+        if "TZ" in os.environ:
+            os.environ.pop("TZ", None)
     return tz_name
 
 
 APP_TIMEZONE = _configure_process_timezone()
+
+try:
+    from zoneinfo import ZoneInfo
+    APP_TZ_OBJ = ZoneInfo(APP_TIMEZONE)
+except Exception:
+    APP_TZ_OBJ = None
+
+
+def get_app_now() -> datetime:
+    """Return current datetime in the configured application timezone (e.g. Asia/Ho_Chi_Minh) as a naive datetime."""
+    if APP_TZ_OBJ is not None:
+        try:
+            return datetime.now(APP_TZ_OBJ).replace(tzinfo=None)
+        except Exception:
+            pass
+    return datetime.now()
 _SIDEBAR_MASCOT_DATA_URI = None
 FAST_START_COMMAND = str(os.getenv("FAST_START_COMMAND", "1")).strip().lower() not in {"0", "false", "no", "off"}
 FAST_SHEET_SETUP_RESPONSE = str(os.getenv("FAST_SHEET_SETUP_RESPONSE", "1")).strip().lower() not in {"0", "false", "no", "off"}
@@ -3367,7 +3389,7 @@ def build_settings_panel_html(current_user, state=None):
 def add_log(msg, state=None):
     runtime_state = resolve_runtime_state(state)
     logs = runtime_state["logs"]
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    timestamp = get_app_now().strftime("%H:%M:%S")
     # store full messages (trim list length), useful for debugging unicode/errors
     logs.insert(0, f"[{timestamp}] {msg}")
     if len(logs) > MAX_RUNTIME_LOG_LINES:
@@ -3433,7 +3455,7 @@ def build_pending_html(state=None):
 def add_failed_item(tab_name: str, row_idx: int, platform: str, url: str, reason: str, state=None, sheet_id: str = ""):
     runtime_state = resolve_runtime_state(state)
     failed_items = runtime_state.get("failed_items") or []
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    timestamp = get_app_now().strftime("%H:%M:%S")
     target_sheet_id = str(sheet_id or runtime_state.get("active_sheet_id", "") or "").strip()
     target_tab = str(tab_name or "").strip()
     target_row = int(row_idx or 0)
@@ -4616,7 +4638,23 @@ def get_worksheet(sheet_name, sheet_id: Optional[str] = None, state=None):
                     "updated_at": time.time(),
                     "spreadsheet": spreadsheet,
                 }
-        return spreadsheet.worksheet(resolved_sheet_name)
+        try:
+            return spreadsheet.worksheet(resolved_sheet_name)
+        except Exception as exc:
+            clean_target = str(resolved_sheet_name or "").strip()
+            if clean_target:
+                try:
+                    all_ws = spreadsheet.worksheets()
+                    for ws in all_ws:
+                        if str(ws.title or "").strip() == clean_target:
+                            return ws
+                    clean_target_lower = clean_target.lower()
+                    for ws in all_ws:
+                        if str(ws.title or "").strip().lower() == clean_target_lower:
+                            return ws
+                except Exception:
+                    pass
+            raise Exception(f"Không tìm thấy tab '{resolved_sheet_name}' trong Google Sheet (hãy kiểm tra lại tên tab).") from exc
     
     worksheet = retry_with_backoff(_open_worksheet, max_retries=4, base_delay=2, handle_quota=True)
     with WORKSHEET_OBJECT_CACHE_LOCK:
@@ -4624,6 +4662,12 @@ def get_worksheet(sheet_name, sheet_id: Optional[str] = None, state=None):
             "updated_at": now_epoch,
             "worksheet": worksheet,
         }
+        if worksheet and getattr(worksheet, "title", None) and worksheet.title != resolved_sheet_name:
+            actual_key = f"{resolved_sheet_id}:{worksheet.title}"
+            WORKSHEET_OBJECT_CACHE[actual_key] = {
+                "updated_at": now_epoch,
+                "worksheet": worksheet,
+            }
     runtime_state["_cached_worksheet_id"] = resolved_sheet_id
     runtime_state["_cached_worksheet_name"] = resolved_sheet_name
     runtime_state["_cached_worksheet"] = worksheet
@@ -7380,15 +7424,25 @@ def build_row_updates(col_map, platform, now, stats):
         "comment": "c",
         "save": "save",
     }
+    platform_key = str(platform or "").strip().lower()
     for field, stat_key in metric_keys.items():
         if not col_map.get(field):
             continue
         if stat_key not in stats or stats.get(stat_key) is None:
+            # Facebook reel/post has no comments or metric is absent: explicitly clear comment column
+            if field == "comment" and platform_key == "facebook" and (stats.get("l") is not None or stats.get("v") is not None or stats.get("s") is not None):
+                row_updates.append((field, col_map[field], ""))
             continue
         row_updates.append((field, col_map[field], parse_metric_number(stats.get(stat_key, 0))))
+
+    # Safety guard: on Facebook if like == comment, clear comment column so it doesn't show duplicate
+    if platform_key == "facebook":
+        l_val = stats.get("l")
+        c_val = stats.get("c")
+        if l_val is not None and c_val is not None and l_val == c_val:
+            row_updates = [(f, col, ("" if f == "comment" else v)) for f, col, v in row_updates]
     has_share_metric = "s" in stats and stats.get("s") is not None
     has_comment_metric = "c" in stats and stats.get("c") is not None
-    platform_key = str(platform or "").strip().lower()
     should_write_buzz = has_comment_metric if platform_key == "tiktok" else (has_share_metric or has_comment_metric)
     if col_map.get("buzz") and should_write_buzz:
         buzz_value = compute_buzz_value(
@@ -7428,6 +7482,8 @@ def ensure_dashboard_date_column(sheet, layout=None, col_map=None, state=None):
     return resolved_col_map
 
 def normalize_cell_value(field, value):
+    if value == "" or value is None:
+        return ""
     if field in {"view", "like", "share", "comment", "buzz", "save"}:
         return parse_metric_number(value)
     return value
@@ -7618,7 +7674,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         runtime_state["schedule_last_run_success"] = 0
         runtime_state["schedule_last_run_failed"] = 0
         runtime_state["is_running"], runtime_state["is_finished"] = True, False
-        now = datetime.now().strftime("%d/%m/%Y %H:%M")
+        now = get_app_now().strftime("%d/%m/%Y %H:%M")
         prepared_groups = []
         total_scannable_rows = 0
         is_multi_group_scan = len(scan_groups) > 1
@@ -7713,7 +7769,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
         def scan_one_tab(ws, tab_name, tab_sheet_id, col_map, row_plan):
             tab_driver = None
             tab_driver_failed = False
-            now_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+            now_str = get_app_now().strftime("%d/%m/%Y %H:%M")
             deferred_failed_rows = []
 
             def locked_log(msg):
@@ -15153,6 +15209,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             if (!tabName) {{
                                 return;
                             }}
+                            const rawTabName = String(item?.tab_name || "");
                             const entry = {{
                                 ok: Boolean(item?.ok),
                                 error: String(item?.error || item?.message || "").trim(),
@@ -15161,6 +15218,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             }};
                             if (!item?.ok || !item?.detected_inputs) {{
                                 payloadByTab[tabName] = entry;
+                                if (rawTabName) payloadByTab[rawTabName] = entry;
                                 return;
                             }}
                             const normalizedConfig = {{}};
@@ -15172,13 +15230,19 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             }}
                             tabColConfigCache[tabName] = normalizedConfig;
                             serverColConfigByTab[tabName] = normalizedConfig;
-                            payloadByTab[tabName] = {{
+                            if (rawTabName) {{
+                                tabColConfigCache[rawTabName] = normalizedConfig;
+                                serverColConfigByTab[rawTabName] = normalizedConfig;
+                            }}
+                            const resObj = {{
                                 ok: true,
                                 tabName,
                                 error: "",
                                 detectedInputs: normalizedConfig,
                                 startRow: normalizedConfig.start_row || "",
                             }};
+                            payloadByTab[tabName] = resObj;
+                            if (rawTabName) payloadByTab[rawTabName] = resObj;
                         }});
                         return payloadByTab;
                     }} catch (_) {{
@@ -15227,7 +15291,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     const batchedResults = await fetchAutoColumnConfigBatch(tabsForAuto);
                     if (batchedResults && typeof batchedResults === "object") {{
                         tabsForAuto.forEach((tabName, idx) => {{
-                            detectResults[idx] = batchedResults[tabName] || null;
+                            detectResults[idx] = batchedResults[tabName] || batchedResults[String(tabName || "").trim()] || null;
                         }});
                     }}
                     const missingTabIndexes = detectResults
@@ -15270,7 +15334,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                         scannedTabs += 1;
                         const filledForTab = AUTO_COLUMN_FIELDS.reduce((sum, field) => sum + (detected.detectedInputs[field] ? 1 : 0), 0);
                         totalFilledAcrossTabs += filledForTab;
-                        if (tabName === activeTabForForm) {{
+                        if (tabName === activeTabForForm || String(tabName || "").trim() === String(activeTabForForm || "").trim()) {{
                             activeDetected = detected.detectedInputs;
                             activeStartRow = detected.startRow || "";
                         }}
